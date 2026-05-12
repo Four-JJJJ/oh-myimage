@@ -1,0 +1,78 @@
+# Cloudflare 部署手册
+
+## 1. 创建资源
+
+先注册 Cloudflare 免费账号，暂时不迁移腾讯云域名。第一版使用 `workers.dev` 默认域名。
+
+```bash
+npm install
+npx wrangler login
+npx wrangler d1 create image-2-platform
+npx wrangler r2 bucket create image-2-images
+npx wrangler queues create image-2-generation
+```
+
+把 `d1 create` 返回的 `database_id` 写入 `wrangler.toml`。
+
+## 2. 配置密钥
+
+```bash
+npx wrangler secret put APP_ENCRYPTION_KEY
+npx wrangler secret put TURNSTILE_SECRET_KEY
+```
+
+本地开发可创建 `.dev.vars`：
+
+```bash
+APP_ENCRYPTION_KEY="replace-with-strong-random-secret"
+TURNSTILE_SECRET_KEY=""
+TURNSTILE_REQUIRED="false"
+```
+
+如果启用 Turnstile，需要在 Cloudflare 控制台创建 Turnstile site，并把 site key 填到 `wrangler.toml` 的 `TURNSTILE_SITE_KEY`。
+
+## 3. 数据库迁移
+
+```bash
+npm run db:migrate:local
+npm run db:migrate:remote
+```
+
+## 4. 本地验证
+
+```bash
+npm run typecheck
+npm run test
+npm run build
+npm run dev
+```
+
+打开 Wrangler 输出的本地地址，创建空间，进入设置页，保存用户自己的 `baseURL + API Key + model`。
+
+## 5. 部署
+
+```bash
+npm run deploy
+```
+
+部署完成后使用 `*.workers.dev` 访问。第一版不修改腾讯云 DNS，不绑定自定义域名。
+
+## 6. 上线验收
+
+- 登录空间成功。
+- 设置页保存 provider 后不会回显完整 API Key。
+- 测试连接返回成功或明确失败原因。
+- 使用低质量参数生成 1 张图片。
+- 任务状态从 `queued/running` 变为 `succeeded`。
+- 图库能看到图片，并可以下载。
+- D1 中有任务和图片元数据。
+- R2 中有对应图片文件。
+
+## 7. 成本保护默认值
+
+- 单空间每日任务：50
+- 单次生成数量：4
+- 单空间同时运行任务：2
+- 图片保留期：90 天，当前版本只记录配置，清理任务后续实现
+
+超过每日 1000 个任务、R2 超过 50GB 或 Workers 请求接近免费层上限时，再升级 Workers Paid 或拆分服务。

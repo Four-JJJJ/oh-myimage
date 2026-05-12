@@ -1,2 +1,47 @@
 # oh-myimage
-在线image-2生产平台
+
+在线 Image-2 生图平台。第一版采用 Cloudflare 低成本架构：React + Vite + Cloudflare Worker + Hono + D1 + R2 + Queues。
+
+## 功能
+
+- 空间名 + 密码进入独立工作区
+- 用户自填 `baseURL + API Key + model`
+- API Key 服务端 AES-GCM 加密保存
+- 支持 prompt、比例、尺寸、质量、数量、格式、透明背景、压缩率
+- D1 保存任务和图片元数据
+- R2 保存生成图片
+- Queues 异步处理生图任务
+- 基础配额、并发限制、SSRF 防护和日志脱敏
+
+## 本地运行
+
+```bash
+npm install
+npm run db:migrate:local
+npm run dev
+```
+
+访问 Wrangler 输出的本地地址，默认通常是 `http://localhost:8787`。
+
+本地需要 `.dev.vars`：
+
+```bash
+APP_ENCRYPTION_KEY="replace-with-local-secret"
+TURNSTILE_REQUIRED="false"
+TURNSTILE_SECRET_KEY=""
+```
+
+## 验证
+
+```bash
+npm run typecheck
+npm test
+npm run build
+npx wrangler deploy --dry-run
+```
+
+## 部署
+
+部署到 Cloudflare 前需要创建 D1、R2、Queue、Turnstile，并把 D1 的 `database_id` 写入 `wrangler.toml`。
+
+完整步骤见 [docs/cloudflare-deployment.md](docs/cloudflare-deployment.md)。
