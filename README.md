@@ -1,6 +1,6 @@
 # oh-myimage
 
-在线 Image-2 生图平台。第一版采用 Cloudflare 低成本架构：React + Vite + Cloudflare Worker + Hono + D1 + R2 + Queues。
+在线 Image-2 生图平台。第一版采用 Cloudflare 低成本架构：React + Vite + shadcn/ui + Cloudflare Worker + Hono + D1 + R2 + Queues。
 
 ## 功能
 
@@ -8,6 +8,7 @@
 - 用户自填 `baseURL + API Key + model`
 - API Key 服务端 AES-GCM 加密保存
 - 支持 prompt、比例、尺寸、质量、数量、格式、透明背景、压缩率
+- 使用 shadcn/ui + Tailwind 构建创作工作台界面
 - D1 保存任务和图片元数据
 - R2 保存生成图片
 - Queues 异步处理生图任务
