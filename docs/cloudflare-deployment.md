@@ -1,5 +1,16 @@
 # Cloudflare 部署手册
 
+## 当前部署
+
+- Worker URL: `https://image-2-platform.fourjjjjci.workers.dev`
+- Cloudflare account: `909a6b863d75fd896d98e647a884581e`
+- D1 database: `image-2-platform` / `038dabd7-a970-454a-b0a4-a9f7c8ed73df`
+- R2 bucket: `image-2-images`
+- Queue: `image-2-generation`
+- Turnstile: 第一版暂未启用，`TURNSTILE_REQUIRED = "false"`
+
+不要把 Cloudflare API Token、OpenAI/兼容服务 API Key、`APP_ENCRYPTION_KEY` 写入仓库。
+
 ## 1. 创建资源
 
 先注册 Cloudflare 免费账号，暂时不迁移腾讯云域名。第一版使用 `workers.dev` 默认域名。
