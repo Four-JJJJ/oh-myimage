@@ -12,7 +12,7 @@
 - D1 保存任务和图片元数据
 - R2 保存生成图片
 - Queues 异步处理生图任务
-- 灵感库：半自动采集优秀图片示例、提示词和来源链接，支持收藏与一键套用
+- 灵感库代码保留，但当前默认隐藏并暂停定时采集
 - 基础配额、并发限制、SSRF 防护和日志脱敏
 
 ## 本地运行
@@ -34,7 +34,7 @@ TURNSTILE_SECRET_KEY=""
 X_BEARER_TOKEN=""
 ```
 
-灵感库会使用 D1 保存素材元数据，R2 缓存不超过 `INSPIRATION_THUMBNAIL_MAX_BYTES` 的缩略图。默认启用 Civitai 公开 API 定时采集；X 只使用官方 API 或手动粘贴提示词导入，不抓取网页。
+灵感库会使用 D1 保存素材元数据，R2 缓存不超过 `INSPIRATION_THUMBNAIL_MAX_BYTES` 的缩略图。当前 `INSPIRATION_FEATURE_ENABLED=false`，前端入口隐藏且 Cron 不会采集；需要恢复时再开启。X 只使用官方 API 或手动粘贴提示词导入，不抓取网页。
 
 ## 验证
 

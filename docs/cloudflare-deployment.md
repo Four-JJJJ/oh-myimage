@@ -83,7 +83,7 @@ npm run deploy
 - 图库能看到图片，并可以下载。
 - D1 中有任务和图片元数据。
 - R2 中有对应图片文件。
-- 灵感页可以看到 Civitai 定时采集或手动导入的素材，收藏后能在生成页套用提示词。
+- 当前灵感入口默认隐藏，`INSPIRATION_FEATURE_ENABLED=false` 时 Cron 不会采集；恢复后再验收灵感页列表、收藏和套用。
 - 本地可用 Wrangler 的 scheduled handler 冒烟触发 Cron：`curl "http://localhost:8787/cdn-cgi/handler/scheduled"`。
 
 ## 7. 成本保护默认值
@@ -92,7 +92,8 @@ npm run deploy
 - 单次生成数量：4
 - 单空间同时运行任务：2
 - 图片保留期：90 天，当前版本只记录配置，清理任务后续实现
-- 灵感单次采集：12 条
+- 灵感定时采集：默认暂停
+- 灵感单次采集：12 条，开启后生效
 - 灵感缩略图缓存上限：1MB，超过则只保存来源和图片外链
 
 超过每日 1000 个任务、R2 超过 50GB 或 Workers 请求接近免费层上限时，再升级 Workers Paid 或拆分服务。

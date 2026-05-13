@@ -375,6 +375,7 @@ export default {
   },
 
   async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    if (env.INSPIRATION_FEATURE_ENABLED !== "true") return;
     const sources = await listEnabledInspirationSources(env.DB);
     const results = await Promise.allSettled(
       sources.map((source) =>

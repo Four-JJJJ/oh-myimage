@@ -36,7 +36,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./comp
 import { cn } from "./lib/utils";
 import { api, AppConfig, formatBytes, GenerationJob, ImageItem, InspirationItem, ProviderSettings } from "./api";
 
-type View = "generate" | "inspiration" | "gallery" | "settings";
+type View = "generate" | "gallery" | "settings";
 
 interface MeState {
   space: { id: string; name: string };
@@ -86,7 +86,6 @@ const defaultForm: GenerateForm = {
 
 const viewItems: Array<{ value: View; label: string; icon: typeof Wand2 }> = [
   { value: "generate", label: "生成", icon: Wand2 },
-  { value: "inspiration", label: "灵感", icon: LibraryBig },
   { value: "gallery", label: "图库", icon: GalleryHorizontalEnd },
   { value: "settings", label: "设置", icon: Settings },
 ];
@@ -96,7 +95,6 @@ export function App() {
   const [me, setMe] = useState<MeState | null>(null);
   const [view, setView] = useState<View>("generate");
   const [booting, setBooting] = useState(true);
-  const [promptDraft, setPromptDraft] = useState<PromptDraft | null>(null);
 
   const refreshMe = useCallback(async () => {
     const result = await api<{ ok: true; space: MeState["space"]; providerConfigured: boolean }>("/api/me");
@@ -193,7 +191,7 @@ export function App() {
                   <p className="mt-1 truncate text-xs text-muted-foreground">空间：{me.space.name}</p>
                 </div>
                 <Tabs value={view} onValueChange={(value) => setView(value as View)} className="w-full md:w-auto">
-                  <TabsList className="grid w-full grid-cols-4 md:w-auto">
+                  <TabsList className="grid w-full grid-cols-3 md:w-auto">
                     {viewItems.map((item) => (
                       <MainTabTrigger key={item.value} value={item.value} label={item.label} icon={item.icon} />
                     ))}
@@ -207,17 +205,7 @@ export function App() {
                 <GenerateView
                   config={config}
                   providerConfigured={me.providerConfigured}
-                  incomingPrompt={promptDraft}
                   onProviderNeeded={() => setView("settings")}
-                  onOpenInspirations={() => setView("inspiration")}
-                />
-              )}
-              {view === "inspiration" && (
-                <InspirationView
-                  onUse={(item) => {
-                    setPromptDraft({ id: item.id, prompt: item.prompt, aspectRatio: item.aspectRatio, nonce: Date.now() });
-                    setView("generate");
-                  }}
                 />
               )}
               {view === "gallery" && <GalleryView />}
@@ -319,15 +307,11 @@ function LoginScreen({ config, onLogin }: { config: AppConfig | null; onLogin: (
 function GenerateView({
   config,
   providerConfigured,
-  incomingPrompt,
   onProviderNeeded,
-  onOpenInspirations,
 }: {
   config: AppConfig | null;
   providerConfigured: boolean;
-  incomingPrompt: PromptDraft | null;
   onProviderNeeded: () => void;
-  onOpenInspirations: () => void;
 }) {
   const [form, setForm] = useState<GenerateForm>(defaultForm);
   const [job, setJob] = useState<GenerationJob | null>(null);
@@ -336,20 +320,6 @@ function GenerateView({
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-
-  useEffect(() => {
-    if (!incomingPrompt?.prompt) return;
-    setForm((current) => {
-      const next = { ...current, prompt: incomingPrompt.prompt };
-      if (incomingPrompt.aspectRatio && ratioSizes[incomingPrompt.aspectRatio]) {
-        const [width, height] = ratioSizes[incomingPrompt.aspectRatio];
-        next.aspectRatio = incomingPrompt.aspectRatio;
-        next.width = width;
-        next.height = height;
-      }
-      return next;
-    });
-  }, [incomingPrompt?.nonce]);
 
   useEffect(() => {
     if (!job || job.status === "succeeded" || job.status === "failed" || job.status === "cancelled") return;
@@ -448,8 +418,6 @@ function GenerateView({
               className="min-h-40 resize-none"
             />
           </Field>
-
-          <InspirationPromptStrip onSelect={(item) => update("prompt", item.prompt)} onOpenInspirations={onOpenInspirations} />
 
           <Field label="比例">
             <div className="grid grid-cols-3 gap-2">
