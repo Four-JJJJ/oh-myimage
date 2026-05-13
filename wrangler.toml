@@ -8,7 +8,7 @@ assets = { directory = "./dist", binding = "ASSETS", not_found_handling = "singl
 [[d1_databases]]
 binding = "DB"
 database_name = "image-2-platform"
-database_id = "replace-with-cloudflare-d1-database-id"
+database_id = "038dabd7-a970-454a-b0a4-a9f7c8ed73df"
 migrations_dir = "migrations"
 
 [[r2_buckets]]
