@@ -2,6 +2,7 @@ export interface AppConfig {
   model: string;
   maxImagesPerRequest: number;
   maxDailyJobsPerSpace: number;
+  generationTimeoutSeconds: number;
   ratios: string[];
   qualities: string[];
   formats: string[];
@@ -29,6 +30,28 @@ export interface ImageItem {
   prompt?: string;
   quality?: string;
   aspectRatio?: string;
+}
+
+export interface InspirationItem {
+  id: string;
+  sourceKey: string;
+  sourceName: string;
+  originalUrl: string;
+  author: string | null;
+  title: string | null;
+  prompt: string;
+  negativePrompt: string | null;
+  thumbnailUrl: string | null;
+  externalImageUrl: string | null;
+  width: number | null;
+  height: number | null;
+  aspectRatio: string | null;
+  tags: string[];
+  model: string | null;
+  safety: string;
+  useCount: number;
+  importedAt: string;
+  favorite: boolean;
 }
 
 export interface GenerationJob {

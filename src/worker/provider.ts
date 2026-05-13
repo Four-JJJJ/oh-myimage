@@ -1,5 +1,5 @@
 import { bytesFromBase64, decryptSecret, sha256Hex } from "./crypto";
-import { randomId, redactSecrets } from "./http";
+import { envNumber, randomId, redactSecrets } from "./http";
 import { buildProviderEndpoint } from "./security";
 import {
   completeJob,
@@ -24,6 +24,9 @@ interface ProviderGenerationResponse {
   size?: string;
   usage?: unknown;
 }
+
+const DEFAULT_GENERATION_TIMEOUT_MS = 600_000;
+const MAX_QUEUE_CONSUMER_TIMEOUT_MS = 14 * 60 * 1000;
 
 export class ProviderError extends Error {
   constructor(
@@ -127,7 +130,12 @@ async function requestGeneration(
 ): Promise<ProviderGenerationResponse> {
   const endpoint = buildProviderEndpoint(credential.base_url, "/images/generations");
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort("timeout"), Number(env.REQUEST_TIMEOUT_MS ?? 120000));
+  const timeoutMs = resolveGenerationTimeoutMs(env.REQUEST_TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   try {
     const body: Record<string, unknown> = {
       model: job.model,
@@ -159,7 +167,7 @@ async function requestGeneration(
       const text = await providerMessage(response);
       throw new ProviderError(
         providerErrorCode(response.status),
-        text || `模型服务返回 ${response.status}。`,
+        providerStatusMessage(response.status, text, timeoutMs),
         response.status === 429 || response.status >= 500,
       );
     }
@@ -167,6 +175,13 @@ async function requestGeneration(
     return (await response.json()) as ProviderGenerationResponse;
   } catch (error) {
     if (error instanceof ProviderError) throw error;
+    if (timedOut) {
+      throw new ProviderError(
+        "provider_timeout",
+        `模型服务超过 ${formatDuration(timeoutMs)} 仍未返回，已停止等待。请确认 baseURL 的网关、负载均衡和模型服务超时都不低于这个时间。`,
+        true,
+      );
+    }
     throw new ProviderError("provider_request_failed", redactSecrets(error instanceof Error ? error.message : "模型请求失败。"));
   } finally {
     clearTimeout(timer);
@@ -180,6 +195,13 @@ function providerErrorCode(status: number): string {
   return "provider_rejected";
 }
 
+function providerStatusMessage(status: number, message: string, timeoutMs: number): string {
+  if (status === 502 || status === 503 || status === 504) {
+    return `模型服务返回 ${status}。当前 Worker 已允许最长等待 ${formatDuration(timeoutMs)}；如果仍然出现这个状态，通常是 baseURL 上游网关或模型服务在更早的位置超时。`;
+  }
+  return message || `模型服务返回 ${status}。`;
+}
+
 async function providerMessage(response: Response): Promise<string> {
   const text = redactSecrets(await response.text());
   try {
@@ -190,12 +212,25 @@ async function providerMessage(response: Response): Promise<string> {
   } catch {
     // Fall back to trimmed text below.
   }
+  if (text.trimStart().startsWith("<")) return "";
   return text.length > 240 ? `${text.slice(0, 240)}...` : text;
 }
 
 function normalizeProviderError(error: unknown): ProviderError {
   if (error instanceof ProviderError) return error;
   return new ProviderError("generation_failed", redactSecrets(error instanceof Error ? error.message : "生成失败。"));
+}
+
+export function resolveGenerationTimeoutMs(value: string | undefined): number {
+  return Math.min(Math.max(envNumber(value, DEFAULT_GENERATION_TIMEOUT_MS), 1000), MAX_QUEUE_CONSUMER_TIMEOUT_MS);
+}
+
+function formatDuration(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return remainingSeconds ? `${minutes} 分 ${remainingSeconds} 秒` : `${minutes} 分钟`;
 }
 
 function mimeFromFormat(format: string): string {

@@ -1,14 +1,19 @@
 import {
   AlertCircle,
   CheckCircle2,
+  ExternalLink,
   Download,
   GalleryHorizontalEnd,
+  Heart,
   ImagePlus,
   Images,
   KeyRound,
+  LibraryBig,
+  LinkIcon,
   Loader2,
   LogOut,
   RefreshCcw,
+  Search,
   Settings,
   ShieldCheck,
   SlidersHorizontal,
@@ -29,9 +34,9 @@ import { Tabs, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { Textarea } from "./components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
 import { cn } from "./lib/utils";
-import { api, AppConfig, formatBytes, GenerationJob, ImageItem, ProviderSettings } from "./api";
+import { api, AppConfig, formatBytes, GenerationJob, ImageItem, InspirationItem, ProviderSettings } from "./api";
 
-type View = "generate" | "gallery" | "settings";
+type View = "generate" | "inspiration" | "gallery" | "settings";
 
 interface MeState {
   space: { id: string; name: string };
@@ -50,6 +55,13 @@ interface GenerateForm {
   compression: number;
 }
 
+interface PromptDraft {
+  id: string;
+  prompt: string;
+  aspectRatio: string | null;
+  nonce: number;
+}
+
 const ratioSizes: Record<string, [number, number]> = {
   "1:1": [1024, 1024],
   "3:2": [1536, 1024],
@@ -57,6 +69,8 @@ const ratioSizes: Record<string, [number, number]> = {
   "16:9": [1536, 864],
   "9:16": [864, 1536],
 };
+
+const GENERATION_POLL_INTERVAL_MS = 6000;
 
 const defaultForm: GenerateForm = {
   prompt: "",
@@ -70,14 +84,9 @@ const defaultForm: GenerateForm = {
   compression: 100,
 };
 
-const promptPresets = [
-  "产品摄影，白色陶瓷咖啡杯，晨光，柔和阴影，真实材质",
-  "国风插画，雨后街巷，纸伞，低饱和配色，电影构图",
-  "极简海报，一束橙色郁金香，浅灰背景，高级杂志排版",
-];
-
 const viewItems: Array<{ value: View; label: string; icon: typeof Wand2 }> = [
   { value: "generate", label: "生成", icon: Wand2 },
+  { value: "inspiration", label: "灵感", icon: LibraryBig },
   { value: "gallery", label: "图库", icon: GalleryHorizontalEnd },
   { value: "settings", label: "设置", icon: Settings },
 ];
@@ -87,6 +96,7 @@ export function App() {
   const [me, setMe] = useState<MeState | null>(null);
   const [view, setView] = useState<View>("generate");
   const [booting, setBooting] = useState(true);
+  const [promptDraft, setPromptDraft] = useState<PromptDraft | null>(null);
 
   const refreshMe = useCallback(async () => {
     const result = await api<{ ok: true; space: MeState["space"]; providerConfigured: boolean }>("/api/me");
@@ -183,7 +193,7 @@ export function App() {
                   <p className="mt-1 truncate text-xs text-muted-foreground">空间：{me.space.name}</p>
                 </div>
                 <Tabs value={view} onValueChange={(value) => setView(value as View)} className="w-full md:w-auto">
-                  <TabsList className="grid w-full grid-cols-3 md:w-auto">
+                  <TabsList className="grid w-full grid-cols-4 md:w-auto">
                     {viewItems.map((item) => (
                       <MainTabTrigger key={item.value} value={item.value} label={item.label} icon={item.icon} />
                     ))}
@@ -194,7 +204,21 @@ export function App() {
 
             <div className="flex-1 p-4 md:p-6">
               {view === "generate" && (
-                <GenerateView config={config} providerConfigured={me.providerConfigured} onProviderNeeded={() => setView("settings")} />
+                <GenerateView
+                  config={config}
+                  providerConfigured={me.providerConfigured}
+                  incomingPrompt={promptDraft}
+                  onProviderNeeded={() => setView("settings")}
+                  onOpenInspirations={() => setView("inspiration")}
+                />
+              )}
+              {view === "inspiration" && (
+                <InspirationView
+                  onUse={(item) => {
+                    setPromptDraft({ id: item.id, prompt: item.prompt, aspectRatio: item.aspectRatio, nonce: Date.now() });
+                    setView("generate");
+                  }}
+                />
               )}
               {view === "gallery" && <GalleryView />}
               {view === "settings" && <SettingsView defaultModel={config?.model ?? "gpt-image-2"} onSaved={refreshMe} />}
@@ -231,7 +255,7 @@ function LoginScreen({ config, onLogin }: { config: AppConfig | null; onLogin: (
   }
 
   return (
-    <main className="min-h-screen bg-[radial-gradient(circle_at_18%_18%,hsl(37_90%_90%),transparent_28%),linear-gradient(135deg,hsl(43_35%_97%),hsl(210_30%_96%))] p-4 text-foreground md:p-8">
+    <main className="min-h-screen bg-[radial-gradient(circle_at_18%_18%,hsl(199_82%_92%),transparent_30%),linear-gradient(135deg,hsl(216_32%_98%),hsl(190_28%_96%))] p-4 text-foreground md:p-8">
       <section className="mx-auto grid min-h-[calc(100vh-2rem)] max-w-6xl items-center gap-8 md:min-h-[calc(100vh-4rem)] lg:grid-cols-[minmax(0,1fr)_420px]">
         <div className="max-w-2xl">
           <Badge variant="outline" className="mb-5 bg-background/70">
@@ -263,10 +287,17 @@ function LoginScreen({ config, onLogin }: { config: AppConfig | null; onLogin: (
           <CardContent>
             <form className="grid gap-5" onSubmit={submit}>
               <Field label="空间名">
-                <Input value={spaceName} onChange={(event) => setSpaceName(event.target.value)} minLength={2} required />
+                <Input value={spaceName} onChange={(event) => setSpaceName(event.target.value)} minLength={2} autoComplete="username" required />
               </Field>
               <Field label="密码">
-                <Input value={password} onChange={(event) => setPassword(event.target.value)} type="password" minLength={8} required />
+                <Input
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  type="password"
+                  minLength={8}
+                  autoComplete="current-password"
+                  required
+                />
               </Field>
               {config?.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={setTurnstileToken} />}
               {config?.turnstileRequired && !config.turnstileSiteKey && (
@@ -288,11 +319,15 @@ function LoginScreen({ config, onLogin }: { config: AppConfig | null; onLogin: (
 function GenerateView({
   config,
   providerConfigured,
+  incomingPrompt,
   onProviderNeeded,
+  onOpenInspirations,
 }: {
   config: AppConfig | null;
   providerConfigured: boolean;
+  incomingPrompt: PromptDraft | null;
   onProviderNeeded: () => void;
+  onOpenInspirations: () => void;
 }) {
   const [form, setForm] = useState<GenerateForm>(defaultForm);
   const [job, setJob] = useState<GenerationJob | null>(null);
@@ -300,6 +335,21 @@ function GenerateView({
   const [turnstileToken, setTurnstileToken] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
+  useEffect(() => {
+    if (!incomingPrompt?.prompt) return;
+    setForm((current) => {
+      const next = { ...current, prompt: incomingPrompt.prompt };
+      if (incomingPrompt.aspectRatio && ratioSizes[incomingPrompt.aspectRatio]) {
+        const [width, height] = ratioSizes[incomingPrompt.aspectRatio];
+        next.aspectRatio = incomingPrompt.aspectRatio;
+        next.width = width;
+        next.height = height;
+      }
+      return next;
+    });
+  }, [incomingPrompt?.nonce]);
 
   useEffect(() => {
     if (!job || job.status === "succeeded" || job.status === "failed" || job.status === "cancelled") return;
@@ -308,13 +358,25 @@ function GenerateView({
         const result = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${job.id}`);
         setJob(result.job);
         setImages(result.images);
-        if (result.job.status === "succeeded" || result.job.status === "failed") window.clearInterval(timer);
+        if (result.job.status === "succeeded" || result.job.status === "failed" || result.job.status === "cancelled") window.clearInterval(timer);
       } catch (err) {
         setError(err instanceof Error ? err.message : "刷新任务状态失败。");
       }
-    }, 4000);
+    }, GENERATION_POLL_INTERVAL_MS);
     return () => window.clearInterval(timer);
   }, [job]);
+
+  useEffect(() => {
+    if (!job || job.status === "succeeded" || job.status === "failed" || job.status === "cancelled") {
+      if (!job) setElapsedSeconds(0);
+      return;
+    }
+    const startedAt = Date.parse(job.created_at);
+    const updateElapsed = () => setElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(timer);
+  }, [job?.id, job?.created_at, job?.status]);
 
   function update<K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) {
     setForm((current) => {
@@ -343,6 +405,7 @@ function GenerateView({
     setLoading(true);
     setError("");
     setImages([]);
+    setElapsedSeconds(0);
     try {
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
@@ -386,16 +449,7 @@ function GenerateView({
             />
           </Field>
 
-          <div className="grid gap-2">
-            <Label>灵感片段</Label>
-            <div className="flex flex-wrap gap-2">
-              {promptPresets.map((preset) => (
-                <Button key={preset} type="button" variant="outline" size="sm" className="h-auto py-2 text-left" onClick={() => update("prompt", preset)}>
-                  {preset}
-                </Button>
-              ))}
-            </div>
-          </div>
+          <InspirationPromptStrip onSelect={(item) => update("prompt", item.prompt)} onOpenInspirations={onOpenInspirations} />
 
           <Field label="比例">
             <div className="grid grid-cols-3 gap-2">
@@ -470,7 +524,7 @@ function GenerateView({
         </div>
       </form>
 
-      <section className="relative overflow-hidden rounded-lg border bg-[linear-gradient(135deg,hsl(40_38%_98%),hsl(205_30%_96%))] shadow-canvas">
+      <section className="relative overflow-hidden rounded-lg border bg-[linear-gradient(135deg,hsl(216_32%_98%),hsl(190_28%_96%))] shadow-canvas">
         <div className="flex flex-col gap-3 border-b bg-background/82 p-4 backdrop-blur md:flex-row md:items-center md:justify-between">
           <div>
             <p className="text-xs font-semibold uppercase text-muted-foreground">Canvas</p>
@@ -501,7 +555,9 @@ function GenerateView({
                 </div>
                 <div>
                   <p className="font-semibold">模型正在处理</p>
-                  <p className="mt-1 text-sm text-muted-foreground">页面会自动刷新任务状态。</p>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    已等待 {formatElapsed(elapsedSeconds)}，最长可能接近 {formatElapsed(config?.generationTimeoutSeconds ?? 600)}。
+                  </p>
                 </div>
               </div>
             </div>
@@ -509,6 +565,322 @@ function GenerateView({
           {images.length > 0 && <ImageGrid images={images} />}
         </div>
       </section>
+    </div>
+  );
+}
+
+function InspirationPromptStrip({
+  onSelect,
+  onOpenInspirations,
+}: {
+  onSelect: (item: InspirationItem) => void;
+  onOpenInspirations: () => void;
+}) {
+  const [items, setItems] = useState<InspirationItem[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let mounted = true;
+    async function load() {
+      setLoading(true);
+      try {
+        const favorites = await api<{ ok: true; inspirations: InspirationItem[] }>("/api/inspirations?favorites=1");
+        const result = favorites.inspirations.length
+          ? favorites
+          : await api<{ ok: true; inspirations: InspirationItem[] }>("/api/inspirations");
+        if (mounted) setItems(result.inspirations.filter((item) => item.prompt.trim()).slice(0, 4));
+      } catch {
+        if (mounted) setItems([]);
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    }
+    void load();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  return (
+    <div className="grid gap-2">
+      <div className="flex items-center justify-between gap-3">
+        <Label>灵感片段</Label>
+        <Button type="button" variant="ghost" size="sm" className="h-8 px-2 text-xs" onClick={onOpenInspirations}>
+          <LibraryBig className="size-3.5" />
+          灵感库
+        </Button>
+      </div>
+      {loading && <div className="h-10 rounded-lg border bg-muted/50" />}
+      {!loading && items.length === 0 && (
+        <button
+          type="button"
+          className="rounded-lg border border-dashed bg-background px-3 py-3 text-left text-sm text-muted-foreground transition-colors hover:bg-muted"
+          onClick={onOpenInspirations}
+        >
+          导入或采集灵感后，可在这里快速套用提示词。
+        </button>
+      )}
+      {items.length > 0 && (
+        <div className="grid gap-2">
+          {items.map((item) => (
+            <Button
+              key={item.id}
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-auto justify-start py-2 text-left"
+              onClick={() => {
+                void api(`/api/inspirations/${item.id}/use`, { method: "POST" });
+                onSelect(item);
+              }}
+            >
+              <span className="line-clamp-2">{item.prompt}</span>
+            </Button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function InspirationView({ onUse }: { onUse: (item: InspirationItem) => void }) {
+  const [items, setItems] = useState<InspirationItem[]>([]);
+  const [query, setQuery] = useState("");
+  const [source, setSource] = useState("all");
+  const [tag, setTag] = useState("");
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [importUrl, setImportUrl] = useState("");
+  const [importPrompt, setImportPrompt] = useState("");
+  const [importTags, setImportTags] = useState("");
+  const [importing, setImporting] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    const params = new URLSearchParams();
+    if (query.trim()) params.set("q", query.trim());
+    if (source !== "all") params.set("source", source);
+    if (tag.trim()) params.set("tag", tag.trim());
+    if (favoritesOnly) params.set("favorites", "1");
+    try {
+      const result = await api<{ ok: true; inspirations: InspirationItem[] }>(`/api/inspirations?${params.toString()}`);
+      setItems(result.inspirations);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "灵感库加载失败。");
+    } finally {
+      setLoading(false);
+    }
+  }, [favoritesOnly, query, source, tag]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function submitImport(event: FormEvent) {
+    event.preventDefault();
+    setImporting(true);
+    setError("");
+    setMessage("");
+    try {
+      const result = await api<{ ok: true; inspiration: InspirationItem }>("/api/inspirations/import-url", {
+        method: "POST",
+        body: JSON.stringify({
+          url: importUrl,
+          prompt: importPrompt,
+          tags: splitTags(importTags),
+        }),
+      });
+      setItems((current) => [result.inspiration, ...current.filter((item) => item.id !== result.inspiration.id)]);
+      setImportUrl("");
+      setImportPrompt("");
+      setImportTags("");
+      setMessage("灵感已导入。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "导入失败。");
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function toggleFavorite(item: InspirationItem) {
+    const next = !item.favorite;
+    setItems((current) => current.map((entry) => (entry.id === item.id ? { ...entry, favorite: next } : entry)));
+    try {
+      const result = await api<{ ok: true; favorite: boolean }>(`/api/inspirations/${item.id}/favorite`, {
+        method: "POST",
+        body: JSON.stringify({ favorite: next }),
+      });
+      setItems((current) => current.map((entry) => (entry.id === item.id ? { ...entry, favorite: result.favorite } : entry)));
+    } catch (err) {
+      setItems((current) => current.map((entry) => (entry.id === item.id ? { ...entry, favorite: item.favorite } : entry)));
+      setError(err instanceof Error ? err.message : "收藏失败。");
+    }
+  }
+
+  async function useItem(item: InspirationItem) {
+    await api(`/api/inspirations/${item.id}/use`, { method: "POST" }).catch(() => null);
+    onUse(item);
+  }
+
+  return (
+    <section className="grid gap-5">
+      <div className="flex flex-col gap-3 xl:flex-row xl:items-end xl:justify-between">
+        <div>
+          <p className="text-xs font-semibold uppercase text-muted-foreground">Inspiration</p>
+          <h2 className="mt-1 text-3xl font-semibold tracking-normal">灵感库</h2>
+        </div>
+        <form className="grid gap-2 md:grid-cols-[minmax(220px,1fr)_140px_150px_auto_auto]" onSubmit={(event) => { event.preventDefault(); void load(); }}>
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索提示词、作者、标签" className="pl-9" />
+          </div>
+          <Select value={source} onValueChange={setSource}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部来源</SelectItem>
+              <SelectItem value="civitai">Civitai</SelectItem>
+              <SelectItem value="x">X</SelectItem>
+              <SelectItem value="jimeng">即梦</SelectItem>
+              <SelectItem value="generic">网页</SelectItem>
+            </SelectContent>
+          </Select>
+          <Input value={tag} onChange={(event) => setTag(event.target.value)} placeholder="标签" />
+          <Button type="button" variant={favoritesOnly ? "default" : "outline"} onClick={() => setFavoritesOnly((current) => !current)}>
+            <Heart className={cn("size-4", favoritesOnly && "fill-current")} />
+            收藏
+          </Button>
+          <Button type="submit" variant="outline">
+            <RefreshCcw className="size-4" />
+            刷新
+          </Button>
+        </form>
+      </div>
+
+      <form className="grid gap-3 rounded-lg border bg-card p-4 shadow-panel lg:grid-cols-[minmax(260px,1fr)_minmax(280px,1.2fr)_180px_auto]" onSubmit={submitImport}>
+        <Field label="来源链接">
+          <Input value={importUrl} onChange={(event) => setImportUrl(event.target.value)} placeholder="https://..." required />
+        </Field>
+        <Field label="提示词">
+          <Input value={importPrompt} onChange={(event) => setImportPrompt(event.target.value)} placeholder="X 手动导入时必填；网页可自动读取描述" />
+        </Field>
+        <Field label="标签">
+          <Input value={importTags} onChange={(event) => setImportTags(event.target.value)} placeholder="产品, 海报" />
+        </Field>
+        <div className="flex items-end">
+          <Button className="w-full" disabled={importing}>
+            {importing ? <Loader2 className="animate-spin" /> : <LinkIcon />}
+            导入
+          </Button>
+        </div>
+      </form>
+
+      {message && <Notice tone="success" text={message} />}
+      {error && <Notice tone="error" text={error} />}
+
+      {loading && (
+        <div className="grid min-h-80 place-items-center rounded-lg border bg-card text-muted-foreground">
+          <div className="flex items-center gap-3">
+            <Loader2 className="size-5 animate-spin" />
+            <span className="text-sm font-medium">加载灵感</span>
+          </div>
+        </div>
+      )}
+      {!loading && items.length === 0 && (
+        <EmptyState icon={<LibraryBig className="size-7" />} title="还没有可用灵感" text="定时采集会写入公开素材，也可以先粘贴来源链接手动导入。" />
+      )}
+      {!loading && items.length > 0 && (
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-4">
+          {items.map((item) => (
+            <InspirationCard key={item.id} item={item} onFavorite={() => void toggleFavorite(item)} onUse={() => void useItem(item)} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function InspirationCard({
+  item,
+  onFavorite,
+  onUse,
+}: {
+  item: InspirationItem;
+  onFavorite: () => void;
+  onUse: () => void;
+}) {
+  const hasPrompt = item.prompt.trim().length > 0;
+  return (
+    <article className="group overflow-hidden rounded-lg border bg-card shadow-panel">
+      <InspirationThumb item={item} />
+      <div className="grid gap-3 p-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant="secondary">{item.sourceName || item.sourceKey || "来源"}</Badge>
+              {item.aspectRatio && <span className="text-xs text-muted-foreground">{item.aspectRatio}</span>}
+            </div>
+            <strong className="mt-2 line-clamp-2 block text-sm font-semibold">{item.title || item.author || "未命名灵感"}</strong>
+          </div>
+          <Button variant="ghost" size="icon" className="shrink-0 rounded-lg" onClick={onFavorite} aria-label={item.favorite ? "取消收藏" : "收藏"}>
+            <Heart className={cn("size-4", item.favorite && "fill-current text-rose-600")} />
+          </Button>
+        </div>
+        <p className={cn("min-h-16 text-sm leading-6", hasPrompt ? "line-clamp-3 text-foreground" : "text-muted-foreground")}>
+          {hasPrompt ? item.prompt : "这个素材没有可读取的提示词，可打开来源查看详情。"}
+        </p>
+        {item.tags.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {item.tags.slice(0, 4).map((tagName) => (
+              <Badge key={tagName} variant="outline" className="text-[11px]">
+                {tagName}
+              </Badge>
+            ))}
+          </div>
+        )}
+        <div className="flex items-center justify-between gap-2 border-t pt-3">
+          <Button variant="outline" size="sm" asChild>
+            <a href={item.originalUrl} target="_blank" rel="noreferrer">
+              <ExternalLink className="size-4" />
+              来源
+            </a>
+          </Button>
+          <Button size="sm" onClick={onUse} disabled={!hasPrompt}>
+            <Wand2 className="size-4" />
+            套用
+          </Button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function InspirationThumb({ item }: { item: InspirationItem }) {
+  const [failed, setFailed] = useState(false);
+  const src = failed ? null : item.thumbnailUrl;
+  return (
+    <div className="relative grid aspect-[4/3] place-items-center overflow-hidden bg-muted">
+      {src ? (
+        <img
+          src={src}
+          alt={item.title || item.prompt || "灵感图片"}
+          loading="lazy"
+          className="size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+          onError={() => setFailed(true)}
+        />
+      ) : (
+        <div className="grid justify-items-center gap-2 text-muted-foreground">
+          <Images className="size-7" />
+          <span className="text-xs">无缩略图</span>
+        </div>
+      )}
+      <div className="absolute left-3 top-3 flex gap-2">
+        {item.model && <Badge className="bg-background/85 text-foreground backdrop-blur">{item.model}</Badge>}
+      </div>
     </div>
   );
 }
@@ -822,13 +1194,28 @@ function statusText(status: GenerationJob["status"]): string {
 
 function statusBadgeClass(status?: GenerationJob["status"]): string {
   return {
-    queued: "border-amber-300 bg-amber-50 text-amber-800",
+    queued: "border-cyan-300 bg-cyan-50 text-cyan-800",
     running: "border-blue-300 bg-blue-50 text-blue-800",
     succeeded: "border-emerald-300 bg-emerald-50 text-emerald-800",
     failed: "border-red-300 bg-red-50 text-red-800",
     cancelled: "border-muted bg-muted text-muted-foreground",
     idle: "border-border bg-background text-muted-foreground",
   }[status ?? "idle"];
+}
+
+function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return remainingSeconds ? `${minutes} 分 ${remainingSeconds} 秒` : `${minutes} 分钟`;
+}
+
+function splitTags(value: string): string[] {
+  return value
+    .split(/[,\n，]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, 12);
 }
 
 declare global {

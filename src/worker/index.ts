@@ -23,8 +23,19 @@ import {
 import { apiKeyHint, decryptSecret, encryptSecret, hashPassword, makeSessionToken, sha256Hex, verifyPassword } from "./crypto";
 import { daysFromNow, envNumber, jsonError, randomId } from "./http";
 import { buildProviderEndpoint, normalizeSpaceName, validateBaseURL, verifyTurnstile } from "./security";
-import { processGenerationMessage, testProvider } from "./provider";
-import { AppBindings, Env, SpaceRecord } from "./types";
+import { processGenerationMessage, resolveGenerationTimeoutMs, testProvider } from "./provider";
+import {
+  getInspirationItem,
+  importInspirationUrl,
+  isInspirationQueueMessage,
+  listEnabledInspirationSources,
+  listInspirations,
+  parseInspirationTags,
+  processInspirationSourceMessage,
+  recordInspirationUse,
+  toggleInspirationFavorite,
+} from "./inspiration";
+import { AppBindings, Env, GenerationMessage, SpaceRecord } from "./types";
 import { parseGenerationInput, RATIO_TO_SIZE } from "./validation";
 
 const SESSION_COOKIE = "image2_session";
@@ -47,6 +58,7 @@ app.get("/api/config", (c) => {
       model: c.env.DEFAULT_IMAGE_MODEL ?? "gpt-image-2",
       maxImagesPerRequest: envNumber(c.env.MAX_IMAGES_PER_REQUEST, 4),
       maxDailyJobsPerSpace: envNumber(c.env.MAX_DAILY_JOBS_PER_SPACE, 50),
+      generationTimeoutSeconds: Math.round(resolveGenerationTimeoutMs(c.env.REQUEST_TIMEOUT_MS) / 1000),
       ratios: [...Object.keys(RATIO_TO_SIZE), "custom"],
       qualities: ["auto", "low", "medium", "high"],
       formats: ["png", "webp", "jpeg"],
@@ -284,6 +296,75 @@ app.get("/api/images/:imageId/download", async (c) => {
   });
 });
 
+app.get("/api/inspirations", async (c) => {
+  const result = await listInspirations(c.env.DB, c.get("space").id, {
+    q: c.req.query("q"),
+    source: c.req.query("source"),
+    tag: c.req.query("tag"),
+    favorites: c.req.query("favorites") === "1",
+    cursor: c.req.query("cursor"),
+  });
+  return c.json({
+    ok: true,
+    inspirations: result.items.map((item) => serializeInspiration(item)),
+    nextCursor: result.nextCursor,
+  });
+});
+
+app.post("/api/inspirations/import-url", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object") throw jsonError(400, "invalid_request", "请求体格式不正确。");
+  const raw = body as Record<string, unknown>;
+  if (typeof raw.url !== "string") throw jsonError(400, "invalid_url", "请输入灵感来源链接。");
+  const tags = Array.isArray(raw.tags) ? raw.tags.filter((item): item is string => typeof item === "string") : undefined;
+  try {
+    const item = await importInspirationUrl(c.env, {
+      url: raw.url,
+      prompt: typeof raw.prompt === "string" ? raw.prompt : undefined,
+      title: typeof raw.title === "string" ? raw.title : undefined,
+      author: typeof raw.author === "string" ? raw.author : undefined,
+      tags,
+    });
+    return c.json({ ok: true, inspiration: serializeInspiration({ ...item, favorite: 0 }) });
+  } catch (error) {
+    throw jsonError(400, "inspiration_import_failed", error instanceof Error ? error.message : "导入失败。");
+  }
+});
+
+app.post("/api/inspirations/:itemId/favorite", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const favorite = body && typeof body === "object" && typeof (body as Record<string, unknown>).favorite === "boolean"
+    ? ((body as Record<string, unknown>).favorite as boolean)
+    : undefined;
+  try {
+    const nextFavorite = await toggleInspirationFavorite(c.env.DB, c.get("space").id, c.req.param("itemId"), favorite);
+    return c.json({ ok: true, favorite: nextFavorite });
+  } catch (error) {
+    throw jsonError(404, "inspiration_not_found", error instanceof Error ? error.message : "灵感素材不存在。");
+  }
+});
+
+app.post("/api/inspirations/:itemId/use", async (c) => {
+  await recordInspirationUse(c.env.DB, c.req.param("itemId"));
+  return c.json({ ok: true });
+});
+
+app.get("/api/inspirations/:itemId/thumbnail", async (c) => {
+  const item = await getInspirationItem(c.env.DB, c.req.param("itemId"));
+  if (!item || item.status !== "published" || !item.thumbnail_storage_key) {
+    throw jsonError(404, "inspiration_thumbnail_missing", "灵感缩略图不存在。");
+  }
+  const object = await c.env.IMAGES.get(item.thumbnail_storage_key);
+  if (!object) throw jsonError(404, "inspiration_thumbnail_missing", "灵感缩略图不存在。");
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": item.thumbnail_mime_type ?? "image/jpeg",
+      "Cache-Control": "private, max-age=300",
+      "Content-Disposition": `inline; filename="${item.id}"`,
+    },
+  });
+});
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -293,9 +374,29 @@ export default {
     return env.ASSETS.fetch(request);
   },
 
+  async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    const sources = await listEnabledInspirationSources(env.DB);
+    const results = await Promise.allSettled(
+      sources.map((source) =>
+        env.INSPIRATION_QUEUE.send({
+          type: "inspiration-source",
+          sourceId: source.id,
+          trigger: "scheduled",
+        }),
+      ),
+    );
+    for (const result of results) {
+      if (result.status === "rejected") console.error("inspiration scheduled enqueue failed", result.reason);
+    }
+  },
+
   async queue(batch: MessageBatch, env: Env): Promise<void> {
     for (const message of batch.messages) {
-      await processGenerationMessage(message.body as { jobId: string; spaceId: string }, env);
+      if (isInspirationQueueMessage(message.body)) {
+        await processInspirationSourceMessage(message.body, env);
+      } else {
+        await processGenerationMessage(message.body as GenerationMessage, env);
+      }
       message.ack();
     }
   },
@@ -303,3 +404,51 @@ export default {
 
 // Force buildProviderEndpoint to stay typechecked with worker entry. It is also exported for tests.
 void buildProviderEndpoint;
+
+function serializeInspiration(item: Parameters<typeof inspirationItemShape>[0]) {
+  return inspirationItemShape(item);
+}
+
+function inspirationItemShape(item: {
+  id: string;
+  source_key?: string;
+  source_name?: string;
+  original_url: string;
+  author: string | null;
+  title: string | null;
+  prompt: string;
+  negative_prompt: string | null;
+  thumbnail_storage_key: string | null;
+  original_image_url: string | null;
+  width: number | null;
+  height: number | null;
+  aspect_ratio: string | null;
+  tags_json: string;
+  model: string | null;
+  safety: string;
+  use_count: number;
+  imported_at: string;
+  favorite?: number;
+}) {
+  return {
+    id: item.id,
+    sourceKey: item.source_key ?? "",
+    sourceName: item.source_name ?? "",
+    originalUrl: item.original_url,
+    author: item.author,
+    title: item.title,
+    prompt: item.prompt,
+    negativePrompt: item.negative_prompt,
+    thumbnailUrl: item.thumbnail_storage_key ? `/api/inspirations/${item.id}/thumbnail` : null,
+    externalImageUrl: item.original_image_url,
+    width: item.width,
+    height: item.height,
+    aspectRatio: item.aspect_ratio,
+    tags: parseInspirationTags(item.tags_json),
+    model: item.model,
+    safety: item.safety,
+    useCount: item.use_count,
+    importedAt: item.imported_at,
+    favorite: Boolean(item.favorite),
+  };
+}

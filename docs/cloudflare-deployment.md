@@ -6,7 +6,7 @@
 - Cloudflare account: `909a6b863d75fd896d98e647a884581e`
 - D1 database: `image-2-platform` / `038dabd7-a970-454a-b0a4-a9f7c8ed73df`
 - R2 bucket: `image-2-images`
-- Queue: `image-2-generation`
+- Queues: `image-2-generation`, `image-2-inspiration`
 - Turnstile: 第一版暂未启用，`TURNSTILE_REQUIRED = "false"`
 
 不要把 Cloudflare API Token、OpenAI/兼容服务 API Key、`APP_ENCRYPTION_KEY` 写入仓库。
@@ -21,6 +21,7 @@ npx wrangler login
 npx wrangler d1 create image-2-platform
 npx wrangler r2 bucket create image-2-images
 npx wrangler queues create image-2-generation
+npx wrangler queues create image-2-inspiration
 ```
 
 把 `d1 create` 返回的 `database_id` 写入 `wrangler.toml`。
@@ -30,6 +31,7 @@ npx wrangler queues create image-2-generation
 ```bash
 npx wrangler secret put APP_ENCRYPTION_KEY
 npx wrangler secret put TURNSTILE_SECRET_KEY
+npx wrangler secret put X_BEARER_TOKEN
 ```
 
 本地开发可创建 `.dev.vars`：
@@ -38,7 +40,10 @@ npx wrangler secret put TURNSTILE_SECRET_KEY
 APP_ENCRYPTION_KEY="replace-with-strong-random-secret"
 TURNSTILE_SECRET_KEY=""
 TURNSTILE_REQUIRED="false"
+X_BEARER_TOKEN=""
 ```
+
+如果不采集 X，可跳过 `X_BEARER_TOKEN`。X 来源只使用官方 API 或用户手动粘贴提示词导入，不做网页抓取。
 
 如果启用 Turnstile，需要在 Cloudflare 控制台创建 Turnstile site，并把 site key 填到 `wrangler.toml` 的 `TURNSTILE_SITE_KEY`。
 
@@ -78,6 +83,8 @@ npm run deploy
 - 图库能看到图片，并可以下载。
 - D1 中有任务和图片元数据。
 - R2 中有对应图片文件。
+- 灵感页可以看到 Civitai 定时采集或手动导入的素材，收藏后能在生成页套用提示词。
+- 本地可用 Wrangler 的 scheduled handler 冒烟触发 Cron：`curl "http://localhost:8787/cdn-cgi/handler/scheduled"`。
 
 ## 7. 成本保护默认值
 
@@ -85,5 +92,7 @@ npm run deploy
 - 单次生成数量：4
 - 单空间同时运行任务：2
 - 图片保留期：90 天，当前版本只记录配置，清理任务后续实现
+- 灵感单次采集：12 条
+- 灵感缩略图缓存上限：1MB，超过则只保存来源和图片外链
 
 超过每日 1000 个任务、R2 超过 50GB 或 Workers 请求接近免费层上限时，再升级 Workers Paid 或拆分服务。

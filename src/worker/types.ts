@@ -3,6 +3,7 @@ export interface Env {
   IMAGES: R2Bucket;
   ASSETS: Fetcher;
   GENERATION_QUEUE: Queue<GenerationMessage>;
+  INSPIRATION_QUEUE: Queue<InspirationQueueMessage>;
   APP_ENCRYPTION_KEY?: string;
   TURNSTILE_SECRET_KEY?: string;
   TURNSTILE_SITE_KEY?: string;
@@ -13,11 +14,21 @@ export interface Env {
   MAX_RUNNING_JOBS_PER_SPACE?: string;
   REQUEST_TIMEOUT_MS?: string;
   IMAGE_RETENTION_DAYS?: string;
+  X_BEARER_TOKEN?: string;
+  INSPIRATION_MAX_ITEMS_PER_RUN?: string;
+  INSPIRATION_THUMBNAIL_MAX_BYTES?: string;
+  INSPIRATION_AUTO_PUBLISH_SOURCES?: string;
 }
 
 export interface GenerationMessage {
   jobId: string;
   spaceId: string;
+}
+
+export interface InspirationQueueMessage {
+  type: "inspiration-source";
+  sourceId: string;
+  trigger: "scheduled" | "manual";
 }
 
 export interface SpaceRecord {
@@ -90,6 +101,60 @@ export interface ImageAssetRecord {
   prompt?: string;
   quality?: string;
   aspect_ratio?: string;
+}
+
+export interface InspirationSourceRecord {
+  id: string;
+  source_key: string;
+  name: string;
+  kind: "x" | "jimeng" | "civitai" | "generic";
+  enabled: number;
+  config_json: string;
+  last_run_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InspirationItemRecord {
+  id: string;
+  source_id: string;
+  source_item_id: string | null;
+  original_url: string;
+  author: string | null;
+  title: string | null;
+  prompt: string;
+  negative_prompt: string | null;
+  thumbnail_storage_key: string | null;
+  thumbnail_mime_type: string | null;
+  original_image_url: string | null;
+  width: number | null;
+  height: number | null;
+  aspect_ratio: string | null;
+  tags_json: string;
+  model: string | null;
+  safety: "sfw" | "nsfw" | "unknown";
+  status: "draft" | "published" | "hidden";
+  dedupe_key: string;
+  use_count: number;
+  imported_at: string;
+  created_at: string;
+  updated_at: string;
+  source_key?: string;
+  source_name?: string;
+  favorite?: number;
+}
+
+export interface InspirationImportRunRecord {
+  id: string;
+  source_id: string | null;
+  source_key: string | null;
+  trigger_type: "scheduled" | "manual";
+  status: "running" | "succeeded" | "failed";
+  items_seen: number;
+  items_imported: number;
+  error_message: string | null;
+  started_at: string;
+  completed_at: string | null;
 }
 
 export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
