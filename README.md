@@ -9,7 +9,8 @@
 - API Key 服务端 AES-GCM 加密保存
 - 提示词优化走 Responses API，图片生成走 Images API，二者复用同一套 `baseURL + API Key`
 - 支持 prompt、比例、尺寸、质量、数量、格式、压缩率；PNG/WebP 下可由提示词自动触发透明背景
-- 使用 shadcn/ui + Tailwind 构建创作工作台界面
+- 使用 shadcn/ui + Tailwind 构建创作工作台界面，生成页与图库共用生成记录状态，切换视图时直接保留记录卡片
+- 界面统一为无阴影样式，依靠边框、间距和状态色表达层级
 - D1 保存任务和图片元数据
 - R2 保存生成图片
 - Queues 异步处理生图任务

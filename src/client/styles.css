@@ -168,9 +168,6 @@
           rgb(110 255 48 / 0.14)
         )
         border-box;
-    box-shadow:
-      0 0 0 1px rgb(110 255 48 / 0.08),
-      0 0 32px rgb(110 255 48 / 0.08);
     animation: record-border-flow 2.4s linear infinite;
   }
 
@@ -222,7 +219,6 @@
     border: 0 !important;
     border-radius: 0 !important;
     background: transparent !important;
-    box-shadow: none !important;
     outline: none !important;
     --tw-ring-color: transparent;
     --tw-ring-offset-width: 0px;
@@ -239,7 +235,6 @@
   .figma-settings-input:-webkit-autofill,
   .figma-settings-input:-webkit-autofill:hover,
   .figma-settings-input:-webkit-autofill:focus {
-    box-shadow: 0 0 0 1000px #191919 inset !important;
     caret-color: rgb(255 255 255 / 0.9);
     -webkit-text-fill-color: rgb(255 255 255 / 0.9);
     transition: background-color 9999s ease-out 0s;
@@ -296,9 +291,6 @@
     overflow: hidden;
     border-radius: 12px;
     background: #191919;
-    box-shadow:
-      0 24px 80px rgb(0 0 0 / 0.45),
-      inset 0 0 0 1px rgb(255 255 255 / 0.04);
   }
 
   .image-preview-stage {
@@ -465,12 +457,6 @@
     background:
       linear-gradient(180deg, hsl(var(--card) / 0.76), hsl(var(--card) / 0.58)),
       hsl(var(--card));
-  }
-
-  .loader-disc {
-    box-shadow:
-      0 0 0 1px hsl(var(--primary) / 0.18),
-      0 0 64px hsl(var(--primary) / 0.12);
   }
 
   .entry-fade {

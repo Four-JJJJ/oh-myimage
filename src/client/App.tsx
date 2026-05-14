@@ -15,7 +15,21 @@ import {
   Undo2,
   X,
 } from "lucide-react";
-import { ChangeEvent, ClipboardEvent, CSSProperties, FormEvent, PointerEvent as ReactPointerEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ChangeEvent,
+  ClipboardEvent,
+  CSSProperties,
+  Dispatch,
+  FormEvent,
+  PointerEvent as ReactPointerEvent,
+  ReactNode,
+  SetStateAction,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { Alert, AlertDescription } from "./components/ui/alert";
 import { Button } from "./components/ui/button";
@@ -81,6 +95,8 @@ interface ImageSelectionStroke {
   brushRatio: number;
   points: ImageSelectionPoint[];
 }
+
+type LoadGenerationRecords = (cursor?: string, options?: { background?: boolean }) => Promise<void>;
 
 const FIGMA_RATIOS = ["16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "1:1"] as const;
 const RESOLUTIONS = ["1K", "2K", "4K"] as const;
@@ -175,11 +191,26 @@ export function App() {
   const [imageEditDraft, setImageEditDraft] = useState<GenerateForm | null>(null);
   const [imageEditMask, setImageEditMask] = useState<ImageSelectionMask | null>(null);
   const [pendingGenerateForm, setPendingGenerateForm] = useState<GenerateForm | null>(null);
+  const [generationRecords, setGenerationRecords] = useState<GenerationRecord[]>([]);
+  const [generationRecordsError, setGenerationRecordsError] = useState("");
+  const [generationNextCursor, setGenerationNextCursor] = useState<string | null>(null);
   const [booting, setBooting] = useState(true);
 
   const effectiveConfig = config ?? fallbackConfig;
   const dailyRemainingLabel = me?.dailyRemaining ?? effectiveConfig.maxDailyImagesPerSpace;
   const hideSmallTokenPromos = Boolean(me?.usesTokenFourjProvider);
+
+  const loadGenerationRecords = useCallback<LoadGenerationRecords>(async (cursor) => {
+    setGenerationRecordsError("");
+    try {
+      const path = cursor ? `/api/generations?cursor=${encodeURIComponent(cursor)}` : "/api/generations";
+      const result = await api<{ ok: true; records: GenerationRecord[]; nextCursor: string | null }>(path);
+      setGenerationRecords((current) => mergeGenerationRecordList(current, result.records, cursor ? "append" : "replace"));
+      setGenerationNextCursor(result.nextCursor);
+    } catch (err) {
+      setGenerationRecordsError(err instanceof Error ? err.message : "生成记录加载失败。");
+    }
+  }, []);
 
   const refreshMe = useCallback(async () => {
     const result = await api<{
@@ -254,10 +285,23 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!me) {
+      setGenerationRecords([]);
+      setGenerationNextCursor(null);
+      setGenerationRecordsError("");
+      return;
+    }
+
+    setGenerationRecords([]);
+    setGenerationNextCursor(null);
+    void loadGenerationRecords();
+  }, [loadGenerationRecords, me?.space.id]);
+
   if (booting) {
     return (
       <main className="app-shell grid min-h-screen place-items-center">
-        <div className="entry-fade flex items-center gap-3 rounded-lg border bg-card px-4 py-3 shadow-panel">
+        <div className="entry-fade flex items-center gap-3 rounded-lg border bg-card px-4 py-3">
           <span className="grid size-9 place-items-center rounded-md bg-primary text-primary-foreground">
             <Loader2 className="animate-spin" />
           </span>
@@ -363,6 +407,11 @@ export function App() {
               <GenerateView
                 config={effectiveConfig}
                 providerConfigured={me.providerConfigured}
+                records={generationRecords}
+                setRecords={setGenerationRecords}
+                recordsError={generationRecordsError}
+                nextCursor={generationNextCursor}
+                loadRecords={loadGenerationRecords}
                 onProviderNeeded={() => setView("settings")}
                 pendingEditImage={imageToEdit}
                 pendingEditForm={imageEditDraft}
@@ -377,6 +426,11 @@ export function App() {
               <GalleryView
                 config={effectiveConfig}
                 providerConfigured={me.providerConfigured}
+                records={generationRecords}
+                setRecords={setGenerationRecords}
+                recordsError={generationRecordsError}
+                nextCursor={generationNextCursor}
+                loadRecords={loadGenerationRecords}
                 onProviderNeeded={() => setView("settings")}
                 onEditImage={editImageFromGallery}
                 onEditPrompt={editPromptFromGallery}
@@ -443,7 +497,7 @@ function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Pr
             autoComplete="username"
             placeholder="请输入空间名称"
             required
-            className="mt-2 h-[34px] rounded-[10px] border-white/15 bg-transparent px-2 py-0 text-xs leading-none text-white/90 shadow-none placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0 focus-visible:ring-offset-0"
+            className="mt-2 h-[34px] rounded-[10px] border-white/15 bg-transparent px-2 py-0 text-xs leading-none text-white/90 placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0 focus-visible:ring-offset-0"
           />
 
           <Label htmlFor="space-password" className="mt-3.5 block text-xs font-normal leading-none text-white/90">
@@ -458,11 +512,11 @@ function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Pr
             autoComplete="current-password"
             placeholder="请输入空间密码"
             required
-            className="mt-2 h-[34px] rounded-[10px] border-white/15 bg-transparent px-2 py-0 text-xs leading-none text-white/90 shadow-none placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0 focus-visible:ring-offset-0"
+            className="mt-2 h-[34px] rounded-[10px] border-white/15 bg-transparent px-2 py-0 text-xs leading-none text-white/90 placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0 focus-visible:ring-offset-0"
           />
 
           <Button
-            className="mt-[22px] h-[34px] w-full rounded-[10px] border border-[#6eff30] bg-transparent px-2 py-0 text-xs font-semibold leading-none text-[#6eff30] shadow-none hover:bg-transparent hover:text-[#6eff30] focus-visible:ring-[#6eff30]/40"
+            className="mt-[22px] h-[34px] w-full rounded-[10px] border border-[#6eff30] bg-transparent px-2 py-0 text-xs font-semibold leading-none text-[#6eff30] hover:bg-transparent hover:text-[#6eff30] focus-visible:ring-[#6eff30]/40"
             disabled={loading}
           >
             {loading ? "进入中" : "进入空间"}
@@ -484,6 +538,11 @@ function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Pr
 function GenerateView({
   config,
   providerConfigured,
+  records,
+  setRecords,
+  recordsError,
+  nextCursor,
+  loadRecords,
   onProviderNeeded,
   pendingEditImage,
   pendingEditForm,
@@ -495,6 +554,11 @@ function GenerateView({
 }: {
   config: AppConfig;
   providerConfigured: boolean;
+  records: GenerationRecord[];
+  setRecords: Dispatch<SetStateAction<GenerationRecord[]>>;
+  recordsError: string;
+  nextCursor: string | null;
+  loadRecords: LoadGenerationRecords;
   onProviderNeeded: () => void;
   pendingEditImage: ImageItem | null;
   pendingEditForm: GenerateForm | null;
@@ -507,10 +571,6 @@ function GenerateView({
   const [form, setForm] = useState<GenerateForm>(defaultForm);
   const [job, setJob] = useState<GenerationJob | null>(null);
   const [images, setImages] = useState<ImageItem[]>([]);
-  const [records, setRecords] = useState<GenerationRecord[]>([]);
-  const [recordsLoading, setRecordsLoading] = useState(true);
-  const [recordsError, setRecordsError] = useState("");
-  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [turnstileToken, setTurnstileToken] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -623,21 +683,6 @@ function GenerateView({
     onPendingGenerateFormConsumed();
   }, [onPendingGenerateFormConsumed, pendingGenerateForm]);
 
-  const loadRecords = useCallback(async (cursor?: string, options?: { background?: boolean }) => {
-    if (!cursor && !options?.background) setRecordsLoading(true);
-    setRecordsError("");
-    try {
-      const path = cursor ? `/api/generations?cursor=${encodeURIComponent(cursor)}` : "/api/generations";
-      const result = await api<{ ok: true; records: GenerationRecord[]; nextCursor: string | null }>(path);
-      setRecords((current) => mergeGenerationRecordList(current, result.records, cursor ? "append" : "replace"));
-      setNextCursor(result.nextCursor);
-    } catch (err) {
-      setRecordsError(err instanceof Error ? err.message : "生成记录加载失败。");
-    } finally {
-      if (!cursor && !options?.background) setRecordsLoading(false);
-    }
-  }, []);
-
   const upsertRecord = useCallback((nextJob: GenerationJob, nextImages: ImageItem[]) => {
     setRecords((current) => {
       const record: GenerationRecord = {
@@ -650,11 +695,7 @@ function GenerateView({
       const rest = current.filter((item) => item.job.id !== nextJob.id);
       return [mergedRecord, ...rest];
     });
-  }, []);
-
-  useEffect(() => {
-    void loadRecords();
-  }, [loadRecords]);
+  }, [setRecords]);
 
   useEffect(() => {
     if (!job || isTerminalJobStatus(job.status)) return;
@@ -999,8 +1040,7 @@ function GenerateView({
       <section className="figma-records thin-scrollbar h-full min-w-0 flex-1 overflow-y-auto px-5 py-4">
         <div className="mx-auto flex w-[800px] max-w-full flex-col gap-3">
           {recordsError && <Notice tone="error" text={recordsError} />}
-          {recordsLoading && records.length === 0 && <LoadingPanel text="加载生成记录" />}
-          {!recordsLoading && !loading && records.length === 0 && (
+          {!loading && records.length === 0 && (
             <div className="figma-record-card grid min-h-[188px] place-items-center rounded-[10px] border border-white/15 p-6 text-center">
               <div className="flex flex-col items-center gap-3 text-white/40">
                 <Images className="size-7" />
@@ -1704,6 +1744,11 @@ function ImagePreviewEditPanel({
 function GalleryView({
   config,
   providerConfigured,
+  records,
+  setRecords,
+  recordsError,
+  nextCursor,
+  loadRecords,
   onProviderNeeded,
   onEditImage,
   onEditPrompt,
@@ -1711,14 +1756,16 @@ function GalleryView({
 }: {
   config: AppConfig;
   providerConfigured: boolean;
+  records: GenerationRecord[];
+  setRecords: Dispatch<SetStateAction<GenerationRecord[]>>;
+  recordsError: string;
+  nextCursor: string | null;
+  loadRecords: LoadGenerationRecords;
   onProviderNeeded: () => void;
   onEditImage: (image: ImageItem, draft?: GenerateForm, mask?: ImageSelectionMask) => void;
   onEditPrompt: (draft: GenerateForm) => void;
   onUsageChanged: () => Promise<void>;
 }) {
-  const [records, setRecords] = useState<GenerationRecord[]>([]);
-  const [recordsLoading, setRecordsLoading] = useState(true);
-  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState<GenerationJob | null>(null);
   const [activeImages, setActiveImages] = useState<ImageItem[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -1741,21 +1788,6 @@ function GalleryView({
     void onUsageChanged().catch(() => undefined);
   }, [onUsageChanged]);
 
-  const loadRecords = useCallback(async (cursor?: string, options?: { background?: boolean }) => {
-    if (!cursor && !options?.background) setRecordsLoading(true);
-    setError("");
-    try {
-      const path = cursor ? `/api/generations?cursor=${encodeURIComponent(cursor)}` : "/api/generations";
-      const result = await api<{ ok: true; records: GenerationRecord[]; nextCursor: string | null }>(path);
-      setRecords((current) => mergeGenerationRecordList(current, result.records, cursor ? "append" : "replace"));
-      setNextCursor(result.nextCursor);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "生成记录加载失败。");
-    } finally {
-      if (!cursor && !options?.background) setRecordsLoading(false);
-    }
-  }, []);
-
   const upsertRecord = useCallback((nextJob: GenerationJob, nextImages: ImageItem[]) => {
     setRecords((current) => {
       const record: GenerationRecord = {
@@ -1768,11 +1800,7 @@ function GalleryView({
       const rest = current.filter((item) => item.job.id !== nextJob.id);
       return [mergedRecord, ...rest];
     });
-  }, []);
-
-  useEffect(() => {
-    void loadRecords();
-  }, [loadRecords]);
+  }, [setRecords]);
 
   useEffect(() => {
     if (!activeJob || isTerminalJobStatus(activeJob.status)) return;
@@ -1897,9 +1925,9 @@ function GalleryView({
   return (
     <section className="entry-fade figma-records thin-scrollbar h-[calc(100dvh-64px)] flex-1 overflow-y-auto px-5 py-4">
       <div className="mx-auto flex w-[800px] max-w-full flex-col gap-3">
+        {recordsError && <Notice tone="error" text={recordsError} />}
         {error && <Notice tone="error" text={error} />}
-        {recordsLoading && records.length === 0 && <LoadingPanel text="加载生成记录" />}
-        {!recordsLoading && records.length === 0 && (
+        {records.length === 0 && (
           <div className="figma-record-card grid min-h-[188px] place-items-center rounded-[10px] border border-white/15 p-6 text-center">
             <div className="flex flex-col items-center gap-3 text-white/40">
               <Images className="size-7" />
@@ -2080,7 +2108,7 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
 
         <div className="mt-4 flex gap-2">
           <Button
-            className="h-10 flex-1 rounded-[10px] border border-[#6eff30] bg-transparent px-2.5 py-0 text-xs font-semibold leading-none text-[#6eff30] shadow-none hover:bg-[#6eff30]/10 hover:text-[#6eff30]"
+            className="h-10 flex-1 rounded-[10px] border border-[#6eff30] bg-transparent px-2.5 py-0 text-xs font-semibold leading-none text-[#6eff30] hover:bg-[#6eff30]/10 hover:text-[#6eff30]"
             disabled={saving}
           >
             {saving ? "保存中" : "保存"}
@@ -2088,7 +2116,7 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
           <Button
             type="button"
             variant="outline"
-            className="h-10 flex-1 rounded-[10px] border border-white/90 bg-transparent px-2.5 py-0 text-xs font-semibold leading-none text-white/90 shadow-none hover:bg-white/10 hover:text-white"
+            className="h-10 flex-1 rounded-[10px] border border-white/90 bg-transparent px-2.5 py-0 text-xs font-semibold leading-none text-white/90 hover:bg-white/10 hover:text-white"
             onClick={test}
           >
             测试
@@ -2118,7 +2146,7 @@ function SettingsTextField({
       <Input
         id={id}
         className={cn(
-          "figma-settings-input h-10 rounded-[10px] border-white/15 bg-transparent px-2 py-2.5 text-xs font-bold leading-none text-white/90 shadow-none caret-white/90 placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0",
+          "figma-settings-input h-10 rounded-[10px] border-white/15 bg-transparent px-2 py-2.5 text-xs font-bold leading-none text-white/90 caret-white/90 placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0",
           className,
         )}
         {...props}
@@ -2142,7 +2170,7 @@ function SettingsSelectField({
     <label className="flex flex-col gap-2">
       <span className="text-xs leading-none text-white/60">{label}</span>
       <Select value={value} onValueChange={onChange}>
-        <SelectTrigger className="h-10 rounded-[10px] border-white/15 bg-transparent px-2 py-2.5 text-xs font-semibold leading-none text-white shadow-none focus:ring-0 focus:ring-offset-0 [&>svg]:size-3 [&>svg]:opacity-100">
+        <SelectTrigger className="h-10 rounded-[10px] border-white/15 bg-transparent px-2 py-2.5 text-xs font-semibold leading-none text-white focus:ring-0 focus:ring-offset-0 [&>svg]:size-3 [&>svg]:opacity-100">
           <SelectValue />
         </SelectTrigger>
         <SelectContent className="border-white/15 bg-[#191919] text-white">
@@ -2177,20 +2205,9 @@ function EmptyState({ icon, title, text }: { icon: ReactNode; title: string; tex
   return (
     <div className="empty-state grid min-h-[520px] place-items-center rounded-lg border bg-card/70 p-6 text-center">
       <div className="grid max-w-sm justify-items-center gap-3">
-        <div className="grid size-16 place-items-center rounded-full border bg-background text-muted-foreground shadow-panel">{icon}</div>
+        <div className="grid size-16 place-items-center rounded-full border bg-background text-muted-foreground">{icon}</div>
         <strong className="text-lg font-semibold">{title}</strong>
         <span className="text-sm leading-6 text-muted-foreground">{text}</span>
-      </div>
-    </div>
-  );
-}
-
-function LoadingPanel({ text }: { text: string }) {
-  return (
-    <div className="grid min-h-80 place-items-center rounded-lg border bg-card text-muted-foreground shadow-panel">
-      <div className="flex items-center gap-3">
-        <Loader2 className="animate-spin" />
-        <span className="text-sm font-medium">{text}</span>
       </div>
     </div>
   );
