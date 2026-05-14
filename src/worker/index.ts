@@ -191,8 +191,8 @@ async function assertGenerationLimitsForRequest(env: Env, spaceId: string, reque
   }
 }
 
-function hasUnlimitedDailyImageQuota(credential: Pick<CredentialRecord, "base_url" | "last_test_ok">): boolean {
-  return Boolean(credential.last_test_ok) && isTokenFourjBaseURL(credential.base_url);
+export function hasUnlimitedDailyImageQuota(credential: Pick<CredentialRecord, "base_url">): boolean {
+  return isTokenFourjBaseURL(credential.base_url);
 }
 
 function dailyImageLimit(env: Env): number {
