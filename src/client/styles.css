@@ -7,40 +7,40 @@
 
 @layer base {
   :root {
-    color-scheme: light;
-    --background: 214 32% 98%;
-    --foreground: 222 36% 12%;
-    --card: 0 0% 100%;
-    --card-foreground: 222 36% 12%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 222 36% 12%;
-    --primary: 221 74% 42%;
-    --primary-foreground: 210 40% 98%;
-    --secondary: 214 28% 92%;
-    --secondary-foreground: 222 30% 16%;
-    --muted: 214 24% 94%;
-    --muted-foreground: 219 14% 42%;
-    --accent: 190 42% 90%;
-    --accent-foreground: 198 54% 18%;
-    --destructive: 0 72% 47%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 215 20% 84%;
-    --input: 215 20% 84%;
-    --ring: 221 74% 42%;
+    color-scheme: dark;
+    --background: 0 0% 4%;
+    --foreground: 0 0% 96%;
+    --card: 0 0% 8%;
+    --card-foreground: 0 0% 96%;
+    --popover: 0 0% 8%;
+    --popover-foreground: 0 0% 96%;
+    --primary: 107 92% 58%;
+    --primary-foreground: 0 0% 5%;
+    --secondary: 0 0% 14%;
+    --secondary-foreground: 0 0% 94%;
+    --muted: 0 0% 13%;
+    --muted-foreground: 0 0% 62%;
+    --accent: 107 70% 18%;
+    --accent-foreground: 107 92% 72%;
+    --destructive: 0 76% 58%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 18%;
+    --input: 0 0% 24%;
+    --ring: 107 92% 58%;
     --radius: 0.5rem;
-    --chart-1: 221 74% 42%;
-    --chart-2: 189 70% 36%;
-    --chart-3: 261 52% 48%;
-    --chart-4: 158 58% 36%;
-    --chart-5: 348 62% 48%;
-    --sidebar: 216 30% 96%;
-    --sidebar-foreground: 222 36% 12%;
-    --sidebar-primary: 221 74% 42%;
-    --sidebar-primary-foreground: 210 40% 98%;
-    --sidebar-accent: 190 42% 90%;
-    --sidebar-accent-foreground: 198 54% 18%;
-    --sidebar-border: 215 20% 84%;
-    --sidebar-ring: 221 74% 42%;
+    --chart-1: 107 92% 58%;
+    --chart-2: 43 90% 60%;
+    --chart-3: 174 62% 50%;
+    --chart-4: 18 82% 56%;
+    --chart-5: 295 55% 62%;
+    --sidebar: 0 0% 7%;
+    --sidebar-foreground: 0 0% 88%;
+    --sidebar-primary: 107 92% 58%;
+    --sidebar-primary-foreground: 0 0% 5%;
+    --sidebar-accent: 0 0% 13%;
+    --sidebar-accent-foreground: 0 0% 96%;
+    --sidebar-border: 0 0% 18%;
+    --sidebar-ring: 107 92% 58%;
   }
 
   * {
@@ -49,18 +49,26 @@
 
   html {
     font-family:
-      "Aptos",
-      "Segoe UI",
+      "Inter Variable",
       "Noto Sans SC",
+      "PingFang SC",
+      "Microsoft YaHei",
       system-ui,
       sans-serif;
     @apply font-sans;
   }
 
   body {
-    @apply min-h-screen antialiased bg-background text-foreground;
+    @apply min-h-screen bg-background text-foreground antialiased;
     margin: 0;
     min-width: 320px;
+    text-rendering: optimizeLegibility;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
   }
 
   button,
@@ -73,48 +81,395 @@
   button {
     cursor: pointer;
   }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.28);
+    color: hsl(var(--foreground));
+  }
+
   .theme {
     --font-heading: var(--font-sans);
-    --font-sans: 'Inter Variable', sans-serif;
+    --font-sans: "Inter Variable", sans-serif;
   }
-  .dark {
-    --background: 222 36% 8%;
-    --foreground: 210 40% 96%;
-    --card: 222 31% 11%;
-    --card-foreground: 210 40% 96%;
-    --popover: 222 31% 11%;
-    --popover-foreground: 210 40% 96%;
-    --primary: 212 86% 62%;
-    --primary-foreground: 222 36% 8%;
-    --secondary: 220 22% 18%;
-    --secondary-foreground: 210 40% 96%;
-    --muted: 220 20% 17%;
-    --muted-foreground: 216 16% 72%;
-    --accent: 190 42% 22%;
-    --accent-foreground: 185 50% 88%;
-    --destructive: 0 70% 58%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 219 20% 22%;
-    --input: 219 20% 22%;
-    --ring: 212 86% 62%;
-    --chart-1: 212 86% 62%;
-    --chart-2: 188 78% 52%;
-    --chart-3: 262 68% 66%;
-    --chart-4: 158 62% 48%;
-    --chart-5: 348 72% 62%;
-    --sidebar: 222 31% 11%;
-    --sidebar-foreground: 210 40% 96%;
-    --sidebar-primary: 212 86% 62%;
-    --sidebar-primary-foreground: 222 36% 8%;
-    --sidebar-accent: 190 42% 22%;
-    --sidebar-accent-foreground: 185 50% 88%;
-    --sidebar-border: 219 20% 22%;
-    --sidebar-ring: 212 86% 62%;
+}
+
+@layer components {
+  .app-shell {
+    background:
+      linear-gradient(180deg, hsl(0 0% 6%) 0%, hsl(0 0% 4%) 58%, hsl(0 0% 3%) 100%),
+      hsl(var(--background));
+  }
+
+  .figma-app,
+  .figma-login-home,
+  .figma-composer,
+  .figma-records,
+  .figma-top-bar,
+  .figma-left-rail {
+    background: #191919;
+  }
+
+  .figma-login-home {
+    font-family:
+      "PingFang SC",
+      "Noto Sans SC",
+      "Microsoft YaHei",
+      system-ui,
+      sans-serif;
+  }
+
+  .figma-left-rail {
+    border-right: 1px solid rgb(255 255 255 / 0.1);
+  }
+
+  .figma-top-bar {
+    border-color: rgb(255 255 255 / 0.1);
+  }
+
+  .figma-composer {
+    border-color: rgb(255 255 255 / 0.1);
+  }
+
+  .figma-nav-button {
+    display: grid;
+    width: 32px;
+    height: 32px;
+    place-items: center;
+    border-radius: 6px;
+    color: rgb(255 255 255 / 0.7);
+    transition:
+      background-color 160ms ease,
+      color 160ms ease;
+  }
+
+  .figma-nav-button:hover,
+  .figma-nav-button-active {
+    background: rgb(255 255 255 / 0.15);
+    color: rgb(255 255 255 / 0.95);
+  }
+
+  .figma-prompt-box,
+  .figma-param-panel,
+  .figma-record-card {
+    background: #191919;
+  }
+
+  .figma-record-card-generating {
+    --record-border-angle: 0deg;
+    border-color: transparent;
+    background:
+      linear-gradient(#191919, #191919) padding-box,
+      conic-gradient(
+          from var(--record-border-angle),
+          rgb(110 255 48 / 0.14),
+          rgb(110 255 48 / 0.82),
+          rgb(255 255 255 / 0.26),
+          rgb(110 255 48 / 0.42),
+          rgb(110 255 48 / 0.14)
+        )
+        border-box;
+    box-shadow:
+      0 0 0 1px rgb(110 255 48 / 0.08),
+      0 0 32px rgb(110 255 48 / 0.08);
+    animation: record-border-flow 2.4s linear infinite;
+  }
+
+  .figma-prompt-textarea,
+  .figma-prompt-textarea:focus,
+  .figma-prompt-textarea:focus-visible {
+    appearance: none;
+    border: 0 !important;
+    border-radius: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    outline: none !important;
+    --tw-ring-color: transparent;
+    --tw-ring-offset-width: 0px;
+  }
+
+  .figma-segment {
+    transition:
+      border-color 140ms ease,
+      background-color 140ms ease;
+  }
+
+  .figma-segment:hover {
+    border-color: rgb(255 255 255 / 0.35);
+    background: rgb(255 255 255 / 0.08);
+  }
+
+  .figma-generate-button {
+    transition:
+      background-color 140ms ease,
+      color 140ms ease;
+  }
+
+  .figma-generate-button:hover:not(:disabled) {
+    background: rgb(110 255 48 / 0.1);
+  }
+
+  .figma-icon-action {
+    display: grid;
+    width: 14px;
+    height: 14px;
+    place-items: center;
+    color: rgb(255 255 255 / 0.9);
+    transition: color 140ms ease;
+  }
+
+  .figma-icon-action:hover {
+    color: #6eff30;
+  }
+
+  .image-preview-panel {
+    --preview-panel-width: 762px;
+    --preview-panel-height: 762px;
+    --preview-editor-width: 0px;
+    --preview-control-inset: 16px;
+    --preview-image-inset: 61px;
+    --preview-stage-left: var(--preview-image-inset);
+    position: relative;
+    width: var(--preview-panel-width);
+    height: var(--preview-panel-height);
+    max-width: calc(100vw - 48px);
+    max-width: calc(100dvw - 48px);
+    max-height: calc(100vh - 48px);
+    max-height: calc(100dvh - 48px);
+    overflow: hidden;
+    border-radius: 12px;
+    background: #191919;
+    box-shadow:
+      0 24px 80px rgb(0 0 0 / 0.45),
+      inset 0 0 0 1px rgb(255 255 255 / 0.04);
+  }
+
+  .image-preview-stage {
+    position: absolute;
+    top: var(--preview-image-inset);
+    right: var(--preview-image-inset);
+    bottom: var(--preview-image-inset);
+    left: var(--preview-stage-left);
+    display: grid;
+    overflow: hidden;
+    place-items: center;
+    border: 1px solid rgb(255 255 255 / 0.1);
+    border-radius: 6px;
+    background: rgb(255 255 255 / 0.1);
+  }
+
+  .image-preview-stage-selection {
+    cursor: crosshair;
+  }
+
+  .image-preview-stage img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+
+  .image-preview-selection-canvas {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    touch-action: none;
+  }
+
+  .image-preview-actions {
+    position: absolute;
+    z-index: 1;
+    top: var(--preview-control-inset);
+    left: var(--preview-control-inset);
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+
+  .image-preview-selection-toolbar {
+    position: absolute;
+    z-index: 2;
+    top: var(--preview-control-inset);
+    right: 48px;
+    left: calc(var(--preview-editor-width) + var(--preview-control-inset));
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+  }
+
+  .image-preview-panel-edit {
+    --preview-stage-left: calc(var(--preview-editor-width) + var(--preview-image-inset));
+  }
+
+  .image-preview-panel-edit .image-preview-actions {
+    left: calc(var(--preview-editor-width) + var(--preview-control-inset));
+  }
+
+  .image-preview-editor {
+    position: absolute;
+    inset: 0 auto 0 0;
+    display: flex;
+    width: var(--preview-editor-width);
+    min-width: 0;
+    flex-direction: column;
+    border-right: 1px solid rgb(255 255 255 / 0.1);
+    background: #191919;
+  }
+
+  .image-preview-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: 0;
+    background: transparent;
+    color: rgb(255 255 255 / 0.9);
+    font-size: 12px;
+    line-height: 1;
+    text-decoration: none;
+    transition: color 140ms ease;
+  }
+
+  .image-preview-action:hover,
+  .image-preview-action:focus-visible,
+  .image-preview-close:hover,
+  .image-preview-close:focus-visible {
+    color: #6eff30;
+  }
+
+  .image-preview-action:disabled,
+  .image-preview-action:disabled:hover,
+  .image-preview-action:disabled:focus-visible {
+    cursor: not-allowed;
+    color: rgb(255 255 255 / 0.4);
+  }
+
+  .image-preview-action svg,
+  .image-preview-close svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  .image-preview-close {
+    position: absolute;
+    z-index: 1;
+    top: 8px;
+    right: 8px;
+    display: grid;
+    width: 28px;
+    height: 28px;
+    place-items: center;
+    border: 0;
+    background: transparent;
+    color: rgb(255 255 255 / 0.9);
+    transition: color 140ms ease;
+  }
+
+  .record-prompt {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+  }
+
+  .left-rail {
+    background: hsl(var(--sidebar) / 0.96);
+    border-right: 1px solid hsl(var(--sidebar-border));
+  }
+
+  .top-bar {
+    background: hsl(var(--background) / 0.86);
+    border-color: hsl(var(--border));
+  }
+
+  .composer-panel {
+    background: hsl(0 0% 7% / 0.96);
+    border-color: hsl(var(--border));
+  }
+
+  .workspace-plane {
+    background:
+      linear-gradient(180deg, hsl(0 0% 5%) 0%, hsl(0 0% 4%) 100%),
+      hsl(var(--background));
+  }
+
+  .preview-console {
+    background:
+      linear-gradient(180deg, hsl(0 0% 9%) 0%, hsl(0 0% 7%) 100%),
+      hsl(var(--card));
+  }
+
+  .prompt-mock,
+  .prompt-input {
+    background:
+      linear-gradient(180deg, hsl(0 0% 8%) 0%, hsl(0 0% 7%) 100%),
+      hsl(var(--background));
+  }
+
+  .empty-state {
+    background:
+      linear-gradient(180deg, hsl(var(--card) / 0.76), hsl(var(--card) / 0.58)),
+      hsl(var(--card));
+  }
+
+  .loader-disc {
+    box-shadow:
+      0 0 0 1px hsl(var(--primary) / 0.18),
+      0 0 64px hsl(var(--primary) / 0.12);
+  }
+
+  .entry-fade {
+    animation: entry-fade 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .thin-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted)) transparent;
+  }
+
+  .thin-scrollbar::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .thin-scrollbar::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted));
+    border-radius: 999px;
   }
 }
 
 @layer utilities {
   .text-balance {
     text-wrap: balance;
+  }
+}
+
+@keyframes entry-fade {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@property --record-border-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes record-border-flow {
+  to {
+    --record-border-angle: 360deg;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.001ms !important;
   }
 }

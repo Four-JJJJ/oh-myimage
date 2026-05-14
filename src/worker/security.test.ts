@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildProviderEndpoint, validateBaseURL } from "./security";
+import { buildProviderEndpoint, isTokenFourjBaseURL, validateBaseURL } from "./security";
 
 describe("baseURL safety", () => {
   it("accepts public HTTPS provider URLs", () => {
@@ -20,5 +20,11 @@ describe("baseURL safety", () => {
     expect(buildProviderEndpoint("https://api.openai.com/v1", "/images/generations")).toBe(
       "https://api.openai.com/v1/images/generations",
     );
+  });
+
+  it("detects token.fourj.space provider URLs", () => {
+    expect(isTokenFourjBaseURL("https://token.fourj.space/v1")).toBe(true);
+    expect(isTokenFourjBaseURL("https://api.openai.com/v1")).toBe(false);
+    expect(isTokenFourjBaseURL("https://not-token.fourj.space/v1")).toBe(false);
   });
 });

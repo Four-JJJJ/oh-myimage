@@ -1,0 +1,17 @@
+[Unit]
+Description=oh-myimage API
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/oh-myimage/current
+EnvironmentFile=/etc/oh-myimage/oh-myimage.env
+ExecStart=/usr/bin/npm run start:node
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

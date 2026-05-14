@@ -19,7 +19,7 @@
     "paths": {
       "@/*": ["src/client/*"]
     },
-    "types": ["@cloudflare/workers-types", "vitest/globals"]
+    "types": ["@cloudflare/workers-types", "vitest/globals", "node"]
   },
   "include": ["src", "test", "vite.config.ts"]
 }

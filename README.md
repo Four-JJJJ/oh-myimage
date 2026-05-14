@@ -1,17 +1,19 @@
 # oh-myimage
 
-在线 Image-2 生图平台。第一版采用 Cloudflare 低成本架构：React + Vite + shadcn/ui + Cloudflare Worker + Hono + D1 + R2 + Queues。
+在线 Image-2 生图平台。第一版采用 Cloudflare 低成本架构：React + Vite + shadcn/ui + Cloudflare Worker + Hono + D1 + R2 + Queues；同时支持长期稳定的 Node 服务器部署：Hono + Postgres + Redis/BullMQ + R2。
 
 ## 功能
 
 - 空间名 + 密码进入独立工作区
-- 用户自填 `baseURL + API Key + model`
+- 用户自填 `baseURL + API Key`，并配置生图模型与提示词优化模型
 - API Key 服务端 AES-GCM 加密保存
-- 支持 prompt、比例、尺寸、质量、数量、格式、透明背景、压缩率
+- 提示词优化走 Responses API，图片生成走 Images API，二者复用同一套 `baseURL + API Key`
+- 支持 prompt、比例、尺寸、质量、数量、格式、压缩率；PNG/WebP 下可由提示词自动触发透明背景
 - 使用 shadcn/ui + Tailwind 构建创作工作台界面
 - D1 保存任务和图片元数据
 - R2 保存生成图片
 - Queues 异步处理生图任务
+- Node 部署模式使用 Postgres 保存元数据、Redis/BullMQ 异步处理长生图任务、R2 保存图片，避免 Cloudflare Worker 出站链路截断长请求
 - 灵感库代码保留，但当前默认隐藏并暂停定时采集
 - 基础配额、并发限制、SSRF 防护和日志脱敏
 
@@ -50,3 +52,5 @@ npx wrangler deploy --dry-run
 部署到 Cloudflare 前需要创建 D1、R2、Queue、Turnstile，并把 D1 的 `database_id` 写入 `wrangler.toml`。
 
 完整步骤见 [docs/cloudflare-deployment.md](docs/cloudflare-deployment.md)。
+
+独立服务器部署见 [docs/node-server-deployment.md](docs/node-server-deployment.md)。该模式用于长时间 Image-2 请求，默认监听 `127.0.0.1:8788`，通过独立 nginx server block 暴露，不影响现有 NewAPI。

@@ -1,0 +1,10 @@
+[Unit]
+Description=oh-myimage scheduled jobs
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/oh-myimage/current
+EnvironmentFile=/etc/oh-myimage/oh-myimage.env
+ExecStart=/usr/bin/npm run cron:node

@@ -1,5 +1,6 @@
-import { randomId, todayStartIso } from "./http";
+import { randomId, todayStartTimestamp } from "./http";
 import {
+  AppDatabase,
   CredentialRecord,
   GenerationJobRecord,
   ImageAssetRecord,
@@ -9,12 +10,27 @@ import {
 } from "./types";
 import { GenerationInput } from "./validation";
 
-export async function getSpaceByKey(db: D1Database, spaceKey: string): Promise<SpaceRecord | null> {
+export const IMAGE_GENERATED_EVENT = "image_generated";
+
+export interface StoredReferenceImage {
+  storageKey: string;
+  mimeType: string;
+  name: string;
+  byteSize: number;
+}
+
+export interface DailyImageUsage {
+  generated: number;
+  pending: number;
+  total: number;
+}
+
+export async function getSpaceByKey(db: AppDatabase, spaceKey: string): Promise<SpaceRecord | null> {
   return db.prepare("SELECT * FROM spaces WHERE space_key = ?").bind(spaceKey).first<SpaceRecord>();
 }
 
 export async function createSpace(
-  db: D1Database,
+  db: AppDatabase,
   displayName: string,
   spaceKey: string,
   passwordHash: string,
@@ -29,14 +45,14 @@ export async function createSpace(
   return space;
 }
 
-export async function createSession(db: D1Database, spaceId: string, tokenHash: string, expiresAt: string): Promise<void> {
+export async function createSession(db: AppDatabase, spaceId: string, tokenHash: string, expiresAt: string): Promise<void> {
   await db
     .prepare("INSERT INTO space_sessions (id, space_id, token_hash, expires_at) VALUES (?, ?, ?, ?)")
     .bind(randomId("ses"), spaceId, tokenHash, expiresAt)
     .run();
 }
 
-export async function getSession(db: D1Database, tokenHash: string): Promise<(SessionRecord & SpaceRecord) | null> {
+export async function getSession(db: AppDatabase, tokenHash: string): Promise<(SessionRecord & SpaceRecord) | null> {
   return db
     .prepare(
       `SELECT
@@ -58,15 +74,16 @@ export async function getSession(db: D1Database, tokenHash: string): Promise<(Se
     .first<SessionRecord & SpaceRecord & { space_id_record: string }>();
 }
 
-export async function deleteSession(db: D1Database, tokenHash: string): Promise<void> {
+export async function deleteSession(db: AppDatabase, tokenHash: string): Promise<void> {
   await db.prepare("DELETE FROM space_sessions WHERE token_hash = ?").bind(tokenHash).run();
 }
 
 export async function upsertCredential(
-  db: D1Database,
+  db: AppDatabase,
   spaceId: string,
   baseURL: string,
   model: string,
+  promptOptimizerModel: string,
   encryptedApiKey: string,
   apiKeyHint: string,
 ): Promise<void> {
@@ -75,32 +92,33 @@ export async function upsertCredential(
     await db
       .prepare(
         `UPDATE api_credentials
-         SET base_url = ?, model = ?, encrypted_api_key = ?, api_key_hint = ?, updated_at = CURRENT_TIMESTAMP
+         SET base_url = ?, model = ?, prompt_optimizer_model = ?, encrypted_api_key = ?, api_key_hint = ?,
+             last_test_ok = 0, last_tested_at = NULL, updated_at = CURRENT_TIMESTAMP
          WHERE space_id = ?`,
       )
-      .bind(baseURL, model, encryptedApiKey, apiKeyHint, spaceId)
+      .bind(baseURL, model, promptOptimizerModel, encryptedApiKey, apiKeyHint, spaceId)
       .run();
     return;
   }
 
   await db
     .prepare(
-      `INSERT INTO api_credentials (id, space_id, base_url, model, encrypted_api_key, api_key_hint)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO api_credentials (id, space_id, base_url, model, prompt_optimizer_model, encrypted_api_key, api_key_hint)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
-    .bind(randomId("cred"), spaceId, baseURL, model, encryptedApiKey, apiKeyHint)
+    .bind(randomId("cred"), spaceId, baseURL, model, promptOptimizerModel, encryptedApiKey, apiKeyHint)
     .run();
 }
 
-export async function getCredential(db: D1Database, spaceId: string): Promise<CredentialRecord | null> {
+export async function getCredential(db: AppDatabase, spaceId: string): Promise<CredentialRecord | null> {
   return db.prepare("SELECT * FROM api_credentials WHERE space_id = ?").bind(spaceId).first<CredentialRecord>();
 }
 
-export async function deleteCredential(db: D1Database, spaceId: string): Promise<void> {
+export async function deleteCredential(db: AppDatabase, spaceId: string): Promise<void> {
   await db.prepare("DELETE FROM api_credentials WHERE space_id = ?").bind(spaceId).run();
 }
 
-export async function markCredentialTested(db: D1Database, spaceId: string, ok: boolean): Promise<void> {
+export async function markCredentialTested(db: AppDatabase, spaceId: string, ok: boolean): Promise<void> {
   await db
     .prepare(
       `UPDATE api_credentials
@@ -112,22 +130,26 @@ export async function markCredentialTested(db: D1Database, spaceId: string, ok: 
 }
 
 export async function createGenerationJob(
-  db: D1Database,
+  db: AppDatabase,
   spaceId: string,
   input: GenerationInput,
   model: string,
   baseUrlHash: string,
+  referenceImage?: StoredReferenceImage,
+  maskImage?: StoredReferenceImage,
+  jobId = randomId("job"),
 ): Promise<string> {
-  const id = randomId("job");
   await db
     .prepare(
       `INSERT INTO generation_jobs (
         id, space_id, status, prompt, aspect_ratio, width, height, quality, quantity,
-        output_format, background, compression, moderation, model, base_url_hash
-      ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        output_format, background, compression, moderation, model, base_url_hash,
+        reference_image_storage_key, reference_image_mime_type, reference_image_name, reference_image_byte_size,
+        mask_image_storage_key, mask_image_mime_type, mask_image_name, mask_image_byte_size
+      ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
-      id,
+      jobId,
       spaceId,
       input.prompt,
       input.aspectRatio,
@@ -141,13 +163,21 @@ export async function createGenerationJob(
       input.moderation,
       model,
       baseUrlHash,
+      referenceImage?.storageKey ?? null,
+      referenceImage?.mimeType ?? null,
+      referenceImage?.name ?? null,
+      referenceImage?.byteSize ?? null,
+      maskImage?.storageKey ?? null,
+      maskImage?.mimeType ?? null,
+      maskImage?.name ?? null,
+      maskImage?.byteSize ?? null,
     )
     .run();
-  return id;
+  return jobId;
 }
 
 export async function getGenerationJob(
-  db: D1Database,
+  db: AppDatabase,
   spaceId: string,
   jobId: string,
 ): Promise<GenerationJobRecord | null> {
@@ -157,11 +187,30 @@ export async function getGenerationJob(
     .first<GenerationJobRecord>();
 }
 
-export async function getGenerationJobForWorker(db: D1Database, jobId: string): Promise<GenerationJobRecord | null> {
+export async function getGenerationJobForWorker(db: AppDatabase, jobId: string): Promise<GenerationJobRecord | null> {
   return db.prepare("SELECT * FROM generation_jobs WHERE id = ?").bind(jobId).first<GenerationJobRecord>();
 }
 
-export async function listImagesForJob(db: D1Database, spaceId: string, jobId: string): Promise<ImageAssetRecord[]> {
+export async function deleteGenerationJob(db: AppDatabase, spaceId: string, jobId: string): Promise<void> {
+  await db.prepare("DELETE FROM generation_jobs WHERE id = ? AND space_id = ?").bind(jobId, spaceId).run();
+}
+
+export async function listGenerationJobs(db: AppDatabase, spaceId: string, cursor?: string): Promise<GenerationJobRecord[]> {
+  const sql = cursor
+    ? `SELECT * FROM generation_jobs
+       WHERE space_id = ? AND created_at < ?
+       ORDER BY created_at DESC
+       LIMIT 30`
+    : `SELECT * FROM generation_jobs
+       WHERE space_id = ?
+       ORDER BY created_at DESC
+       LIMIT 30`;
+  const statement = cursor ? db.prepare(sql).bind(spaceId, cursor) : db.prepare(sql).bind(spaceId);
+  const result = await statement.all<GenerationJobRecord>();
+  return result.results ?? [];
+}
+
+export async function listImagesForJob(db: AppDatabase, spaceId: string, jobId: string): Promise<ImageAssetRecord[]> {
   const result = await db
     .prepare("SELECT * FROM image_assets WHERE job_id = ? AND space_id = ? ORDER BY created_at ASC")
     .bind(jobId, spaceId)
@@ -169,7 +218,21 @@ export async function listImagesForJob(db: D1Database, spaceId: string, jobId: s
   return result.results ?? [];
 }
 
-export async function listImages(db: D1Database, spaceId: string, cursor?: string): Promise<ImageAssetRecord[]> {
+export async function listImagesForJobs(db: AppDatabase, spaceId: string, jobIds: string[]): Promise<ImageAssetRecord[]> {
+  if (jobIds.length === 0) return [];
+  const placeholders = jobIds.map(() => "?").join(", ");
+  const result = await db
+    .prepare(
+      `SELECT * FROM image_assets
+       WHERE space_id = ? AND job_id IN (${placeholders})
+       ORDER BY created_at ASC`,
+    )
+    .bind(spaceId, ...jobIds)
+    .all<ImageAssetRecord>();
+  return result.results ?? [];
+}
+
+export async function listImages(db: AppDatabase, spaceId: string, cursor?: string): Promise<ImageAssetRecord[]> {
   const sql = cursor
     ? `SELECT image_assets.*, generation_jobs.prompt, generation_jobs.quality, generation_jobs.aspect_ratio
        FROM image_assets
@@ -188,44 +251,86 @@ export async function listImages(db: D1Database, spaceId: string, cursor?: strin
   return result.results ?? [];
 }
 
-export async function getImage(db: D1Database, spaceId: string, imageId: string): Promise<ImageAssetRecord | null> {
+export async function getImage(db: AppDatabase, spaceId: string, imageId: string): Promise<ImageAssetRecord | null> {
   return db
     .prepare("SELECT * FROM image_assets WHERE id = ? AND space_id = ?")
     .bind(imageId, spaceId)
     .first<ImageAssetRecord>();
 }
 
-export async function countDailyJobs(db: D1Database, spaceId: string): Promise<number> {
+export async function countDailyGeneratedImages(db: AppDatabase, spaceId: string): Promise<number> {
   const row = await db
-    .prepare("SELECT COUNT(*) AS count FROM generation_jobs WHERE space_id = ? AND created_at >= ?")
-    .bind(spaceId, todayStartIso())
-    .first<{ count: number }>();
-  return row?.count ?? 0;
+    .prepare("SELECT COUNT(*) AS count FROM rate_limit_events WHERE space_id = ? AND event_type = ? AND created_at >= ?")
+    .bind(spaceId, IMAGE_GENERATED_EVENT, todayStartTimestamp())
+    .first<{ count: number | string }>();
+  return dbNumber(row?.count);
 }
 
-export async function countActiveJobs(db: D1Database, spaceId: string): Promise<number> {
+export async function countPendingGenerationImages(db: AppDatabase, spaceId: string): Promise<number> {
+  const row = await db
+    .prepare(
+      `SELECT COALESCE(SUM(
+         CASE
+           WHEN generation_jobs.quantity > COALESCE(image_counts.image_count, 0)
+           THEN generation_jobs.quantity - COALESCE(image_counts.image_count, 0)
+           ELSE 0
+         END
+       ), 0) AS count
+       FROM generation_jobs
+       LEFT JOIN (
+         SELECT job_id, COUNT(*) AS image_count
+         FROM image_assets
+         WHERE space_id = ?
+         GROUP BY job_id
+       ) image_counts ON image_counts.job_id = generation_jobs.id
+       WHERE generation_jobs.space_id = ?
+         AND generation_jobs.status IN ('queued', 'running')`,
+    )
+    .bind(spaceId, spaceId)
+    .first<{ count: number | string }>();
+  return dbNumber(row?.count);
+}
+
+export async function countDailyImageUsage(db: AppDatabase, spaceId: string): Promise<DailyImageUsage> {
+  const generated = await countDailyGeneratedImages(db, spaceId);
+  const pending = await countPendingGenerationImages(db, spaceId);
+  return {
+    generated,
+    pending,
+    total: generated + pending,
+  };
+}
+
+export async function countActiveJobs(db: AppDatabase, spaceId: string): Promise<number> {
   const row = await db
     .prepare("SELECT COUNT(*) AS count FROM generation_jobs WHERE space_id = ? AND status IN ('queued', 'running')")
     .bind(spaceId)
-    .first<{ count: number }>();
-  return row?.count ?? 0;
+    .first<{ count: number | string }>();
+  return dbNumber(row?.count);
 }
 
-export async function insertRateLimitEvent(db: D1Database, spaceId: string, eventType: string): Promise<void> {
+export async function insertRateLimitEvent(db: AppDatabase, spaceId: string, eventType: string): Promise<void> {
   await db
     .prepare("INSERT INTO rate_limit_events (id, space_id, event_type) VALUES (?, ?, ?)")
     .bind(randomId("evt"), spaceId, eventType)
     .run();
 }
 
+export async function insertImageUsageEvent(db: AppDatabase, spaceId: string, imageId: string): Promise<void> {
+  await db
+    .prepare("INSERT INTO rate_limit_events (id, space_id, event_type) VALUES (?, ?, ?)")
+    .bind(imageUsageEventId(imageId), spaceId, IMAGE_GENERATED_EVENT)
+    .run();
+}
+
 export async function updateJobStatus(
-  db: D1Database,
+  db: AppDatabase,
   jobId: string,
   status: JobStatus,
   errorCode?: string,
   errorMessage?: string,
 ): Promise<void> {
-  const completed = status === "succeeded" || status === "failed" || status === "cancelled";
+  const completed = status === "succeeded" || status === "partial_succeeded" || status === "failed" || status === "cancelled";
   await db
     .prepare(
       `UPDATE generation_jobs
@@ -236,28 +341,31 @@ export async function updateJobStatus(
            completed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE completed_at END
        WHERE id = ?`,
     )
-    .bind(status, errorCode ?? null, errorMessage ?? null, status, completed ? 1 : 0, jobId)
+    .bind(status, errorCode ?? null, errorMessage ?? null, status, completed, jobId)
     .run();
 }
 
 export async function completeJob(
-  db: D1Database,
+  db: AppDatabase,
   jobId: string,
+  status: Extract<JobStatus, "succeeded" | "partial_succeeded">,
   revisedPrompt: string | null,
   usageJson: string | null,
+  errorCode: string | null = null,
+  errorMessage: string | null = null,
 ): Promise<void> {
   await db
     .prepare(
       `UPDATE generation_jobs
-       SET status = 'succeeded', revised_prompt = ?, usage_json = ?, completed_at = CURRENT_TIMESTAMP
+       SET status = ?, revised_prompt = ?, usage_json = ?, error_code = ?, error_message = ?, completed_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
     )
-    .bind(revisedPrompt, usageJson, jobId)
+    .bind(status, revisedPrompt, usageJson, errorCode, errorMessage, jobId)
     .run();
 }
 
 export async function insertImageAsset(
-  db: D1Database,
+  db: AppDatabase,
   row: Omit<ImageAssetRecord, "created_at">,
 ): Promise<void> {
   await db
@@ -279,4 +387,13 @@ export async function insertImageAsset(
       row.sha256,
     )
     .run();
+}
+
+function imageUsageEventId(imageId: string): string {
+  return `evt_usage_${imageId}`;
+}
+
+function dbNumber(value: number | string | null | undefined): number {
+  const parsed = typeof value === "number" ? value : Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
 }

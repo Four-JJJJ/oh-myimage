@@ -1,7 +1,9 @@
 export interface AppConfig {
   model: string;
+  promptOptimizerModel: string;
   maxImagesPerRequest: number;
-  maxDailyJobsPerSpace: number;
+  maxDailyImagesPerSpace: number;
+  maxDailyJobsPerSpace?: number;
   generationTimeoutSeconds: number;
   ratios: string[];
   qualities: string[];
@@ -13,6 +15,7 @@ export interface AppConfig {
 export interface ProviderSettings {
   baseURL: string;
   model: string;
+  promptOptimizerModel: string;
   apiKeyHint: string;
   lastTestOk: boolean;
   lastTestedAt: string | null;
@@ -56,7 +59,7 @@ export interface InspirationItem {
 
 export interface GenerationJob {
   id: string;
-  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  status: "queued" | "running" | "succeeded" | "partial_succeeded" | "failed" | "cancelled";
   prompt: string;
   aspect_ratio: string;
   width: number;
@@ -69,6 +72,14 @@ export interface GenerationJob {
   error_code: string | null;
   error_message: string | null;
   created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+export interface GenerationRecord {
+  job: GenerationJob;
+  images: ImageItem[];
+  elapsedSeconds: number | null;
 }
 
 interface ApiResponse<T> {
@@ -81,13 +92,15 @@ interface ApiResponse<T> {
 }
 
 export async function api<T>(path: string, options?: RequestInit): Promise<T> {
+  const headers = new Headers(options?.headers);
+  if (!(options?.body instanceof FormData) && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+
   const response = await fetch(path, {
     ...options,
     credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...options?.headers,
-    },
+    headers,
   });
   const json = (await response.json().catch(() => ({}))) as ApiResponse<T>;
   if (!response.ok || json.ok === false) {

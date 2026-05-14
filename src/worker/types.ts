@@ -1,18 +1,74 @@
+export interface AppDatabase {
+  prepare(query: string): AppPreparedStatement;
+}
+
+export interface AppPreparedStatement {
+  bind(...values: unknown[]): AppPreparedStatement;
+  first<T = unknown>(): Promise<T | null>;
+  all<T = unknown>(): Promise<{ results?: T[] }>;
+  run(): Promise<unknown>;
+}
+
+export interface AppObject {
+  body: ReadableStream | null;
+  httpMetadata?: {
+    contentType?: string;
+    contentDisposition?: string;
+  };
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+export interface AppObjectStorePutOptions {
+  httpMetadata?: {
+    contentType?: string;
+    contentDisposition?: string;
+  };
+  customMetadata?: Record<string, string>;
+}
+
+export interface AppObjectStore {
+  put(
+    key: string,
+    value: ArrayBuffer | ArrayBufferView | Blob | ReadableStream | string,
+    options?: AppObjectStorePutOptions,
+  ): Promise<unknown>;
+  get(key: string): Promise<AppObject | null>;
+  delete(key: string): Promise<void>;
+  createPresignedGetUrl?(
+    key: string,
+    options?: {
+      expiresInSeconds?: number;
+      contentType?: string;
+      contentDisposition?: string;
+    },
+  ): Promise<string>;
+}
+
+export interface AppQueue<T> {
+  send(message: T): Promise<void>;
+}
+
 export interface Env {
-  DB: D1Database;
-  IMAGES: R2Bucket;
-  ASSETS: Fetcher;
-  GENERATION_QUEUE: Queue<GenerationMessage>;
-  INSPIRATION_QUEUE: Queue<InspirationQueueMessage>;
+  DB: AppDatabase;
+  IMAGES: AppObjectStore;
+  ASSETS?: Fetcher;
+  GENERATION_QUEUE: AppQueue<GenerationMessage>;
+  INSPIRATION_QUEUE: AppQueue<InspirationQueueMessage>;
   APP_ENCRYPTION_KEY?: string;
   TURNSTILE_SECRET_KEY?: string;
   TURNSTILE_SITE_KEY?: string;
   TURNSTILE_REQUIRED?: string;
   DEFAULT_IMAGE_MODEL?: string;
+  PROMPT_OPTIMIZER_MODEL?: string;
   MAX_IMAGES_PER_REQUEST?: string;
+  MAX_DAILY_IMAGES_PER_SPACE?: string;
   MAX_DAILY_JOBS_PER_SPACE?: string;
   MAX_RUNNING_JOBS_PER_SPACE?: string;
   REQUEST_TIMEOUT_MS?: string;
+  PROVIDER_IMAGE_BATCH_SIZE?: string;
+  PROVIDER_IMAGE_CONCURRENCY?: string;
+  PROVIDER_RETRY_ATTEMPTS?: string;
+  PROVIDER_RETRY_DELAY_SECONDS?: string;
   IMAGE_RETENTION_DAYS?: string;
   X_BEARER_TOKEN?: string;
   INSPIRATION_FEATURE_ENABLED?: string;
@@ -54,6 +110,7 @@ export interface CredentialRecord {
   space_id: string;
   base_url: string;
   model: string;
+  prompt_optimizer_model: string;
   encrypted_api_key: string;
   api_key_hint: string;
   last_test_ok: number;
@@ -78,6 +135,14 @@ export interface GenerationJobRecord {
   moderation: string;
   model: string;
   base_url_hash: string | null;
+  reference_image_storage_key: string | null;
+  reference_image_mime_type: string | null;
+  reference_image_name: string | null;
+  reference_image_byte_size: number | null;
+  mask_image_storage_key: string | null;
+  mask_image_mime_type: string | null;
+  mask_image_name: string | null;
+  mask_image_byte_size: number | null;
   revised_prompt: string | null;
   usage_json: string | null;
   error_code: string | null;
@@ -158,7 +223,7 @@ export interface InspirationImportRunRecord {
   completed_at: string | null;
 }
 
-export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+export type JobStatus = "queued" | "running" | "succeeded" | "partial_succeeded" | "failed" | "cancelled";
 
 export type AppBindings = {
   Bindings: Env;

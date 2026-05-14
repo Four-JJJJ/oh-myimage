@@ -1,115 +1,239 @@
 import {
   AlertCircle,
+  CloudDownload,
   CheckCircle2,
-  ExternalLink,
+  Copy,
   Download,
-  GalleryHorizontalEnd,
-  Heart,
-  ImagePlus,
+  Edit3,
+  FileText,
   Images,
-  KeyRound,
-  LibraryBig,
-  LinkIcon,
   Loader2,
   LogOut,
-  RefreshCcw,
-  Search,
-  Settings,
-  ShieldCheck,
-  SlidersHorizontal,
-  Sparkles,
-  Wand2,
+  Redo2,
+  RotateCcw,
+  Trash2,
+  Undo2,
+  X,
 } from "lucide-react";
-import { FormEvent, ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { ChangeEvent, ClipboardEvent, CSSProperties, FormEvent, PointerEvent as ReactPointerEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Alert, AlertDescription } from "./components/ui/alert";
-import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
-import { Input } from "./components/ui/input";
+import { Input, type InputProps } from "./components/ui/input";
 import { Label } from "./components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select";
 import { Separator } from "./components/ui/separator";
-import { Slider } from "./components/ui/slider";
-import { Tabs, TabsList, TabsTrigger } from "./components/ui/tabs";
-import { Textarea } from "./components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
+import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem, ProviderSettings } from "./api";
+import addIcon from "./assets/figma/add.svg";
+import figmaLogo from "./assets/figma/logo.png";
+import navGalleryActiveIcon from "./assets/figma/nav-gallery-active.svg";
+import navGalleryIcon from "./assets/figma/nav-gallery.svg";
+import navGenerateActiveIcon from "./assets/figma/nav-generate-active.svg";
+import navGenerateIcon from "./assets/figma/nav-generate.svg";
+import navSettingsActiveIcon from "./assets/figma/nav-settings-active.svg";
+import navSettingsIcon from "./assets/figma/nav-settings.svg";
+import openaiIcon from "./assets/figma/openai.svg";
+import optimizeIcon from "./assets/figma/optimize.svg";
+import referenceDeleteIcon from "./assets/figma/reference-delete.svg";
 import { cn } from "./lib/utils";
-import { api, AppConfig, formatBytes, GenerationJob, ImageItem, InspirationItem, ProviderSettings } from "./api";
 
 type View = "generate" | "gallery" | "settings";
 
 interface MeState {
   space: { id: string; name: string };
   providerConfigured: boolean;
+  dailyLimitExempt?: boolean;
+  dailyRemaining?: number;
+  dailyLimit?: number;
 }
 
 interface GenerateForm {
   prompt: string;
   aspectRatio: string;
+  resolution: string;
   width: number;
   height: number;
   quality: string;
   quantity: number;
   outputFormat: string;
-  background: string;
   compression: number;
 }
 
-interface PromptDraft {
-  id: string;
-  prompt: string;
-  aspectRatio: string | null;
-  nonce: number;
+interface ReferenceImagePreview {
+  file: File;
+  url: string;
+  name: string;
 }
 
-const ratioSizes: Record<string, [number, number]> = {
-  "1:1": [1024, 1024],
-  "3:2": [1536, 1024],
-  "2:3": [1024, 1536],
+interface ImageSelectionMask {
+  file: File;
+  name: string;
+}
+
+interface ImageSelectionPoint {
+  x: number;
+  y: number;
+}
+
+interface ImageSelectionStroke {
+  brushRatio: number;
+  points: ImageSelectionPoint[];
+}
+
+const FIGMA_RATIOS = ["16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "1:1"] as const;
+const RESOLUTIONS = ["1K", "2K", "4K"] as const;
+const QUALITY_OPTIONS = ["auto", "low", "medium", "high"] as const;
+const FORMAT_OPTIONS = ["png", "jpeg", "webp"] as const;
+const IMAGE_MODEL_OPTIONS = ["gpt-image-2"] as const;
+const PROMPT_OPTIMIZER_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4"] as const;
+const REFERENCE_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+const REFERENCE_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const MAX_IMAGE_EDGE = 3840;
+const MAX_IMAGE_PIXELS = 8_294_400;
+
+const resolutionLongEdge: Record<string, number> = {
+  "1K": 1536,
+  "2K": 2048,
+  "4K": 3840,
+};
+
+const baseRatioSizes: Record<string, [number, number]> = {
   "16:9": [1536, 864],
   "9:16": [864, 1536],
+  "4:3": [1536, 1152],
+  "3:4": [1152, 1536],
+  "3:2": [1536, 1024],
+  "2:3": [1024, 1536],
+  "1:1": [1024, 1024],
+};
+
+const qualityLabels: Record<string, string> = {
+  auto: "自动",
+  low: "低",
+  medium: "中",
+  high: "高",
+};
+
+const formatLabels: Record<string, string> = {
+  png: "PNG",
+  jpeg: "JPEG",
+  webp: "WEBP",
 };
 
 const GENERATION_POLL_INTERVAL_MS = 6000;
+const IMAGE_PREVIEW_VIEWPORT_GAP = 24;
+const IMAGE_PREVIEW_IMAGE_INSET = 61;
+const IMAGE_PREVIEW_EDITOR_WIDTH = 400;
+const IMAGE_PREVIEW_MIN_STAGE_SIZE = 120;
+const IMAGE_SELECTION_BRUSH_RATIO = 0.08;
 
 const defaultForm: GenerateForm = {
   prompt: "",
-  aspectRatio: "1:1",
-  width: 1024,
-  height: 1024,
+  aspectRatio: "16:9",
+  resolution: "1K",
+  width: 1536,
+  height: 864,
   quality: "auto",
   quantity: 1,
   outputFormat: "png",
-  background: "auto",
   compression: 100,
 };
 
-const viewItems: Array<{ value: View; label: string; icon: typeof Wand2 }> = [
-  { value: "generate", label: "生成", icon: Wand2 },
-  { value: "gallery", label: "图库", icon: GalleryHorizontalEnd },
-  { value: "settings", label: "设置", icon: Settings },
+const fallbackConfig: AppConfig = {
+  model: "gpt-image-2",
+  promptOptimizerModel: "gpt-5.5",
+  maxImagesPerRequest: 4,
+  maxDailyImagesPerSpace: 50,
+  generationTimeoutSeconds: 600,
+  ratios: [...FIGMA_RATIOS],
+  qualities: ["auto", "low", "medium", "high"],
+  formats: ["png", "jpeg", "webp"],
+  turnstileSiteKey: "",
+  turnstileRequired: false,
+};
+
+const viewItems: Array<{ value: View; label: string; helper: string; asset: string; activeAsset: string }> = [
+  { value: "generate", label: "生成", helper: "Prompt", asset: navGenerateIcon, activeAsset: navGenerateActiveIcon },
+  { value: "gallery", label: "图库", helper: "Assets", asset: navGalleryIcon, activeAsset: navGalleryActiveIcon },
+  { value: "settings", label: "设置", helper: "Provider", asset: navSettingsIcon, activeAsset: navSettingsActiveIcon },
 ];
 
 export function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [me, setMe] = useState<MeState | null>(null);
   const [view, setView] = useState<View>("generate");
+  const [imageToEdit, setImageToEdit] = useState<ImageItem | null>(null);
+  const [imageEditDraft, setImageEditDraft] = useState<GenerateForm | null>(null);
+  const [imageEditMask, setImageEditMask] = useState<ImageSelectionMask | null>(null);
+  const [pendingGenerateForm, setPendingGenerateForm] = useState<GenerateForm | null>(null);
   const [booting, setBooting] = useState(true);
 
+  const effectiveConfig = config ?? fallbackConfig;
+  const dailyRemainingLabel = me?.dailyLimitExempt ? "不限" : (me?.dailyRemaining ?? effectiveConfig.maxDailyImagesPerSpace);
+
   const refreshMe = useCallback(async () => {
-    const result = await api<{ ok: true; space: MeState["space"]; providerConfigured: boolean }>("/api/me");
-    setMe({ space: result.space, providerConfigured: result.providerConfigured });
+    const result = await api<{
+      ok: true;
+      space: MeState["space"];
+      providerConfigured: boolean;
+      dailyLimitExempt?: boolean;
+      dailyRemaining?: number;
+      dailyLimit?: number;
+    }>("/api/me");
+    setMe({
+      space: result.space,
+      providerConfigured: result.providerConfigured,
+      dailyLimitExempt: result.dailyLimitExempt,
+      dailyRemaining: result.dailyRemaining,
+      dailyLimit: result.dailyLimit,
+    });
+  }, []);
+  const editImageFromGallery = useCallback((image: ImageItem, draft?: GenerateForm, mask?: ImageSelectionMask) => {
+    setImageToEdit(image);
+    setImageEditDraft(draft ?? null);
+    setImageEditMask(mask ?? null);
+    setView("generate");
+  }, []);
+  const clearImageToEdit = useCallback(() => {
+    setImageToEdit(null);
+    setImageEditDraft(null);
+    setImageEditMask(null);
+  }, []);
+  const editPromptFromGallery = useCallback((draft: GenerateForm) => {
+    setPendingGenerateForm(draft);
+    setView("generate");
+  }, []);
+  const clearPendingGenerateForm = useCallback(() => {
+    setPendingGenerateForm(null);
   }, []);
 
   useEffect(() => {
     let mounted = true;
     Promise.all([
       api<{ ok: true; config: AppConfig }>("/api/config").then((result) => result.config),
-      api<{ ok: true; space: MeState["space"]; providerConfigured: boolean }>("/api/me").catch(() => null),
+      api<{
+        ok: true;
+        space: MeState["space"];
+        providerConfigured: boolean;
+        dailyLimitExempt?: boolean;
+        dailyRemaining?: number;
+        dailyLimit?: number;
+      }>("/api/me").catch(() => null),
     ]).then(([appConfig, user]) => {
       if (!mounted) return;
       setConfig(appConfig);
-      setMe(user ? { space: user.space, providerConfigured: user.providerConfigured } : null);
+      setMe(
+        user
+          ? {
+              space: user.space,
+              providerConfigured: user.providerConfigured,
+              dailyLimitExempt: user.dailyLimitExempt,
+              dailyRemaining: user.dailyRemaining,
+              dailyLimit: user.dailyLimit,
+            }
+          : null,
+      );
       setBooting(false);
     });
     return () => {
@@ -119,98 +243,116 @@ export function App() {
 
   if (booting) {
     return (
-      <main className="grid min-h-screen place-items-center bg-background text-muted-foreground">
-        <div className="flex items-center gap-3 rounded-lg border bg-card px-4 py-3 shadow-panel">
-          <Loader2 className="size-5 animate-spin" />
-          <span className="text-sm font-medium">正在进入工作台</span>
+      <main className="app-shell grid min-h-screen place-items-center">
+        <div className="entry-fade flex items-center gap-3 rounded-lg border bg-card px-4 py-3 shadow-panel">
+          <span className="grid size-9 place-items-center rounded-md bg-primary text-primary-foreground">
+            <Loader2 className="animate-spin" />
+          </span>
+          <span className="text-sm font-medium text-foreground">正在打开创作台</span>
         </div>
       </main>
     );
   }
 
   if (!me) {
-    return <LoginScreen config={config} onLogin={refreshMe} />;
+    return <LoginScreen config={effectiveConfig} onLogin={refreshMe} />;
   }
 
+  const spaceDisplayName = me.space.name.trim() || "Workspace";
+  const studioDisplayName = `${spaceDisplayName} Studio`;
+
   return (
-    <TooltipProvider delayDuration={180}>
-      <main className="min-h-screen bg-background text-foreground">
-        <div className="flex min-h-screen">
-          <aside className="hidden w-20 shrink-0 border-r bg-card/80 px-3 py-4 lg:flex lg:flex-col lg:items-center">
-            <div className="mb-8 grid size-11 place-items-center rounded-lg bg-foreground text-background">
-              <Sparkles className="size-5" />
+    <TooltipProvider delayDuration={140}>
+      <main className="figma-app h-dvh overflow-hidden text-foreground">
+        <div className="flex h-dvh overflow-hidden">
+          <aside className="figma-left-rail hidden h-dvh w-16 shrink-0 overflow-hidden lg:flex lg:flex-col lg:items-center">
+            <div className="grid h-16 w-full place-items-center">
+              <img src={figmaLogo} alt={studioDisplayName} className="size-10 object-contain" />
             </div>
-            <nav className="flex flex-1 flex-col items-center gap-2">
+            <nav className="mt-3 flex flex-1 flex-col items-center gap-3">
               {viewItems.map((item) => {
-                const Icon = item.icon;
+                const selected = view === item.value;
                 return (
                   <Tooltip key={item.value}>
                     <TooltipTrigger asChild>
-                      <Button
-                        variant={view === item.value ? "default" : "ghost"}
-                        size="icon"
-                        className="rounded-lg"
+                      <button
+                        type="button"
+                        className={cn("figma-nav-button", selected && "figma-nav-button-active")}
+                        aria-label={item.label}
                         onClick={() => setView(item.value)}
                       >
-                        <Icon className="size-4" />
-                      </Button>
+                        <img src={selected ? item.activeAsset : item.asset} alt="" className="size-4" />
+                      </button>
                     </TooltipTrigger>
                     <TooltipContent side="right">{item.label}</TooltipContent>
                   </Tooltip>
                 );
               })}
             </nav>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="rounded-lg text-muted-foreground"
-                  onClick={async () => {
-                    await api("/api/auth/logout", { method: "POST" });
-                    setMe(null);
-                  }}
-                >
-                  <LogOut className="size-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="right">离开空间</TooltipContent>
-            </Tooltip>
+            {view !== "settings" && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    className="figma-nav-button mb-4"
+                    aria-label="离开空间"
+                    onClick={async () => {
+                      await api("/api/auth/logout", { method: "POST" });
+                      setMe(null);
+                    }}
+                  >
+                    <LogOut className="size-4" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right">离开空间</TooltipContent>
+              </Tooltip>
+            )}
           </aside>
 
-          <section className="flex min-w-0 flex-1 flex-col">
-            <header className="sticky top-0 z-20 border-b bg-background/90 px-4 py-3 backdrop-blur md:px-6">
-              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                    <span>Image-2 Studio</span>
-                    <Badge variant={me.providerConfigured ? "secondary" : "outline"} className="shrink-0">
-                      {me.providerConfigured ? "Provider ready" : "Need provider"}
-                    </Badge>
-                  </div>
-                  <p className="mt-1 truncate text-xs text-muted-foreground">空间：{me.space.name}</p>
+          <section className="flex h-dvh min-w-0 flex-1 flex-col overflow-hidden">
+            <header className="figma-top-bar flex h-16 shrink-0 items-center justify-between overflow-hidden border-b px-4">
+              <div className="flex min-w-0 items-baseline gap-1.5">
+                <img src={figmaLogo} alt={studioDisplayName} className="mr-3 size-9 shrink-0 object-contain lg:hidden" />
+                <span className="truncate text-base font-semibold leading-6 text-white">{spaceDisplayName}</span>
+                <span className="shrink-0 text-base leading-6 text-white/60">Studio</span>
+              </div>
+              <div className="flex shrink-0 items-center gap-3 text-xs">
+                <div className="hidden items-center gap-2 rounded-md border border-white/10 px-2 py-1 text-white/60 md:flex">
+                  <span>使用 Small Token 解除张数限制</span>
+                  <button type="button" className="font-medium text-[#6eff30]">
+                    去购买
+                  </button>
                 </div>
-                <Tabs value={view} onValueChange={(value) => setView(value as View)} className="w-full md:w-auto">
-                  <TabsList className="grid w-full grid-cols-3 md:w-auto">
-                    {viewItems.map((item) => (
-                      <MainTabTrigger key={item.value} value={item.value} label={item.label} icon={item.icon} />
-                    ))}
-                  </TabsList>
-                </Tabs>
+                <div className="flex items-center gap-2 rounded-md bg-[#373737] px-2 py-1">
+                  <span className="text-white/60">剩余张数</span>
+                  <span className="font-semibold text-[#6eff30]">{dailyRemainingLabel}</span>
+                </div>
               </div>
             </header>
 
-            <div className="flex-1 p-4 md:p-6">
-              {view === "generate" && (
-                <GenerateView
-                  config={config}
-                  providerConfigured={me.providerConfigured}
-                  onProviderNeeded={() => setView("settings")}
-                />
-              )}
-              {view === "gallery" && <GalleryView />}
-              {view === "settings" && <SettingsView defaultModel={config?.model ?? "gpt-image-2"} onSaved={refreshMe} />}
-            </div>
+            {view === "generate" && (
+              <GenerateView
+                config={effectiveConfig}
+                providerConfigured={me.providerConfigured}
+                onProviderNeeded={() => setView("settings")}
+                pendingEditImage={imageToEdit}
+                pendingEditForm={imageEditDraft}
+                pendingEditMask={imageEditMask}
+                pendingGenerateForm={pendingGenerateForm}
+                onPendingEditImageConsumed={clearImageToEdit}
+                onPendingGenerateFormConsumed={clearPendingGenerateForm}
+              />
+            )}
+            {view === "gallery" && (
+              <GalleryView
+                config={effectiveConfig}
+                providerConfigured={me.providerConfigured}
+                onProviderNeeded={() => setView("settings")}
+                onEditImage={editImageFromGallery}
+                onEditPrompt={editPromptFromGallery}
+              />
+            )}
+            {view === "settings" && <SettingsView config={effectiveConfig} onSaved={refreshMe} />}
           </section>
         </div>
       </main>
@@ -218,7 +360,7 @@ export function App() {
   );
 }
 
-function LoginScreen({ config, onLogin }: { config: AppConfig | null; onLogin: () => Promise<void> }) {
+function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Promise<void> }) {
   const [spaceName, setSpaceName] = useState("");
   const [password, setPassword] = useState("");
   const [turnstileToken, setTurnstileToken] = useState("");
@@ -243,62 +385,75 @@ function LoginScreen({ config, onLogin }: { config: AppConfig | null; onLogin: (
   }
 
   return (
-    <main className="min-h-screen bg-[radial-gradient(circle_at_18%_18%,hsl(199_82%_92%),transparent_30%),linear-gradient(135deg,hsl(216_32%_98%),hsl(190_28%_96%))] p-4 text-foreground md:p-8">
-      <section className="mx-auto grid min-h-[calc(100vh-2rem)] max-w-6xl items-center gap-8 md:min-h-[calc(100vh-4rem)] lg:grid-cols-[minmax(0,1fr)_420px]">
-        <div className="max-w-2xl">
-          <Badge variant="outline" className="mb-5 bg-background/70">
-            Cloudflare Worker / D1 / R2
-          </Badge>
-          <h1 className="text-5xl font-semibold leading-tight tracking-normal text-foreground md:text-7xl">
-            进入你的轻量生图工作台
-          </h1>
-          <p className="mt-6 max-w-xl text-base leading-7 text-muted-foreground">
-            用空间名和密码进入同一个创作空间，配置自己的 OpenAI 兼容 API Key 后即可生成、浏览和下载图片。
-          </p>
-          <div className="mt-8 grid max-w-xl gap-3 sm:grid-cols-3">
-            {["空间隔离", "Key 加密", "图库留存"].map((item) => (
-              <div key={item} className="rounded-lg border bg-background/70 px-4 py-3 text-sm font-medium shadow-panel">
-                {item}
-              </div>
-            ))}
-          </div>
+    <main className="figma-login-home relative min-h-dvh overflow-hidden bg-[#191919] text-white">
+      <header className="h-16 overflow-hidden border-b border-white/10 px-4">
+        <div className="flex h-full items-center gap-1 leading-6">
+          <span className="text-base font-semibold text-white/90">oh-myimage</span>
+          <span className="text-base font-normal text-white/60">Studio</span>
+        </div>
+      </header>
+
+      <section className="absolute left-1/2 top-[104px] w-[calc(100vw-32px)] max-w-[368px] -translate-x-1/2">
+        <img src={figmaLogo} alt="" className="size-10 object-cover" />
+        <div className="mt-0.5 flex items-center gap-2 leading-6">
+          <span className="text-base font-normal text-white/60">欢迎使用</span>
+          <span className="text-base font-semibold text-white/90">oh-myimage</span>
         </div>
 
-        <Card className="bg-card/92 shadow-canvas backdrop-blur">
-          <CardHeader>
-            <div className="mb-3 grid size-11 place-items-center rounded-lg bg-primary text-primary-foreground">
-              <KeyRound className="size-5" />
+        <form className="mt-10" onSubmit={submit}>
+          <Label htmlFor="space-name" className="block text-xs font-normal leading-none text-white/90">
+            空间名字
+          </Label>
+          <Input
+            id="space-name"
+            value={spaceName}
+            onChange={(event) => setSpaceName(event.target.value)}
+            minLength={2}
+            autoComplete="username"
+            placeholder="请输入空间名称"
+            required
+            className="mt-2 h-[34px] rounded-[10px] border-white/15 bg-transparent px-2 py-0 text-xs leading-none text-white/90 shadow-none placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0 focus-visible:ring-offset-0"
+          />
+
+          <Label htmlFor="space-password" className="mt-3.5 block text-xs font-normal leading-none text-white/90">
+            空间密码
+          </Label>
+          <Input
+            id="space-password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            type="password"
+            minLength={8}
+            autoComplete="current-password"
+            placeholder="请输入空间密码"
+            required
+            className="mt-2 h-[34px] rounded-[10px] border-white/15 bg-transparent px-2 py-0 text-xs leading-none text-white/90 shadow-none placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0 focus-visible:ring-offset-0"
+          />
+
+          <Button
+            className="mt-[22px] h-[34px] w-full rounded-[10px] border border-[#6eff30] bg-transparent px-2 py-0 text-xs font-semibold leading-none text-[#6eff30] shadow-none hover:bg-transparent hover:text-[#6eff30] focus-visible:ring-[#6eff30]/40"
+            disabled={loading}
+          >
+            {loading ? "进入中" : "进入空间"}
+          </Button>
+
+          <p className="mt-1.5 text-xs font-normal leading-[18px] text-white/40">新空间会自动创建；忘记空间名或密码无法找回</p>
+          <div className="mt-10 flex h-[42px] items-center gap-2 overflow-hidden rounded-[10px] border border-white/15 p-2">
+            <div className="grid size-6 shrink-0 place-items-center overflow-hidden rounded bg-white/10">
+              <img src={openaiIcon} alt="" className="size-4" />
             </div>
-            <CardTitle>空间登录</CardTitle>
-            <CardDescription>新空间名会自动创建；忘记空间名或密码无法找回。</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <form className="grid gap-5" onSubmit={submit}>
-              <Field label="空间名">
-                <Input value={spaceName} onChange={(event) => setSpaceName(event.target.value)} minLength={2} autoComplete="username" required />
-              </Field>
-              <Field label="密码">
-                <Input
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                  type="password"
-                  minLength={8}
-                  autoComplete="current-password"
-                  required
-                />
-              </Field>
-              {config?.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={setTurnstileToken} />}
-              {config?.turnstileRequired && !config.turnstileSiteKey && (
-                <Notice tone="warn" text="Turnstile 已启用，请配置站点 Key。" />
-              )}
-              {error && <Notice tone="error" text={error} />}
-              <Button className="h-11" disabled={loading}>
-                {loading ? <Loader2 className="animate-spin" /> : <Sparkles />}
-                进入空间
-              </Button>
-            </form>
-          </CardContent>
-        </Card>
+            <p className="min-w-0 flex-1 text-xs font-semibold leading-none text-white/90">推荐使用 Small Token</p>
+            <a href="https://smalltoken.ai/" target="_blank" rel="noreferrer" className="shrink-0 text-xs font-normal leading-[18px] text-[#6eff30]">
+              去购买
+            </a>
+          </div>
+
+          <div className="mt-3 flex flex-col gap-3">
+            {config.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={setTurnstileToken} />}
+            {config.turnstileRequired && !config.turnstileSiteKey && <Notice tone="warn" text="Turnstile 已启用，请配置站点 Key。" />}
+            {error && <Notice tone="error" text={error} />}
+          </div>
+        </form>
       </section>
     </main>
   );
@@ -308,40 +463,195 @@ function GenerateView({
   config,
   providerConfigured,
   onProviderNeeded,
+  pendingEditImage,
+  pendingEditForm,
+  pendingEditMask,
+  pendingGenerateForm,
+  onPendingEditImageConsumed,
+  onPendingGenerateFormConsumed,
 }: {
-  config: AppConfig | null;
+  config: AppConfig;
   providerConfigured: boolean;
   onProviderNeeded: () => void;
+  pendingEditImage: ImageItem | null;
+  pendingEditForm: GenerateForm | null;
+  pendingEditMask: ImageSelectionMask | null;
+  pendingGenerateForm: GenerateForm | null;
+  onPendingEditImageConsumed: () => void;
+  onPendingGenerateFormConsumed: () => void;
 }) {
   const [form, setForm] = useState<GenerateForm>(defaultForm);
   const [job, setJob] = useState<GenerationJob | null>(null);
   const [images, setImages] = useState<ImageItem[]>([]);
+  const [records, setRecords] = useState<GenerationRecord[]>([]);
+  const [recordsLoading, setRecordsLoading] = useState(true);
+  const [recordsError, setRecordsError] = useState("");
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [turnstileToken, setTurnstileToken] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [optimizingPrompt, setOptimizingPrompt] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [referenceImage, setReferenceImage] = useState<ReferenceImagePreview | null>(null);
+  const [referenceMask, setReferenceMask] = useState<ImageSelectionMask | null>(null);
+  const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const referenceInputRef = useRef<HTMLInputElement | null>(null);
+  const referenceObjectUrlRef = useRef<string | null>(null);
+
+  const availableRatios = useMemo(
+    () => FIGMA_RATIOS.filter((ratio) => config.ratios.includes(ratio) || fallbackConfig.ratios.includes(ratio)),
+    [config.ratios],
+  );
+  const qualityOptions = useMemo(
+    () => QUALITY_OPTIONS.filter((quality) => config.qualities.includes(quality) || fallbackConfig.qualities.includes(quality)),
+    [config.qualities],
+  );
+  const formatOptions = useMemo(
+    () => FORMAT_OPTIONS.filter((format) => config.formats.includes(format) || fallbackConfig.formats.includes(format)),
+    [config.formats],
+  );
+  const setReferenceFile = useCallback((file: File) => {
+    const mimeType = normalizeImageMime(file.type);
+    if (!REFERENCE_IMAGE_MIME_TYPES.has(mimeType)) {
+      setError("参考图仅支持 PNG、JPEG 或 WebP 格式。");
+      return;
+    }
+    if (file.size > REFERENCE_IMAGE_MAX_BYTES) {
+      setError("参考图不能超过 10MB。");
+      return;
+    }
+    const nextUrl = URL.createObjectURL(file);
+    if (referenceObjectUrlRef.current) {
+      URL.revokeObjectURL(referenceObjectUrlRef.current);
+    }
+    referenceObjectUrlRef.current = nextUrl;
+    setReferenceImage({
+      file,
+      url: nextUrl,
+      name: file.name || "参考图",
+    });
+    setReferenceMask(null);
+    setError("");
+  }, []);
+  const loadImageForEditing = useCallback(
+    async (image: ImageItem, prompt?: string, mask?: ImageSelectionMask | null) => {
+      setError("");
+      try {
+        const file = await imageItemToFile(image);
+        const nextPrompt = prompt ?? image.prompt ?? "";
+        setReferenceFile(file);
+        setReferenceMask(mask ?? null);
+        if (nextPrompt) {
+          setForm((current) => ({ ...current, prompt: nextPrompt }));
+        }
+        window.requestAnimationFrame(() => {
+          promptTextareaRef.current?.focus();
+          if (nextPrompt) promptTextareaRef.current?.setSelectionRange(nextPrompt.length, nextPrompt.length);
+        });
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "载入图片编辑失败。");
+      }
+    },
+    [setReferenceFile],
+  );
+
+  const clearReferenceImage = useCallback(() => {
+    if (referenceObjectUrlRef.current) {
+      URL.revokeObjectURL(referenceObjectUrlRef.current);
+      referenceObjectUrlRef.current = null;
+    }
+    setReferenceImage(null);
+    if (referenceInputRef.current) {
+      referenceInputRef.current.value = "";
+    }
+    setReferenceMask(null);
+  }, []);
 
   useEffect(() => {
-    if (!job || job.status === "succeeded" || job.status === "failed" || job.status === "cancelled") return;
+    return () => {
+      if (referenceObjectUrlRef.current) {
+        URL.revokeObjectURL(referenceObjectUrlRef.current);
+        referenceObjectUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!pendingEditImage) return;
+    void loadImageForEditing(pendingEditImage, pendingEditForm?.prompt ?? pendingEditImage.prompt, pendingEditMask)
+      .then(() => {
+        if (pendingEditForm) setForm(pendingEditForm);
+      })
+      .finally(onPendingEditImageConsumed);
+  }, [loadImageForEditing, onPendingEditImageConsumed, pendingEditForm, pendingEditImage, pendingEditMask]);
+
+  useEffect(() => {
+    if (!pendingGenerateForm) return;
+    setForm(pendingGenerateForm);
+    setError("");
+    window.requestAnimationFrame(() => {
+      promptTextareaRef.current?.focus();
+      promptTextareaRef.current?.setSelectionRange(pendingGenerateForm.prompt.length, pendingGenerateForm.prompt.length);
+    });
+    onPendingGenerateFormConsumed();
+  }, [onPendingGenerateFormConsumed, pendingGenerateForm]);
+
+  const loadRecords = useCallback(async (cursor?: string, options?: { background?: boolean }) => {
+    if (!cursor && !options?.background) setRecordsLoading(true);
+    setRecordsError("");
+    try {
+      const path = cursor ? `/api/generations?cursor=${encodeURIComponent(cursor)}` : "/api/generations";
+      const result = await api<{ ok: true; records: GenerationRecord[]; nextCursor: string | null }>(path);
+      setRecords((current) => (cursor ? [...current, ...result.records] : result.records));
+      setNextCursor(result.nextCursor);
+    } catch (err) {
+      setRecordsError(err instanceof Error ? err.message : "生成记录加载失败。");
+    } finally {
+      if (!cursor && !options?.background) setRecordsLoading(false);
+    }
+  }, []);
+
+  const upsertRecord = useCallback((nextJob: GenerationJob, nextImages: ImageItem[]) => {
+    setRecords((current) => {
+      const record: GenerationRecord = {
+        job: nextJob,
+        images: nextImages,
+        elapsedSeconds: estimateJobElapsed(nextJob),
+      };
+      const rest = current.filter((item) => item.job.id !== nextJob.id);
+      return [record, ...rest];
+    });
+  }, []);
+
+  useEffect(() => {
+    void loadRecords();
+  }, [loadRecords]);
+
+  useEffect(() => {
+    if (!job || isTerminalJobStatus(job.status)) return;
     const timer = window.setInterval(async () => {
       try {
         const result = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${job.id}`);
         setJob(result.job);
         setImages(result.images);
-        if (result.job.status === "succeeded" || result.job.status === "failed" || result.job.status === "cancelled") window.clearInterval(timer);
+        upsertRecord(result.job, result.images);
+        if (isTerminalJobStatus(result.job.status)) {
+          window.clearInterval(timer);
+          void loadRecords(undefined, { background: true });
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : "刷新任务状态失败。");
       }
     }, GENERATION_POLL_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [job]);
+  }, [job?.id, job?.status, loadRecords, upsertRecord]);
 
   useEffect(() => {
-    if (!job || job.status === "succeeded" || job.status === "failed" || job.status === "cancelled") {
+    if (!job || isTerminalJobStatus(job.status)) {
       if (!job) setElapsedSeconds(0);
       return;
     }
-    const startedAt = Date.parse(job.created_at);
+    const startedAt = parseUtcTimestamp(job.created_at);
     const updateElapsed = () => setElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
     updateElapsed();
     const timer = window.setInterval(updateElapsed, 1000);
@@ -349,21 +659,51 @@ function GenerateView({
   }, [job?.id, job?.created_at, job?.status]);
 
   function update<K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) {
-    setForm((current) => {
-      const next = { ...current, [key]: value };
-      if (key === "aspectRatio" && typeof value === "string" && ratioSizes[value]) {
-        const [width, height] = ratioSizes[value];
-        next.width = width;
-        next.height = height;
-      }
-      if (key === "background" && value === "transparent" && next.outputFormat === "jpeg") {
-        next.outputFormat = "png";
-      }
-      if (key === "outputFormat" && value === "jpeg" && next.background === "transparent") {
-        next.background = "opaque";
-      }
-      return next;
-    });
+    setForm((current) => updateGenerateFormValue(current, key, value));
+  }
+
+  function handleReferenceInputChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (file) setReferenceFile(file);
+    event.target.value = "";
+  }
+
+  function handlePromptPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const file = imageFileFromClipboard(event.clipboardData);
+    if (!file) return;
+    event.preventDefault();
+    setReferenceFile(file);
+  }
+
+  async function optimizeCurrentPrompt() {
+    if (!providerConfigured) {
+      onProviderNeeded();
+      return;
+    }
+    if (!form.prompt.trim()) {
+      setError("请输入提示词后再优化。");
+      promptTextareaRef.current?.focus();
+      return;
+    }
+
+    setOptimizingPrompt(true);
+    setError("");
+    try {
+      const result = await api<{ ok: true; optimizedPrompt: string }>("/api/prompts/optimize", {
+        method: "POST",
+        body: JSON.stringify(promptOptimizationPayload(form)),
+      });
+      const optimizedPrompt = result.optimizedPrompt.trim();
+      update("prompt", optimizedPrompt);
+      window.requestAnimationFrame(() => {
+        promptTextareaRef.current?.focus();
+        promptTextareaRef.current?.setSelectionRange(optimizedPrompt.length, optimizedPrompt.length);
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "提示词优化失败。");
+    } finally {
+      setOptimizingPrompt(false);
+    }
   }
 
   async function submit(event: FormEvent) {
@@ -377,13 +717,17 @@ function GenerateView({
     setImages([]);
     setElapsedSeconds(0);
     try {
+      const submittedPrompt = form.prompt;
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
-        body: JSON.stringify({ ...form, turnstileToken }),
+        body: generationRequestBody(form, turnstileToken, referenceImage, referenceMask),
       });
+      setForm((current) => (current.prompt === submittedPrompt ? { ...current, prompt: "" } : current));
       const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
       setJob(firstPoll.job);
       setImages(firstPoll.images);
+      upsertRecord(firstPoll.job, firstPoll.images);
+      void loadRecords(undefined, { background: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "创建任务失败。");
     } finally {
@@ -391,536 +735,1114 @@ function GenerateView({
     }
   }
 
+  async function deleteRecord(record: GenerationRecord) {
+    setError("");
+    try {
+      await api<{ ok: true }>(`/api/generations/${record.job.id}`, { method: "DELETE" });
+      setRecords((current) => current.filter((item) => item.job.id !== record.job.id));
+      if (job?.id === record.job.id) {
+        setJob(null);
+        setImages([]);
+        setElapsedSeconds(0);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除记录失败。");
+    }
+  }
+
+  async function regenerateRecord(record: GenerationRecord) {
+    if (!providerConfigured) {
+      onProviderNeeded();
+      return;
+    }
+    setLoading(true);
+    setError("");
+    setImages([]);
+    setElapsedSeconds(0);
+    try {
+      const result = await api<{ ok: true; jobId: string; status: "queued" }>(`/api/generations/${record.job.id}/regenerate`, {
+        method: "POST",
+      });
+      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+      setJob(firstPoll.job);
+      setImages(firstPoll.images);
+      upsertRecord(firstPoll.job, firstPoll.images);
+      void loadRecords(undefined, { background: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重新生成失败。");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function editRecordPrompt(record: GenerationRecord) {
+    update("prompt", record.job.prompt);
+    window.requestAnimationFrame(() => {
+      promptTextareaRef.current?.focus();
+      promptTextareaRef.current?.setSelectionRange(record.job.prompt.length, record.job.prompt.length);
+    });
+  }
+
+  async function createEditTaskFromImage(image: ImageItem, draft: GenerateForm, mask?: ImageSelectionMask): Promise<void> {
+    if (!providerConfigured) {
+      throw new Error("请先配置 Provider 后再生成。");
+    }
+    if (!draft.prompt.trim()) {
+      throw new Error("请输入提示词后再生成。");
+    }
+
+    setLoading(true);
+    setError("");
+    setImages([]);
+    setElapsedSeconds(0);
+    try {
+      const file = await imageItemToFile(image);
+      const referenceImageDraft: ReferenceImagePreview = {
+        file,
+        url: image.url,
+        name: file.name || "编辑参考图",
+      };
+      const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
+        method: "POST",
+        body: generationRequestBody(draft, turnstileToken, referenceImageDraft, mask ?? null),
+      });
+      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+      setJob(firstPoll.job);
+      setImages(firstPoll.images);
+      upsertRecord(firstPoll.job, firstPoll.images);
+      void loadRecords(undefined, { background: true });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "创建任务失败。";
+      setError(message);
+      throw new Error(message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
-    <div className="grid min-h-[calc(100vh-104px)] gap-4 xl:grid-cols-[424px_minmax(0,1fr)]">
-      <form className="rounded-lg border bg-card shadow-panel" onSubmit={submit}>
-        <div className="border-b p-4">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <p className="text-xs font-semibold uppercase text-muted-foreground">Text to Image</p>
-              <h2 className="mt-1 text-2xl font-semibold tracking-normal">图片生成</h2>
+    <div className="entry-fade flex h-[calc(100dvh-64px)] min-h-0 overflow-hidden">
+      <form className="figma-composer flex h-full w-full shrink-0 flex-col border-r lg:w-[400px]" onSubmit={submit}>
+        <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-4 pt-4">
+          <div className="flex h-10 items-center gap-2 overflow-hidden rounded-[10px] border border-white/15 p-2">
+            <div className="grid size-6 shrink-0 place-items-center rounded bg-white/10">
+              <img src={openaiIcon} alt="" className="size-4" />
             </div>
-            <Badge variant="secondary" className="gap-1">
-              <SlidersHorizontal className="size-3" />
-              {form.width}x{form.height}
-            </Badge>
+            <p className="min-w-0 flex-1 truncate text-xs font-semibold leading-none text-white">{config.model || "gpt-image-2"}</p>
+            {providerConfigured ? (
+              <span className="shrink-0 text-xs leading-[18px] text-white/60">已配置</span>
+            ) : (
+              <button type="button" className="flex shrink-0 items-center gap-2 text-xs leading-[18px]" onClick={onProviderNeeded}>
+                <span className="text-white/60">暂无 Provider 配置</span>
+                <span className="text-[#6eff30]">去设置</span>
+              </button>
+            )}
           </div>
+
+          <section className="mt-4">
+            <div className="mb-2 flex h-[18px] items-center justify-between">
+              <Label className="text-xs font-semibold leading-[18px] text-white">提示词</Label>
+              <button
+                type="button"
+                className="flex h-[18px] items-center gap-1.5 text-xs leading-[18px] text-[#6eff30] disabled:cursor-not-allowed disabled:opacity-55"
+                disabled={optimizingPrompt || loading}
+                onClick={() => void optimizeCurrentPrompt()}
+              >
+                {optimizingPrompt ? <Loader2 className="size-3 animate-spin" /> : <img src={optimizeIcon} alt="" className="size-3" />}
+                {optimizingPrompt ? "优化中" : "提示词优化"}
+              </button>
+            </div>
+            <div className="figma-prompt-box relative h-[200px] overflow-hidden rounded-[10px] border border-white/15 p-3">
+              <textarea
+                ref={promptTextareaRef}
+                value={form.prompt}
+                onChange={(event) => update("prompt", event.target.value)}
+                onPaste={handlePromptPaste}
+                placeholder="可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等"
+                required
+                className="figma-prompt-textarea block h-[100px] min-h-0 w-full resize-none rounded-none border-0 bg-transparent p-0 text-xs leading-[18px] text-white/80 outline-none placeholder:text-white/40"
+              />
+              <input ref={referenceInputRef} type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={handleReferenceInputChange} />
+              <div className="absolute bottom-3 left-3 h-16 w-12">
+                <button
+                  type="button"
+                  className="absolute inset-0 grid overflow-hidden rounded-[6px] border border-white/10 bg-white/10"
+                  aria-label={referenceImage ? "更换参考图" : "添加参考图"}
+                  title={referenceImage ? "更换参考图" : "添加参考图"}
+                  onClick={() => referenceInputRef.current?.click()}
+                >
+                  {referenceImage ? (
+                    <img src={referenceImage.url} alt={referenceImage.name} className="size-full object-cover" />
+                  ) : (
+                    <span className="grid size-full place-items-center">
+                      <img src={addIcon} alt="" className="size-4" />
+                    </span>
+                  )}
+                </button>
+                {referenceImage && (
+                  <button
+                    type="button"
+                    className="absolute left-[27px] top-[3px] z-10 grid size-4 place-items-center overflow-hidden rounded bg-black/80"
+                    aria-label="删除参考图"
+                    title="删除参考图"
+                    onClick={clearReferenceImage}
+                  >
+                    <img src={referenceDeleteIcon} alt="" className="size-3" />
+                  </button>
+                )}
+                {referenceImage && referenceMask && <span className="absolute bottom-1 right-1 size-2 rounded-full bg-[#6eff30]" aria-label="已应用选区遮罩" />}
+              </div>
+            </div>
+          </section>
+
+          <section className="mt-4 pb-4">
+            <Label className="mb-2 block text-xs font-semibold leading-[18px] text-white">参数</Label>
+            <div className="figma-param-panel flex flex-col gap-4 rounded-[10px] border border-white/15 p-3">
+              <OptionGroup label="比例">
+                {availableRatios.map((ratio) => (
+                  <SegmentButton key={ratio} active={form.aspectRatio === ratio} onClick={() => update("aspectRatio", ratio)}>
+                    {ratio}
+                  </SegmentButton>
+                ))}
+              </OptionGroup>
+
+              <OptionGroup label="质量">
+                {qualityOptions.map((quality) => (
+                  <SegmentButton key={quality} active={form.quality === quality} grow onClick={() => update("quality", quality)}>
+                    {qualityLabels[quality] ?? quality}
+                  </SegmentButton>
+                ))}
+              </OptionGroup>
+
+              <OptionGroup label="分辨率">
+                {RESOLUTIONS.map((resolution) => (
+                  <SegmentButton key={resolution} active={form.resolution === resolution} grow onClick={() => update("resolution", resolution)}>
+                    {resolution}
+                  </SegmentButton>
+                ))}
+              </OptionGroup>
+
+              <OptionGroup label="数量">
+                {Array.from({ length: Math.min(config.maxImagesPerRequest, 4) }, (_, index) => String(index + 1)).map((quantity) => (
+                  <SegmentButton key={quantity} active={form.quantity === Number(quantity)} grow onClick={() => update("quantity", Number(quantity))}>
+                    {quantity}
+                  </SegmentButton>
+                ))}
+              </OptionGroup>
+
+              <OptionGroup label="格式">
+                {formatOptions.map((format) => (
+                  <SegmentButton key={format} active={form.outputFormat === format} grow onClick={() => update("outputFormat", format)}>
+                    {formatLabels[format] ?? format.toUpperCase()}
+                  </SegmentButton>
+                ))}
+              </OptionGroup>
+            </div>
+
+            <div className="mt-4 flex flex-col gap-3">
+              {error && <Notice tone="error" text={error} />}
+              {config.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={setTurnstileToken} />}
+            </div>
+          </section>
         </div>
 
-        <div className="grid gap-5 p-4">
-          <Field label="提示词">
-            <Textarea
-              value={form.prompt}
-              onChange={(event) => update("prompt", event.target.value)}
-              placeholder="描述画面、主体、材质、镜头、光线和风格"
-              rows={8}
-              required
-              className="min-h-40 resize-none"
-            />
-          </Field>
-
-          <Field label="比例">
-            <div className="grid grid-cols-3 gap-2">
-              {config?.ratios.map((ratio) => (
-                <Button
-                  key={ratio}
-                  type="button"
-                  variant={form.aspectRatio === ratio ? "default" : "outline"}
-                  className="h-12"
-                  onClick={() => update("aspectRatio", ratio)}
-                >
-                  {ratio}
-                </Button>
-              ))}
-            </div>
-          </Field>
-
-          {form.aspectRatio === "custom" && (
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="宽">
-                <Input type="number" step={16} value={form.width} onChange={(event) => update("width", Number(event.target.value))} />
-              </Field>
-              <Field label="高">
-                <Input type="number" step={16} value={form.height} onChange={(event) => update("height", Number(event.target.value))} />
-              </Field>
-            </div>
-          )}
-
-          <div className="grid grid-cols-2 gap-3">
-            <SelectField label="质量" value={form.quality} values={config?.qualities ?? []} onChange={(value) => update("quality", value)} />
-            <Field label="数量">
-              <Input
-                type="number"
-                min={1}
-                max={config?.maxImagesPerRequest ?? 4}
-                value={form.quantity}
-                onChange={(event) => update("quantity", Number(event.target.value))}
-              />
-            </Field>
-            <SelectField label="格式" value={form.outputFormat} values={config?.formats ?? []} onChange={(value) => update("outputFormat", value)} />
-            <SelectField
-              label="背景"
-              value={form.background}
-              values={["auto", "opaque", "transparent"]}
-              onChange={(value) => update("background", value)}
-            />
+        <div className="shrink-0 px-4 pb-4 pt-3">
+          <div className="flex items-center justify-between gap-4">
+            <p className="truncate text-xs leading-[18px] text-white/40">禁止利用功能从事违法活动</p>
+            <button
+              type="submit"
+              className="figma-generate-button flex h-[34px] w-[120px] shrink-0 items-center justify-center rounded-[10px] border border-[#6eff30] text-xs font-semibold leading-none text-[#6eff30] disabled:cursor-not-allowed disabled:opacity-55"
+              disabled={loading}
+            >
+              {loading ? "生成中" : "生成任务"}
+            </button>
           </div>
-
-          <div className="grid gap-3">
-            <div className="flex items-center justify-between gap-3">
-              <Label>压缩率</Label>
-              <span className="text-sm font-medium text-muted-foreground">{form.outputFormat === "png" ? "PNG 不压缩" : `${form.compression}%`}</span>
-            </div>
-            <Slider
-              value={[form.compression]}
-              min={0}
-              max={100}
-              step={5}
-              disabled={form.outputFormat === "png"}
-              onValueChange={([value]) => update("compression", value)}
-            />
-          </div>
-
-          {error && <Notice tone="error" text={error} />}
-          {!providerConfigured && <Notice tone="warn" text="请先在设置页保存 baseURL 和 API Key。" />}
-          {config?.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={setTurnstileToken} />}
-
-          <Button className="h-12 text-base" disabled={loading}>
-            {loading ? <Loader2 className="animate-spin" /> : <ImagePlus />}
-            {providerConfigured ? "开始生成" : "去配置 Provider"}
-          </Button>
         </div>
       </form>
 
-      <section className="relative overflow-hidden rounded-lg border bg-[linear-gradient(135deg,hsl(216_32%_98%),hsl(190_28%_96%))] shadow-canvas">
-        <div className="flex flex-col gap-3 border-b bg-background/82 p-4 backdrop-blur md:flex-row md:items-center md:justify-between">
-          <div>
-            <p className="text-xs font-semibold uppercase text-muted-foreground">Canvas</p>
-            <h2 className="mt-1 text-2xl font-semibold tracking-normal">{job ? statusText(job.status) : "等待生成"}</h2>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge className={cn("capitalize", statusBadgeClass(job?.status))} variant="outline">
-              {job?.status ?? "idle"}
-            </Badge>
-            <Badge variant="secondary">{form.quantity} 张</Badge>
-          </div>
-        </div>
-
-        <div className="min-h-[560px] p-4 md:p-6">
-          {job?.status === "failed" && <Notice tone="error" text={job.error_message ?? "生成失败。"} />}
-          {!job && (
-            <EmptyState
-              icon={<Images className="size-7" />}
-              title="结果会在这里铺开"
-              text="左侧输入提示词并选择比例、质量、数量。完成后图片会自动进入当前空间图库。"
-            />
-          )}
-          {(job?.status === "queued" || job?.status === "running") && (
-            <div className="grid min-h-[420px] place-items-center text-center">
-              <div className="grid gap-4">
-                <div className="mx-auto grid size-16 place-items-center rounded-lg bg-background shadow-panel">
-                  <Loader2 className="size-7 animate-spin text-primary" />
-                </div>
-                <div>
-                  <p className="font-semibold">模型正在处理</p>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    已等待 {formatElapsed(elapsedSeconds)}，最长可能接近 {formatElapsed(config?.generationTimeoutSeconds ?? 600)}。
-                  </p>
-                </div>
+      <section className="figma-records thin-scrollbar h-full min-w-0 flex-1 overflow-y-auto px-5 py-4">
+        <div className="mx-auto flex w-[800px] max-w-full flex-col gap-3">
+          {recordsError && <Notice tone="error" text={recordsError} />}
+          {recordsLoading && records.length === 0 && <LoadingPanel text="加载生成记录" />}
+          {!recordsLoading && !loading && records.length === 0 && (
+            <div className="figma-record-card grid min-h-[188px] place-items-center rounded-[10px] border border-white/15 p-6 text-center">
+              <div className="flex flex-col items-center gap-3 text-white/40">
+                <Images className="size-7" />
+                <span className="text-xs">生成记录会出现在这里</span>
               </div>
             </div>
           )}
-          {images.length > 0 && <ImageGrid images={images} />}
+          {records.map((record) => (
+            <GenerationRecordCard
+              key={record.job.id}
+              record={record.job.id === job?.id ? { ...record, job, images, elapsedSeconds: elapsedSeconds || record.elapsedSeconds } : record}
+              onDelete={() => void deleteRecord(record)}
+              onRegenerate={() => void regenerateRecord(record)}
+              onEditPrompt={() => editRecordPrompt(record)}
+              onEditImage={(image) => void loadImageForEditing(image, record.job.prompt)}
+              editOptions={{
+                initialForm: generationFormFromJob(record.job),
+                availableRatios,
+                qualityOptions,
+                formatOptions,
+                maxImagesPerRequest: config.maxImagesPerRequest,
+                submitting: loading,
+                onSubmit: createEditTaskFromImage,
+              }}
+            />
+          ))}
+          {nextCursor && (
+            <button type="button" className="mx-auto mb-2 h-8 rounded-md border border-white/15 px-4 text-xs text-white/60" onClick={() => void loadRecords(nextCursor)}>
+              加载更多
+            </button>
+          )}
         </div>
       </section>
     </div>
   );
 }
 
-function InspirationPromptStrip({
-  onSelect,
-  onOpenInspirations,
-}: {
-  onSelect: (item: InspirationItem) => void;
-  onOpenInspirations: () => void;
-}) {
-  const [items, setItems] = useState<InspirationItem[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let mounted = true;
-    async function load() {
-      setLoading(true);
-      try {
-        const favorites = await api<{ ok: true; inspirations: InspirationItem[] }>("/api/inspirations?favorites=1");
-        const result = favorites.inspirations.length
-          ? favorites
-          : await api<{ ok: true; inspirations: InspirationItem[] }>("/api/inspirations");
-        if (mounted) setItems(result.inspirations.filter((item) => item.prompt.trim()).slice(0, 4));
-      } catch {
-        if (mounted) setItems([]);
-      } finally {
-        if (mounted) setLoading(false);
-      }
-    }
-    void load();
-    return () => {
-      mounted = false;
-    };
-  }, []);
-
+function OptionGroup({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="grid gap-2">
-      <div className="flex items-center justify-between gap-3">
-        <Label>灵感片段</Label>
-        <Button type="button" variant="ghost" size="sm" className="h-8 px-2 text-xs" onClick={onOpenInspirations}>
-          <LibraryBig className="size-3.5" />
-          灵感库
-        </Button>
-      </div>
-      {loading && <div className="h-10 rounded-lg border bg-muted/50" />}
-      {!loading && items.length === 0 && (
-        <button
-          type="button"
-          className="rounded-lg border border-dashed bg-background px-3 py-3 text-left text-sm text-muted-foreground transition-colors hover:bg-muted"
-          onClick={onOpenInspirations}
-        >
-          导入或采集灵感后，可在这里快速套用提示词。
-        </button>
-      )}
-      {items.length > 0 && (
-        <div className="grid gap-2">
-          {items.map((item) => (
-            <Button
-              key={item.id}
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-auto justify-start py-2 text-left"
-              onClick={() => {
-                void api(`/api/inspirations/${item.id}/use`, { method: "POST" });
-                onSelect(item);
-              }}
-            >
-              <span className="line-clamp-2">{item.prompt}</span>
-            </Button>
-          ))}
-        </div>
-      )}
+    <div className="flex flex-col gap-2">
+      <p className="text-xs leading-[18px] text-white/60">{label}</p>
+      <div className="flex w-full items-center gap-1">{children}</div>
     </div>
   );
 }
 
-function InspirationView({ onUse }: { onUse: (item: InspirationItem) => void }) {
-  const [items, setItems] = useState<InspirationItem[]>([]);
-  const [query, setQuery] = useState("");
-  const [source, setSource] = useState("all");
-  const [tag, setTag] = useState("");
-  const [favoritesOnly, setFavoritesOnly] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [message, setMessage] = useState("");
-  const [importUrl, setImportUrl] = useState("");
-  const [importPrompt, setImportPrompt] = useState("");
-  const [importTags, setImportTags] = useState("");
-  const [importing, setImporting] = useState(false);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError("");
-    const params = new URLSearchParams();
-    if (query.trim()) params.set("q", query.trim());
-    if (source !== "all") params.set("source", source);
-    if (tag.trim()) params.set("tag", tag.trim());
-    if (favoritesOnly) params.set("favorites", "1");
-    try {
-      const result = await api<{ ok: true; inspirations: InspirationItem[] }>(`/api/inspirations?${params.toString()}`);
-      setItems(result.inspirations);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "灵感库加载失败。");
-    } finally {
-      setLoading(false);
-    }
-  }, [favoritesOnly, query, source, tag]);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  async function submitImport(event: FormEvent) {
-    event.preventDefault();
-    setImporting(true);
-    setError("");
-    setMessage("");
-    try {
-      const result = await api<{ ok: true; inspiration: InspirationItem }>("/api/inspirations/import-url", {
-        method: "POST",
-        body: JSON.stringify({
-          url: importUrl,
-          prompt: importPrompt,
-          tags: splitTags(importTags),
-        }),
-      });
-      setItems((current) => [result.inspiration, ...current.filter((item) => item.id !== result.inspiration.id)]);
-      setImportUrl("");
-      setImportPrompt("");
-      setImportTags("");
-      setMessage("灵感已导入。");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "导入失败。");
-    } finally {
-      setImporting(false);
-    }
-  }
-
-  async function toggleFavorite(item: InspirationItem) {
-    const next = !item.favorite;
-    setItems((current) => current.map((entry) => (entry.id === item.id ? { ...entry, favorite: next } : entry)));
-    try {
-      const result = await api<{ ok: true; favorite: boolean }>(`/api/inspirations/${item.id}/favorite`, {
-        method: "POST",
-        body: JSON.stringify({ favorite: next }),
-      });
-      setItems((current) => current.map((entry) => (entry.id === item.id ? { ...entry, favorite: result.favorite } : entry)));
-    } catch (err) {
-      setItems((current) => current.map((entry) => (entry.id === item.id ? { ...entry, favorite: item.favorite } : entry)));
-      setError(err instanceof Error ? err.message : "收藏失败。");
-    }
-  }
-
-  async function useItem(item: InspirationItem) {
-    await api(`/api/inspirations/${item.id}/use`, { method: "POST" }).catch(() => null);
-    onUse(item);
-  }
-
+function SegmentButton({
+  active,
+  grow = false,
+  children,
+  onClick,
+}: {
+  active: boolean;
+  grow?: boolean;
+  children: ReactNode;
+  onClick: () => void;
+}) {
   return (
-    <section className="grid gap-5">
-      <div className="flex flex-col gap-3 xl:flex-row xl:items-end xl:justify-between">
-        <div>
-          <p className="text-xs font-semibold uppercase text-muted-foreground">Inspiration</p>
-          <h2 className="mt-1 text-3xl font-semibold tracking-normal">灵感库</h2>
-        </div>
-        <form className="grid gap-2 md:grid-cols-[minmax(220px,1fr)_140px_150px_auto_auto]" onSubmit={(event) => { event.preventDefault(); void load(); }}>
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-            <Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索提示词、作者、标签" className="pl-9" />
-          </div>
-          <Select value={source} onValueChange={setSource}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">全部来源</SelectItem>
-              <SelectItem value="civitai">Civitai</SelectItem>
-              <SelectItem value="x">X</SelectItem>
-              <SelectItem value="jimeng">即梦</SelectItem>
-              <SelectItem value="generic">网页</SelectItem>
-            </SelectContent>
-          </Select>
-          <Input value={tag} onChange={(event) => setTag(event.target.value)} placeholder="标签" />
-          <Button type="button" variant={favoritesOnly ? "default" : "outline"} onClick={() => setFavoritesOnly((current) => !current)}>
-            <Heart className={cn("size-4", favoritesOnly && "fill-current")} />
-            收藏
-          </Button>
-          <Button type="submit" variant="outline">
-            <RefreshCcw className="size-4" />
-            刷新
-          </Button>
-        </form>
-      </div>
-
-      <form className="grid gap-3 rounded-lg border bg-card p-4 shadow-panel lg:grid-cols-[minmax(260px,1fr)_minmax(280px,1.2fr)_180px_auto]" onSubmit={submitImport}>
-        <Field label="来源链接">
-          <Input value={importUrl} onChange={(event) => setImportUrl(event.target.value)} placeholder="https://..." required />
-        </Field>
-        <Field label="提示词">
-          <Input value={importPrompt} onChange={(event) => setImportPrompt(event.target.value)} placeholder="X 手动导入时必填；网页可自动读取描述" />
-        </Field>
-        <Field label="标签">
-          <Input value={importTags} onChange={(event) => setImportTags(event.target.value)} placeholder="产品, 海报" />
-        </Field>
-        <div className="flex items-end">
-          <Button className="w-full" disabled={importing}>
-            {importing ? <Loader2 className="animate-spin" /> : <LinkIcon />}
-            导入
-          </Button>
-        </div>
-      </form>
-
-      {message && <Notice tone="success" text={message} />}
-      {error && <Notice tone="error" text={error} />}
-
-      {loading && (
-        <div className="grid min-h-80 place-items-center rounded-lg border bg-card text-muted-foreground">
-          <div className="flex items-center gap-3">
-            <Loader2 className="size-5 animate-spin" />
-            <span className="text-sm font-medium">加载灵感</span>
-          </div>
-        </div>
+    <button
+      type="button"
+      className={cn(
+        "figma-segment h-[28px] rounded-md border px-2 text-center text-xs font-semibold leading-[18px] text-white/90",
+        grow ? "min-w-0 flex-1" : "w-[44px] shrink-0",
+        active ? "border-white/90 bg-white/10" : "border-white/10 bg-transparent",
       )}
-      {!loading && items.length === 0 && (
-        <EmptyState icon={<LibraryBig className="size-7" />} title="还没有可用灵感" text="定时采集会写入公开素材，也可以先粘贴来源链接手动导入。" />
-      )}
-      {!loading && items.length > 0 && (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-4">
-          {items.map((item) => (
-            <InspirationCard key={item.id} item={item} onFavorite={() => void toggleFavorite(item)} onUse={() => void useItem(item)} />
-          ))}
-        </div>
-      )}
-    </section>
+      onClick={onClick}
+    >
+      {children}
+    </button>
   );
 }
 
-function InspirationCard({
-  item,
-  onFavorite,
-  onUse,
+function GenerationRecordCard({
+  record,
+  onDelete,
+  onRegenerate,
+  onEditPrompt,
+  onEditImage,
+  editOptions,
 }: {
-  item: InspirationItem;
-  onFavorite: () => void;
-  onUse: () => void;
+  record: GenerationRecord;
+  onDelete: () => void;
+  onRegenerate: () => void;
+  onEditPrompt: () => void;
+  onEditImage: (image: ImageItem, draft?: GenerateForm, mask?: ImageSelectionMask) => void;
+  editOptions?: ImagePreviewEditOptions;
 }) {
-  const hasPrompt = item.prompt.trim().length > 0;
+  const [previewImage, setPreviewImage] = useState<ImageItem | null>(null);
+  const isGenerating = record.job.status === "queued" || record.job.status === "running";
+  const pendingThumbnailCount = isGenerating ? Math.max(0, record.job.quantity - record.images.length) : 0;
+  const showEmptyPlaceholder = record.images.length === 0 && pendingThumbnailCount === 0;
+  const recordError =
+    record.job.status === "failed" || record.job.status === "partial_succeeded"
+      ? generationJobErrorMessage(
+          record.job,
+          record.job.status === "partial_succeeded" ? `已生成 ${record.images.length}/${record.job.quantity} 张，部分图片生成失败。` : "生成失败。",
+        )
+      : "";
+  const chips = [
+    ...(record.job.status === "succeeded" || isGenerating ? [] : [statusLabel(record.job.status)]),
+    record.job.aspect_ratio,
+    qualityLabels[record.job.quality] ?? record.job.quality,
+    formatResolution(record.job.width, record.job.height),
+    formatLabels[record.job.output_format] ?? record.job.output_format.toUpperCase(),
+    formatRecordElapsed(record.elapsedSeconds),
+  ];
+
   return (
-    <article className="group overflow-hidden rounded-lg border bg-card shadow-panel">
-      <InspirationThumb item={item} />
-      <div className="grid gap-3 p-3">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <Badge variant="secondary">{item.sourceName || item.sourceKey || "来源"}</Badge>
-              {item.aspectRatio && <span className="text-xs text-muted-foreground">{item.aspectRatio}</span>}
-            </div>
-            <strong className="mt-2 line-clamp-2 block text-sm font-semibold">{item.title || item.author || "未命名灵感"}</strong>
-          </div>
-          <Button variant="ghost" size="icon" className="shrink-0 rounded-lg" onClick={onFavorite} aria-label={item.favorite ? "取消收藏" : "收藏"}>
-            <Heart className={cn("size-4", item.favorite && "fill-current text-rose-600")} />
-          </Button>
+    <article
+      className={cn(
+        "figma-record-card flex w-full flex-col gap-3 overflow-hidden rounded-[10px] border p-3",
+        isGenerating ? "figma-record-card-generating" : "border-white/15",
+      )}
+    >
+      <div className="flex flex-wrap items-start gap-3">
+        {record.images.map((image) => (
+          <GenerationThumbnail key={image.id} image={image} onOpen={() => setPreviewImage(image)} />
+        ))}
+        {Array.from({ length: pendingThumbnailCount }, (_, index) => (
+          <GenerationPlaceholderThumbnail key={`pending-${record.job.id}-${index}`} job={record.job} loading />
+        ))}
+        {showEmptyPlaceholder && <GenerationPlaceholderThumbnail job={record.job} />}
+      </div>
+
+      <p className="record-prompt min-w-full text-xs leading-[18px] text-white/40">
+        {record.job.prompt || statusLabel(record.job.status)}
+      </p>
+      {recordError && <p className="text-xs leading-[18px] text-destructive">{recordError}</p>}
+
+      <div className="flex min-h-5 items-center gap-10">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+          {chips.map((chip) => (
+            <span key={chip} className="rounded-md bg-white/10 px-2 py-1 text-xs leading-none text-white/60">
+              {chip}
+            </span>
+          ))}
         </div>
-        <p className={cn("min-h-16 text-sm leading-6", hasPrompt ? "line-clamp-3 text-foreground" : "text-muted-foreground")}>
-          {hasPrompt ? item.prompt : "这个素材没有可读取的提示词，可打开来源查看详情。"}
-        </p>
-        {item.tags.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
-            {item.tags.slice(0, 4).map((tagName) => (
-              <Badge key={tagName} variant="outline" className="text-[11px]">
-                {tagName}
-              </Badge>
-            ))}
-          </div>
-        )}
-        <div className="flex items-center justify-between gap-2 border-t pt-3">
-          <Button variant="outline" size="sm" asChild>
-            <a href={item.originalUrl} target="_blank" rel="noreferrer">
-              <ExternalLink className="size-4" />
-              来源
-            </a>
-          </Button>
-          <Button size="sm" onClick={onUse} disabled={!hasPrompt}>
-            <Wand2 className="size-4" />
-            套用
-          </Button>
+        <div className="flex shrink-0 items-center gap-4 text-white/90">
+          <button type="button" className="figma-icon-action" aria-label="删除记录" onClick={onDelete}>
+            <Trash2 className="size-[14px]" />
+          </button>
+          <button type="button" className="figma-icon-action" aria-label="重新生成" onClick={onRegenerate}>
+            <RotateCcw className="size-[14px]" />
+          </button>
+          <button type="button" className="figma-icon-action" aria-label="编辑提示词" onClick={onEditPrompt}>
+            <Edit3 className="size-[14px]" />
+          </button>
+          <button type="button" className="figma-icon-action" aria-label="复制提示词" onClick={() => void copyPrompt(record.job.prompt)}>
+            <Copy className="size-[14px]" />
+          </button>
+          <button
+            type="button"
+            className="figma-icon-action disabled:cursor-not-allowed disabled:opacity-40"
+            aria-label="下载全部图片"
+            disabled={record.images.length === 0}
+            onClick={() => downloadAllImages(record)}
+          >
+            <CloudDownload className="size-[14px]" />
+          </button>
         </div>
       </div>
+      {previewImage && (
+        <ImagePreviewDialog
+          image={previewImage}
+          onClose={() => setPreviewImage(null)}
+          onEdit={(draft, mask) => {
+            onEditImage(previewImage, draft, mask);
+            setPreviewImage(null);
+          }}
+          editOptions={editOptions}
+        />
+      )}
     </article>
   );
 }
 
-function InspirationThumb({ item }: { item: InspirationItem }) {
-  const [failed, setFailed] = useState(false);
-  const src = failed ? null : item.thumbnailUrl;
+function GenerationPlaceholderThumbnail({ job, loading = false }: { job: GenerationJob; loading?: boolean }) {
+  const size = thumbnailSize(job.width, job.height);
   return (
-    <div className="relative grid aspect-[4/3] place-items-center overflow-hidden bg-muted">
-      {src ? (
-        <img
-          src={src}
-          alt={item.title || item.prompt || "灵感图片"}
-          loading="lazy"
-          className="size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
-          onError={() => setFailed(true)}
-        />
-      ) : (
-        <div className="grid justify-items-center gap-2 text-muted-foreground">
-          <Images className="size-7" />
-          <span className="text-xs">无缩略图</span>
-        </div>
-      )}
-      <div className="absolute left-3 top-3 flex gap-2">
-        {item.model && <Badge className="bg-background/85 text-foreground backdrop-blur">{item.model}</Badge>}
-      </div>
+    <div
+      className="grid shrink-0 place-items-center rounded-md border border-white/10 bg-white/10 text-white/40"
+      style={{ width: size.width, height: size.height }}
+      aria-label={loading ? "图片生成中" : "暂无生成图片"}
+    >
+      {loading ? <Loader2 className="size-5 animate-spin" /> : <FileText className="size-5" />}
     </div>
   );
 }
 
-function GalleryView() {
-  const [images, setImages] = useState<ImageItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+function GenerationThumbnail({ image, onOpen }: { image: ImageItem; onOpen: () => void }) {
+  const size = thumbnailSize(image.width, image.height);
+  return (
+    <button
+      type="button"
+      className="block shrink-0 overflow-hidden rounded-md border border-white/10 bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/70"
+      style={{ width: size.width, height: size.height }}
+      aria-label="查看大图"
+      onClick={onOpen}
+    >
+      <img src={image.url} alt={image.prompt ?? "生成图片"} loading="lazy" className="size-full object-cover" />
+    </button>
+  );
+}
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const result = await api<{ ok: true; images: ImageItem[] }>("/api/images");
-      setImages(result.images);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "图库加载失败。");
-    } finally {
-      setLoading(false);
+interface ImagePreviewEditOptions {
+  initialForm: GenerateForm;
+  availableRatios: readonly string[];
+  qualityOptions: readonly string[];
+  formatOptions: readonly string[];
+  maxImagesPerRequest: number;
+  submitting: boolean;
+  onSubmit?: (image: ImageItem, draft: GenerateForm, mask?: ImageSelectionMask) => Promise<void>;
+}
+
+const fallbackImagePreviewEditOptions = {
+  initialForm: defaultForm,
+  availableRatios: FIGMA_RATIOS,
+  qualityOptions: QUALITY_OPTIONS,
+  formatOptions: FORMAT_OPTIONS,
+  maxImagesPerRequest: fallbackConfig.maxImagesPerRequest,
+  submitting: false,
+} satisfies ImagePreviewEditOptions;
+
+function ImagePreviewDialog({
+  image,
+  onClose,
+  onEdit,
+  editOptions,
+}: {
+  image: ImageItem;
+  onClose: () => void;
+  onEdit: (draft?: GenerateForm, mask?: ImageSelectionMask) => void;
+  editOptions?: ImagePreviewEditOptions;
+}) {
+  const panelOptions = editOptions ?? fallbackImagePreviewEditOptions;
+  const [viewportSize, setViewportSize] = useState(() => currentViewportSize());
+  const [editing, setEditing] = useState(false);
+  const [selectionEditing, setSelectionEditing] = useState(false);
+  const [selectionStrokes, setSelectionStrokes] = useState<ImageSelectionStroke[]>([]);
+  const [redoSelectionStrokes, setRedoSelectionStrokes] = useState<ImageSelectionStroke[]>([]);
+  const [draft, setDraft] = useState<GenerateForm>(() => panelOptions.initialForm);
+  const [optimizing, setOptimizing] = useState(false);
+  const [editError, setEditError] = useState("");
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const selectionCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const activeSelectionStrokeRef = useRef<ImageSelectionStroke | null>(null);
+  const previewSize = useMemo(
+    () => imagePreviewSize(image.width, image.height, viewportSize.width, viewportSize.height, editing),
+    [editing, image.height, image.width, viewportSize.height, viewportSize.width],
+  );
+  const previewStyle = {
+    "--preview-panel-width": `${previewSize.panelWidth}px`,
+    "--preview-panel-height": `${previewSize.panelHeight}px`,
+    "--preview-editor-width": `${previewSize.editorWidth}px`,
+  } as CSSProperties;
+
+  useEffect(() => {
+    setEditing(false);
+    setSelectionEditing(false);
+    setSelectionStrokes([]);
+    setRedoSelectionStrokes([]);
+    activeSelectionStrokeRef.current = null;
+    setDraft(panelOptions.initialForm);
+    setEditError("");
+  }, [image.id]);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
     }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  useEffect(() => {
+    function handleResize() {
+      setViewportSize(currentViewportSize());
+    }
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
   }, []);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (!selectionEditing) return;
+    drawImageSelectionCanvas(selectionCanvasRef.current, stageRef.current, image, selectionStrokes);
+  }, [image, previewSize.panelHeight, previewSize.panelWidth, selectionEditing, selectionStrokes, viewportSize.height, viewportSize.width]);
+
+  function updateDraft<K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) {
+    setDraft((current) => updateGenerateFormValue(current, key, value));
+  }
+
+  function beginSelectionEdit() {
+    setEditing(true);
+    setSelectionEditing(true);
+    setEditError("");
+  }
+
+  function cancelSelectionEdit() {
+    activeSelectionStrokeRef.current = null;
+    setSelectionEditing(false);
+    setSelectionStrokes([]);
+    setRedoSelectionStrokes([]);
+    setEditError("");
+  }
+
+  function undoSelectionStroke() {
+    setSelectionStrokes((current) => {
+      const next = current.slice(0, -1);
+      const removed = current[current.length - 1];
+      if (removed) setRedoSelectionStrokes((redoCurrent) => [removed, ...redoCurrent]);
+      return next;
+    });
+  }
+
+  function redoSelectionStroke() {
+    setRedoSelectionStrokes((current) => {
+      const [restored, ...nextRedo] = current;
+      if (restored) setSelectionStrokes((strokes) => [...strokes, restored]);
+      return nextRedo;
+    });
+  }
+
+  function startSelectionStroke(event: ReactPointerEvent<HTMLCanvasElement>) {
+    if (!selectionEditing) return;
+    const point = imageSelectionPointFromEvent(event, stageRef.current, image);
+    if (!point) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const stroke: ImageSelectionStroke = {
+      brushRatio: IMAGE_SELECTION_BRUSH_RATIO,
+      points: [point],
+    };
+    activeSelectionStrokeRef.current = stroke;
+    setRedoSelectionStrokes([]);
+    setSelectionStrokes((current) => [...current, stroke]);
+  }
+
+  function moveSelectionStroke(event: ReactPointerEvent<HTMLCanvasElement>) {
+    const activeStroke = activeSelectionStrokeRef.current;
+    if (!activeStroke || !selectionEditing) return;
+    const point = imageSelectionPointFromEvent(event, stageRef.current, image);
+    if (!point) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    const previous = activeStroke.points[activeStroke.points.length - 1];
+    const minDistance = 0.003;
+    if (previous && Math.hypot(point.x - previous.x, point.y - previous.y) < minDistance) return;
+
+    const nextStroke = {
+      ...activeStroke,
+      points: [...activeStroke.points, point],
+    };
+    activeSelectionStrokeRef.current = nextStroke;
+    setSelectionStrokes((current) => {
+      if (current.length === 0) return [nextStroke];
+      return [...current.slice(0, -1), nextStroke];
+    });
+  }
+
+  function endSelectionStroke(event: ReactPointerEvent<HTMLCanvasElement>) {
+    if (!activeSelectionStrokeRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    activeSelectionStrokeRef.current = null;
+  }
+
+  async function optimizeDraftPrompt() {
+    if (!draft.prompt.trim()) {
+      setEditError("请输入提示词后再优化。");
+      return;
+    }
+
+    setOptimizing(true);
+    setEditError("");
+    try {
+      const result = await api<{ ok: true; optimizedPrompt: string }>("/api/prompts/optimize", {
+        method: "POST",
+        body: JSON.stringify(promptOptimizationPayload(draft)),
+      });
+      updateDraft("prompt", result.optimizedPrompt.trim());
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "提示词优化失败。");
+    } finally {
+      setOptimizing(false);
+    }
+  }
+
+  async function submitEdit(event: FormEvent) {
+    event.preventDefault();
+    setEditError("");
+    let selectionMask: ImageSelectionMask | undefined;
+    if (selectionEditing) {
+      if (selectionStrokes.length === 0) {
+        setEditError("请先涂抹要优化的区域。");
+        return;
+      }
+      try {
+        selectionMask = await createSelectionMask(image, selectionStrokes);
+      } catch (err) {
+        setEditError(err instanceof Error ? err.message : "选区遮罩生成失败。");
+        return;
+      }
+    }
+    if (!editOptions?.onSubmit) {
+      onEdit(draft, selectionMask);
+      onClose();
+      return;
+    }
+    let submitPromise: Promise<void>;
+    try {
+      submitPromise = editOptions.onSubmit(image, draft, selectionMask);
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "创建任务失败。");
+      return;
+    }
+    onClose();
+    void submitPromise.catch(() => undefined);
+  }
+
+  return createPortal(
+    <div className="image-preview-overlay fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6" onClick={onClose}>
+      <div
+        className={cn("image-preview-panel", editing && "image-preview-panel-edit")}
+        role="dialog"
+        aria-modal="true"
+        aria-label={editing ? "图片编辑" : "图片预览"}
+        style={previewStyle}
+        onClick={(event) => event.stopPropagation()}
+      >
+        {editing && (
+          <ImagePreviewEditPanel
+            draft={draft}
+            error={editError}
+            optimizing={optimizing}
+            submitting={panelOptions.submitting}
+            availableRatios={panelOptions.availableRatios}
+            qualityOptions={panelOptions.qualityOptions}
+            formatOptions={panelOptions.formatOptions}
+            maxImagesPerRequest={panelOptions.maxImagesPerRequest}
+            onDraftChange={updateDraft}
+            onOptimize={() => void optimizeDraftPrompt()}
+            onSubmit={(event) => void submitEdit(event)}
+          />
+        )}
+        {selectionEditing ? (
+          <div className="image-preview-selection-toolbar">
+            <button type="button" className="image-preview-action" onClick={cancelSelectionEdit}>
+              <X />
+              <span>取消选区编辑</span>
+            </button>
+            <div className="flex items-center gap-5">
+              <button type="button" className="image-preview-action" disabled={selectionStrokes.length === 0} onClick={undoSelectionStroke}>
+                <Undo2 />
+                <span>上一步</span>
+              </button>
+              <button type="button" className="image-preview-action" disabled={redoSelectionStrokes.length === 0} onClick={redoSelectionStroke}>
+                <span>下一步</span>
+                <Redo2 />
+              </button>
+            </div>
+            <span aria-hidden="true" />
+          </div>
+        ) : (
+          <div className="image-preview-actions">
+            {editing ? (
+              <button type="button" className="image-preview-action" onClick={beginSelectionEdit}>
+                <Edit3 />
+                <span>选区编辑</span>
+              </button>
+            ) : (
+              <button type="button" className="image-preview-action" onClick={() => setEditing(true)}>
+                <Edit3 />
+                <span>编辑图片</span>
+              </button>
+            )}
+            <a className="image-preview-action" href={image.url} download={imageDownloadName(image)}>
+              <Download />
+              <span>下载图片</span>
+            </a>
+          </div>
+        )}
+        <button type="button" className="image-preview-close" aria-label="关闭预览" onClick={onClose}>
+          <X />
+        </button>
+        <div ref={stageRef} className={cn("image-preview-stage", selectionEditing && "image-preview-stage-selection")}>
+          <img src={image.url} alt={image.prompt ?? "生成图片"} />
+          {selectionEditing && (
+            <canvas
+              ref={selectionCanvasRef}
+              className="image-preview-selection-canvas"
+              aria-label="涂抹选区"
+              onPointerDown={startSelectionStroke}
+              onPointerMove={moveSelectionStroke}
+              onPointerUp={endSelectionStroke}
+              onPointerCancel={endSelectionStroke}
+            />
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function ImagePreviewEditPanel({
+  draft,
+  error,
+  optimizing,
+  submitting,
+  availableRatios,
+  qualityOptions,
+  formatOptions,
+  maxImagesPerRequest,
+  onDraftChange,
+  onOptimize,
+  onSubmit,
+}: {
+  draft: GenerateForm;
+  error: string;
+  optimizing: boolean;
+  submitting: boolean;
+  availableRatios: readonly string[];
+  qualityOptions: readonly string[];
+  formatOptions: readonly string[];
+  maxImagesPerRequest: number;
+  onDraftChange: <K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) => void;
+  onOptimize: () => void;
+  onSubmit: (event: FormEvent) => void;
+}) {
+  return (
+    <form className="image-preview-editor" onSubmit={onSubmit}>
+      <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-4 pt-4">
+        <section>
+          <div className="mb-2 flex h-[18px] items-center justify-between">
+            <Label className="text-xs font-semibold leading-[18px] text-white">提示词</Label>
+            <button
+              type="button"
+              className="flex h-[18px] items-center gap-1.5 text-xs leading-[18px] text-[#6eff30] disabled:cursor-not-allowed disabled:opacity-55"
+              disabled={optimizing || submitting}
+              onClick={onOptimize}
+            >
+              {optimizing ? <Loader2 className="size-3 animate-spin" /> : <img src={optimizeIcon} alt="" className="size-3" />}
+              {optimizing ? "优化中" : "提示词优化"}
+            </button>
+          </div>
+          <div className="figma-prompt-box relative h-[200px] overflow-hidden rounded-[10px] border border-white/15 p-3">
+            <textarea
+              value={draft.prompt}
+              onChange={(event) => onDraftChange("prompt", event.target.value)}
+              placeholder="可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等"
+              required
+              className="figma-prompt-textarea block h-[100px] min-h-0 w-full resize-none rounded-none border-0 bg-transparent p-0 text-xs leading-[18px] text-white/80 outline-none placeholder:text-white/40"
+            />
+            <div className="absolute bottom-3 left-3 grid h-16 w-12 place-items-center overflow-hidden rounded-[6px] bg-white/10">
+              <img src={addIcon} alt="" className="size-4" />
+            </div>
+          </div>
+        </section>
+
+        <section className="mt-4 pb-4">
+          <Label className="mb-2 block text-xs font-semibold leading-[18px] text-white">参数</Label>
+          <div className="figma-param-panel flex flex-col gap-4 rounded-[10px] border border-white/15 p-3">
+            <OptionGroup label="比例">
+              {availableRatios.map((ratio) => (
+                <SegmentButton key={ratio} active={draft.aspectRatio === ratio} onClick={() => onDraftChange("aspectRatio", ratio)}>
+                  {ratio}
+                </SegmentButton>
+              ))}
+            </OptionGroup>
+
+            <OptionGroup label="质量">
+              {qualityOptions.map((quality) => (
+                <SegmentButton key={quality} active={draft.quality === quality} grow onClick={() => onDraftChange("quality", quality)}>
+                  {qualityLabels[quality] ?? quality}
+                </SegmentButton>
+              ))}
+            </OptionGroup>
+
+            <OptionGroup label="分辨率">
+              {RESOLUTIONS.map((resolution) => (
+                <SegmentButton key={resolution} active={draft.resolution === resolution} grow onClick={() => onDraftChange("resolution", resolution)}>
+                  {resolution}
+                </SegmentButton>
+              ))}
+            </OptionGroup>
+
+            <OptionGroup label="数量">
+              {Array.from({ length: Math.min(maxImagesPerRequest, 4) }, (_, index) => String(index + 1)).map((quantity) => (
+                <SegmentButton key={quantity} active={draft.quantity === Number(quantity)} grow onClick={() => onDraftChange("quantity", Number(quantity))}>
+                  {quantity}
+                </SegmentButton>
+              ))}
+            </OptionGroup>
+
+            <OptionGroup label="格式">
+              {formatOptions.map((format) => (
+                <SegmentButton key={format} active={draft.outputFormat === format} grow onClick={() => onDraftChange("outputFormat", format)}>
+                  {formatLabels[format] ?? format.toUpperCase()}
+                </SegmentButton>
+              ))}
+            </OptionGroup>
+          </div>
+          {error && <p className="mt-3 text-xs leading-[18px] text-destructive">{error}</p>}
+        </section>
+      </div>
+
+      <div className="shrink-0 px-4 pb-4 pt-3">
+        <div className="flex items-center justify-between gap-4">
+          <p className="truncate text-xs leading-[18px] text-white/40">禁止利用功能从事违法活动</p>
+          <button
+            type="submit"
+            className="figma-generate-button flex h-[34px] w-[120px] shrink-0 items-center justify-center rounded-[10px] border border-[#6eff30] text-xs font-semibold leading-none text-[#6eff30] disabled:cursor-not-allowed disabled:opacity-55"
+            disabled={submitting}
+          >
+            {submitting ? "生成中" : "生成任务"}
+          </button>
+        </div>
+      </div>
+    </form>
+  );
+}
+
+function GalleryView({
+  config,
+  providerConfigured,
+  onProviderNeeded,
+  onEditImage,
+  onEditPrompt,
+}: {
+  config: AppConfig;
+  providerConfigured: boolean;
+  onProviderNeeded: () => void;
+  onEditImage: (image: ImageItem, draft?: GenerateForm, mask?: ImageSelectionMask) => void;
+  onEditPrompt: (draft: GenerateForm) => void;
+}) {
+  const [records, setRecords] = useState<GenerationRecord[]>([]);
+  const [recordsLoading, setRecordsLoading] = useState(true);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [activeJob, setActiveJob] = useState<GenerationJob | null>(null);
+  const [activeImages, setActiveImages] = useState<ImageItem[]>([]);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
+  const [error, setError] = useState("");
+
+  const availableRatios = useMemo(
+    () => FIGMA_RATIOS.filter((ratio) => config.ratios.includes(ratio) || fallbackConfig.ratios.includes(ratio)),
+    [config.ratios],
+  );
+  const qualityOptions = useMemo(
+    () => QUALITY_OPTIONS.filter((quality) => config.qualities.includes(quality) || fallbackConfig.qualities.includes(quality)),
+    [config.qualities],
+  );
+  const formatOptions = useMemo(
+    () => FORMAT_OPTIONS.filter((format) => config.formats.includes(format) || fallbackConfig.formats.includes(format)),
+    [config.formats],
+  );
+
+  const loadRecords = useCallback(async (cursor?: string, options?: { background?: boolean }) => {
+    if (!cursor && !options?.background) setRecordsLoading(true);
+    setError("");
+    try {
+      const path = cursor ? `/api/generations?cursor=${encodeURIComponent(cursor)}` : "/api/generations";
+      const result = await api<{ ok: true; records: GenerationRecord[]; nextCursor: string | null }>(path);
+      setRecords((current) => (cursor ? [...current, ...result.records] : result.records));
+      setNextCursor(result.nextCursor);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "生成记录加载失败。");
+    } finally {
+      if (!cursor && !options?.background) setRecordsLoading(false);
+    }
+  }, []);
+
+  const upsertRecord = useCallback((nextJob: GenerationJob, nextImages: ImageItem[]) => {
+    setRecords((current) => {
+      const record: GenerationRecord = {
+        job: nextJob,
+        images: nextImages,
+        elapsedSeconds: estimateJobElapsed(nextJob),
+      };
+      const rest = current.filter((item) => item.job.id !== nextJob.id);
+      return [record, ...rest];
+    });
+  }, []);
+
+  useEffect(() => {
+    void loadRecords();
+  }, [loadRecords]);
+
+  useEffect(() => {
+    if (!activeJob || isTerminalJobStatus(activeJob.status)) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const result = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${activeJob.id}`);
+        setActiveJob(result.job);
+        setActiveImages(result.images);
+        upsertRecord(result.job, result.images);
+        if (isTerminalJobStatus(result.job.status)) {
+          window.clearInterval(timer);
+          void loadRecords(undefined, { background: true });
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "刷新任务状态失败。");
+      }
+    }, GENERATION_POLL_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [activeJob?.id, activeJob?.status, loadRecords, upsertRecord]);
+
+  useEffect(() => {
+    if (!activeJob || isTerminalJobStatus(activeJob.status)) {
+      if (!activeJob) setElapsedSeconds(0);
+      return;
+    }
+    const startedAt = parseUtcTimestamp(activeJob.created_at);
+    const updateElapsed = () => setElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(timer);
+  }, [activeJob?.id, activeJob?.created_at, activeJob?.status]);
+
+  async function deleteRecord(record: GenerationRecord) {
+    setError("");
+    try {
+      await api<{ ok: true }>(`/api/generations/${record.job.id}`, { method: "DELETE" });
+      setRecords((current) => current.filter((item) => item.job.id !== record.job.id));
+      if (activeJob?.id === record.job.id) {
+        setActiveJob(null);
+        setActiveImages([]);
+        setElapsedSeconds(0);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除记录失败。");
+    }
+  }
+
+  async function regenerateRecord(record: GenerationRecord) {
+    if (!providerConfigured) {
+      onProviderNeeded();
+      return;
+    }
+    if (regeneratingId) return;
+    setRegeneratingId(record.job.id);
+    setError("");
+    setActiveImages([]);
+    setElapsedSeconds(0);
+    try {
+      const result = await api<{ ok: true; jobId: string; status: "queued" }>(`/api/generations/${record.job.id}/regenerate`, {
+        method: "POST",
+      });
+      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+      setActiveJob(firstPoll.job);
+      setActiveImages(firstPoll.images);
+      upsertRecord(firstPoll.job, firstPoll.images);
+      void loadRecords(undefined, { background: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重新生成失败。");
+    } finally {
+      setRegeneratingId(null);
+    }
+  }
+
+  async function createEditTaskFromImage(image: ImageItem, draft: GenerateForm, mask?: ImageSelectionMask): Promise<void> {
+    if (!providerConfigured) {
+      onProviderNeeded();
+      return;
+    }
+    if (!draft.prompt.trim()) {
+      const message = "请输入提示词后再生成。";
+      setError(message);
+      throw new Error(message);
+    }
+    if (regeneratingId) return;
+
+    setRegeneratingId(image.jobId);
+    setError("");
+    setActiveImages([]);
+    setElapsedSeconds(0);
+    try {
+      const file = await imageItemToFile(image);
+      const referenceImageDraft: ReferenceImagePreview = {
+        file,
+        url: image.url,
+        name: file.name || "编辑参考图",
+      };
+      const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
+        method: "POST",
+        body: generationRequestBody(draft, "", referenceImageDraft, mask ?? null),
+      });
+      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+      setActiveJob(firstPoll.job);
+      setActiveImages(firstPoll.images);
+      upsertRecord(firstPoll.job, firstPoll.images);
+      void loadRecords(undefined, { background: true });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "创建任务失败。";
+      setError(message);
+      throw new Error(message);
+    } finally {
+      setRegeneratingId(null);
+    }
+  }
 
   return (
-    <section className="grid gap-5">
-      <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-        <div>
-          <p className="text-xs font-semibold uppercase text-muted-foreground">Gallery</p>
-          <h2 className="mt-1 text-3xl font-semibold tracking-normal">空间图库</h2>
-        </div>
-        <Button variant="outline" onClick={load}>
-          <RefreshCcw className="size-4" />
-          刷新
-        </Button>
-      </div>
-      {error && <Notice tone="error" text={error} />}
-      {loading && (
-        <div className="grid min-h-80 place-items-center rounded-lg border bg-card text-muted-foreground">
-          <div className="flex items-center gap-3">
-            <Loader2 className="size-5 animate-spin" />
-            <span className="text-sm font-medium">加载图库</span>
+    <section className="entry-fade figma-records thin-scrollbar h-[calc(100dvh-64px)] flex-1 overflow-y-auto px-5 py-4">
+      <div className="mx-auto flex w-[800px] max-w-full flex-col gap-3">
+        {error && <Notice tone="error" text={error} />}
+        {recordsLoading && records.length === 0 && <LoadingPanel text="加载生成记录" />}
+        {!recordsLoading && records.length === 0 && (
+          <div className="figma-record-card grid min-h-[188px] place-items-center rounded-[10px] border border-white/15 p-6 text-center">
+            <div className="flex flex-col items-center gap-3 text-white/40">
+              <Images className="size-7" />
+              <span className="text-xs">生成记录会出现在这里</span>
+            </div>
           </div>
-        </div>
-      )}
-      {!loading && images.length === 0 && (
-        <EmptyState icon={<GalleryHorizontalEnd className="size-7" />} title="图库为空" text="生成成功后的图片会自动出现在这里。" />
-      )}
-      <ImageGrid images={images} showMeta />
+        )}
+        {records.map((record) => {
+          const displayRecord =
+            record.job.id === activeJob?.id
+              ? { ...record, job: activeJob, images: activeImages, elapsedSeconds: elapsedSeconds || record.elapsedSeconds }
+              : record;
+
+          return (
+            <GenerationRecordCard
+              key={record.job.id}
+              record={displayRecord}
+              onDelete={() => void deleteRecord(record)}
+              onRegenerate={() => void regenerateRecord(record)}
+              onEditPrompt={() => onEditPrompt(generationFormFromJob(record.job))}
+              onEditImage={(image, draft) => onEditImage(image, draft ?? generationFormFromJob(record.job))}
+              editOptions={{
+                initialForm: generationFormFromJob(record.job),
+                availableRatios,
+                qualityOptions,
+                formatOptions,
+                maxImagesPerRequest: config.maxImagesPerRequest,
+                submitting: regeneratingId === record.job.id,
+                onSubmit: createEditTaskFromImage,
+              }}
+            />
+          );
+        })}
+        {nextCursor && (
+          <button type="button" className="mx-auto mb-2 h-8 rounded-md border border-white/15 px-4 text-xs text-white/60" onClick={() => void loadRecords(nextCursor)}>
+            加载更多
+          </button>
+        )}
+      </div>
     </section>
   );
 }
 
-function SettingsView({ defaultModel, onSaved }: { defaultModel: string; onSaved: () => Promise<void> }) {
-  const [provider, setProvider] = useState<ProviderSettings | null>(null);
-  const [baseURL, setBaseURL] = useState("https://api.openai.com/v1");
+function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => Promise<void> }) {
+  const [baseURL, setBaseURL] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [model, setModel] = useState(defaultModel);
+  const [promptOptimizerModel, setPromptOptimizerModel] = useState(optionOrFallback(config.promptOptimizerModel, PROMPT_OPTIMIZER_MODEL_OPTIONS));
+  const [model, setModel] = useState(optionOrFallback(config.model, IMAGE_MODEL_OPTIONS));
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
+    let mounted = true;
     api<{ ok: true; provider: ProviderSettings | null }>("/api/settings/provider").then((result) => {
-      setProvider(result.provider);
+      if (!mounted) return;
       if (result.provider) {
-        setBaseURL(result.provider.baseURL);
-        setModel(result.provider.model);
+        setPromptOptimizerModel(optionOrFallback(result.provider.promptOptimizerModel, PROMPT_OPTIMIZER_MODEL_OPTIONS));
+        setModel(optionOrFallback(result.provider.model, IMAGE_MODEL_OPTIONS));
       }
     });
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   async function save(event: FormEvent) {
@@ -929,11 +1851,11 @@ function SettingsView({ defaultModel, onSaved }: { defaultModel: string; onSaved
     setError("");
     setMessage("");
     try {
-      const result = await api<{ ok: true; provider: ProviderSettings }>("/api/settings/provider", {
+      await api<{ ok: true; provider: ProviderSettings }>("/api/settings/provider", {
         method: "POST",
-        body: JSON.stringify({ baseURL, apiKey, model }),
+        body: JSON.stringify({ baseURL, apiKey, model, promptOptimizerModel }),
       });
-      setProvider(result.provider);
+      setBaseURL("");
       setApiKey("");
       setMessage("Provider 已保存，API Key 不会回显。");
       await onSaved();
@@ -948,157 +1870,114 @@ function SettingsView({ defaultModel, onSaved }: { defaultModel: string; onSaved
     setError("");
     setMessage("");
     try {
+      const testsUnsavedProvider = Boolean(apiKey.trim());
       const result = await api<{ ok: true; result: { ok: boolean; message: string; status: number } }>("/api/provider/test", {
         method: "POST",
-        body: JSON.stringify(apiKey ? { baseURL, apiKey, model } : {}),
+        body: JSON.stringify(testsUnsavedProvider ? { baseURL, apiKey, model, promptOptimizerModel } : {}),
       });
       setMessage(result.result.message);
+      if (!testsUnsavedProvider) {
+        await onSaved();
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "测试失败。");
     }
   }
 
   return (
-    <section className="mx-auto grid max-w-5xl gap-5 lg:grid-cols-[minmax(0,1fr)_320px]">
-      <Card>
-        <CardHeader>
-          <p className="text-xs font-semibold uppercase text-muted-foreground">Provider</p>
-          <CardTitle className="text-3xl">模型服务配置</CardTitle>
-          <CardDescription>保存用户自己的 baseURL、API Key 和模型名。API Key 加密存储，不会完整回显。</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form className="grid gap-5" onSubmit={save}>
-            <Field label="baseURL">
-              <Input value={baseURL} onChange={(event) => setBaseURL(event.target.value)} placeholder="https://api.openai.com/v1" />
-            </Field>
-            <Field label="API Key">
-              <Input
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
-                type="password"
-                placeholder={provider ? provider.apiKeyHint : "sk-..."}
-              />
-            </Field>
-            <Field label="模型">
-              <Input value={model} onChange={(event) => setModel(event.target.value)} placeholder={defaultModel} />
-            </Field>
+    <section className="entry-fade thin-scrollbar h-[calc(100dvh-64px)] flex-1 overflow-y-auto bg-[#191919]">
+      <form className="mx-auto flex w-[368px] max-w-[calc(100vw-32px)] flex-col pt-10" onSubmit={save}>
+        <div className="flex h-10 items-center gap-2 overflow-hidden rounded-[10px] border border-white/15 p-2">
+          <span className="grid size-6 shrink-0 place-items-center overflow-hidden rounded bg-white/10">
+            <img src={openaiIcon} alt="" className="size-4" />
+          </span>
+          <strong className="min-w-0 flex-1 truncate text-xs font-semibold leading-none text-white">推荐使用 Small Token</strong>
+          <button type="button" className="shrink-0 text-xs leading-[18px] text-[#6eff30]">
+            去购买
+          </button>
+        </div>
 
-            {provider && (
-              <div className="flex items-center gap-3 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
-                <CheckCircle2 className="size-4" />
-                <span>
-                  已保存 {provider.model}，Key：{provider.apiKeyHint}
-                </span>
-              </div>
-            )}
-            {message && <Notice tone="success" text={message} />}
-            {error && <Notice tone="error" text={error} />}
+        <div className="mt-10 flex flex-col gap-2">
+          <SettingsTextField
+            id="provider-base-url"
+            label="BaseURL"
+            value={baseURL}
+            onChange={(event) => setBaseURL(event.target.value)}
+            placeholder="请输入 baseURL"
+          />
+          <SettingsTextField
+            id="provider-api-key"
+            label="API Key"
+            value={apiKey}
+            onChange={(event) => setApiKey(event.target.value)}
+            type="password"
+            autoComplete="new-password"
+            placeholder="请输入 API Key"
+          />
+          <SettingsSelectField
+            label="提示词优化模型"
+            value={promptOptimizerModel}
+            values={PROMPT_OPTIMIZER_MODEL_OPTIONS}
+            onChange={(value) => setPromptOptimizerModel(optionOrFallback(value, PROMPT_OPTIMIZER_MODEL_OPTIONS))}
+          />
+          <SettingsSelectField
+            label="生图模型"
+            value={model}
+            values={IMAGE_MODEL_OPTIONS}
+            onChange={(value) => setModel(optionOrFallback(value, IMAGE_MODEL_OPTIONS))}
+          />
+        </div>
 
-            <div className="flex flex-wrap gap-3">
-              <Button disabled={saving}>
-                {saving ? <Loader2 className="animate-spin" /> : <CheckCircle2 />}
-                保存
-              </Button>
-              <Button type="button" variant="outline" onClick={test}>
-                测试连接
-              </Button>
-            </div>
-          </form>
-        </CardContent>
-      </Card>
+        <div className="mt-4 flex gap-2">
+          <Button
+            className="h-10 flex-1 rounded-[10px] border border-[#6eff30] bg-transparent px-2.5 py-0 text-xs font-semibold leading-none text-[#6eff30] shadow-none hover:bg-[#6eff30]/10 hover:text-[#6eff30]"
+            disabled={saving}
+          >
+            {saving ? "保存中" : "保存"}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            className="h-10 flex-1 rounded-[10px] border border-white/90 bg-transparent px-2.5 py-0 text-xs font-semibold leading-none text-white/90 shadow-none hover:bg-white/10 hover:text-white"
+            onClick={test}
+          >
+            测试
+          </Button>
+        </div>
 
-      <div className="grid content-start gap-4">
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-lg">
-              <ShieldCheck className="size-5 text-emerald-700" />
-              安全边界
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="grid gap-3 text-sm text-muted-foreground">
-            <p>API Key 使用 Worker Secret 派生密钥加密后写入 D1。</p>
-            <Separator />
-            <p>baseURL 只允许 HTTPS，并拦截 localhost、内网地址和重定向。</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg">默认配额</CardTitle>
-          </CardHeader>
-          <CardContent className="grid gap-2 text-sm">
-            <div className="flex justify-between gap-3">
-              <span className="text-muted-foreground">每日任务</span>
-              <strong>50</strong>
-            </div>
-            <div className="flex justify-between gap-3">
-              <span className="text-muted-foreground">单次图片</span>
-              <strong>4</strong>
-            </div>
-            <div className="flex justify-between gap-3">
-              <span className="text-muted-foreground">并发任务</span>
-              <strong>2</strong>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+        <p className="mt-2 text-xs leading-[18px] text-white/40">所有数据均加密保存</p>
+        {message && <p className="mt-2 text-xs leading-[18px] text-[#6eff30]">{message}</p>}
+        {error && <p className="mt-2 text-xs leading-[18px] text-destructive">{error}</p>}
+      </form>
     </section>
   );
 }
 
-function ImageGrid({ images, showMeta = false }: { images: ImageItem[]; showMeta?: boolean }) {
+function SettingsTextField({
+  id,
+  label,
+  className,
+  ...props
+}: InputProps & {
+  id: string;
+  label: string;
+}) {
   return (
-    <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-4">
-      {images.map((image) => (
-        <article key={image.id} className="group overflow-hidden rounded-lg border bg-card shadow-panel">
-          <div className="relative bg-muted">
-            <img src={image.url} alt={image.prompt ?? "生成图片"} loading="lazy" className="aspect-square w-full object-cover" />
-            <Button asChild size="icon" variant="secondary" className="absolute right-3 top-3 opacity-0 shadow-panel transition-opacity group-hover:opacity-100">
-              <a href={image.url} download aria-label="下载图片">
-                <Download className="size-4" />
-              </a>
-            </Button>
-          </div>
-          <div className="flex items-center justify-between gap-3 border-t px-3 py-2 text-xs text-muted-foreground">
-            <span>
-              {image.width}x{image.height} · {image.format}
-            </span>
-            <a className="font-medium text-foreground hover:underline" href={image.url} download>
-              下载
-            </a>
-          </div>
-          {showMeta && (
-            <div className="grid gap-1 border-t px-3 py-3">
-              <strong className="truncate text-sm font-medium">{image.prompt || "未记录提示词"}</strong>
-              <span className="text-xs text-muted-foreground">
-                {image.quality ?? "auto"} · {image.aspectRatio ?? "custom"} · {formatBytes(image.byteSize)}
-              </span>
-            </div>
-          )}
-        </article>
-      ))}
-    </div>
+    <label className="flex flex-col gap-2" htmlFor={id}>
+      <span className="text-xs leading-none text-white/60">{label}</span>
+      <Input
+        id={id}
+        className={cn(
+          "h-10 rounded-[10px] border-white/15 bg-transparent px-2 py-2.5 text-xs font-semibold leading-none text-white shadow-none placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0",
+          className,
+        )}
+        {...props}
+      />
+    </label>
   );
 }
 
-function MainTabTrigger({ value, label, icon: Icon }: { value: View; label: string; icon: typeof Wand2 }) {
-  return (
-    <TabsTrigger value={value} className="gap-2">
-      <Icon className="size-4" />
-      {label}
-    </TabsTrigger>
-  );
-}
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div className="grid gap-2">
-      <Label>{label}</Label>
-      {children}
-    </div>
-  );
-}
-
-function SelectField({
+function SettingsSelectField({
   label,
   value,
   values,
@@ -1106,32 +1985,49 @@ function SelectField({
 }: {
   label: string;
   value: string;
-  values: string[];
+  values: readonly string[];
   onChange: (value: string) => void;
 }) {
   return (
-    <Field label={label}>
+    <label className="flex flex-col gap-2">
+      <span className="text-xs leading-none text-white/60">{label}</span>
       <Select value={value} onValueChange={onChange}>
-        <SelectTrigger>
+        <SelectTrigger className="h-10 rounded-[10px] border-white/15 bg-transparent px-2 py-2.5 text-xs font-semibold leading-none text-white shadow-none focus:ring-0 focus:ring-offset-0 [&>svg]:size-3 [&>svg]:opacity-100">
           <SelectValue />
         </SelectTrigger>
-        <SelectContent>
-          {values.map((item) => (
-            <SelectItem key={item} value={item}>
-              {item}
-            </SelectItem>
-          ))}
+        <SelectContent className="border-white/15 bg-[#191919] text-white">
+          <SelectGroup>
+            {values.map((item) => (
+              <SelectItem key={item} value={item}>
+                {item}
+              </SelectItem>
+            ))}
+          </SelectGroup>
         </SelectContent>
       </Select>
-    </Field>
+    </label>
   );
+}
+
+function Field({ label, children }: { label: ReactNode; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-2">
+      <Label>{label}</Label>
+      {children}
+    </div>
+  );
+}
+
+function optionOrFallback<T extends readonly string[]>(value: string | undefined, options: T): T[number] {
+  const normalized = value ?? "";
+  return options.some((option) => option === normalized) ? (normalized as T[number]) : options[0];
 }
 
 function EmptyState({ icon, title, text }: { icon: ReactNode; title: string; text: string }) {
   return (
-    <div className="grid min-h-96 place-items-center rounded-lg border border-dashed bg-background/70 p-6 text-center">
-      <div className="grid max-w-sm gap-3 justify-items-center">
-        <div className="grid size-14 place-items-center rounded-lg bg-muted text-muted-foreground">{icon}</div>
+    <div className="empty-state grid min-h-[520px] place-items-center rounded-lg border bg-card/70 p-6 text-center">
+      <div className="grid max-w-sm justify-items-center gap-3">
+        <div className="grid size-16 place-items-center rounded-full border bg-background text-muted-foreground shadow-panel">{icon}</div>
         <strong className="text-lg font-semibold">{title}</strong>
         <span className="text-sm leading-6 text-muted-foreground">{text}</span>
       </div>
@@ -1139,15 +2035,389 @@ function EmptyState({ icon, title, text }: { icon: ReactNode; title: string; tex
   );
 }
 
+function LoadingPanel({ text }: { text: string }) {
+  return (
+    <div className="grid min-h-80 place-items-center rounded-lg border bg-card text-muted-foreground shadow-panel">
+      <div className="flex items-center gap-3">
+        <Loader2 className="animate-spin" />
+        <span className="text-sm font-medium">{text}</span>
+      </div>
+    </div>
+  );
+}
+
 function Notice({ tone, text }: { tone: "error" | "success" | "warn"; text: string }) {
   const variant = tone === "error" ? "destructive" : tone === "success" ? "success" : "warning";
-  const Icon = tone === "error" ? AlertCircle : CheckCircle2;
+  const Icon = tone === "success" ? CheckCircle2 : AlertCircle;
   return (
     <Alert variant={variant} className="flex items-start gap-3">
-      <Icon className="mt-0.5 size-4 shrink-0" />
+      <Icon className="mt-0.5 shrink-0" />
       <AlertDescription>{text}</AlertDescription>
     </Alert>
   );
+}
+
+function sizeForRatioResolution(ratio: string, resolution: string): [number, number] {
+  if (resolution === "1K" && baseRatioSizes[ratio]) {
+    return baseRatioSizes[ratio];
+  }
+
+  const [rawWidth, rawHeight] = ratio.split(":").map((item) => Number(item));
+  const ratioWidth = Number.isFinite(rawWidth) && rawWidth > 0 ? rawWidth : 1;
+  const ratioHeight = Number.isFinite(rawHeight) && rawHeight > 0 ? rawHeight : 1;
+  const longEdge = Math.min(resolutionLongEdge[resolution] ?? resolutionLongEdge["1K"], maxLongEdgeForRatio(ratioWidth, ratioHeight));
+  if (ratioWidth >= ratioHeight) {
+    return [longEdge, roundToStep((longEdge * ratioHeight) / ratioWidth, 16)];
+  }
+  return [roundToStep((longEdge * ratioWidth) / ratioHeight, 16), longEdge];
+}
+
+function updateGenerateFormValue<K extends keyof GenerateForm>(current: GenerateForm, key: K, value: GenerateForm[K]): GenerateForm {
+  const next = { ...current, [key]: value };
+  if (key === "aspectRatio" || key === "resolution") {
+    const [width, height] = sizeForRatioResolution(next.aspectRatio, next.resolution);
+    next.width = width;
+    next.height = height;
+  }
+  return next;
+}
+
+function generationFormFromJob(job: GenerationJob): GenerateForm {
+  const aspectRatio = FIGMA_RATIOS.some((ratio) => ratio === job.aspect_ratio) ? job.aspect_ratio : defaultForm.aspectRatio;
+  const resolution = formatResolution(job.width, job.height);
+  const [width, height] = sizeForRatioResolution(aspectRatio, resolution);
+  return {
+    ...defaultForm,
+    prompt: job.prompt,
+    aspectRatio,
+    resolution,
+    width,
+    height,
+    quality: QUALITY_OPTIONS.some((quality) => quality === job.quality) ? job.quality : defaultForm.quality,
+    quantity: 1,
+    outputFormat: FORMAT_OPTIONS.some((format) => format === job.output_format) ? job.output_format : defaultForm.outputFormat,
+    compression: job.compression ?? defaultForm.compression,
+  };
+}
+
+function maxLongEdgeForRatio(ratioWidth: number, ratioHeight: number): number {
+  const longRatio = Math.max(ratioWidth, ratioHeight);
+  const shortRatio = Math.min(ratioWidth, ratioHeight);
+  const maxByPixels = Math.sqrt((MAX_IMAGE_PIXELS * longRatio) / shortRatio);
+  return Math.max(16, Math.floor(Math.min(MAX_IMAGE_EDGE, maxByPixels) / 16) * 16);
+}
+
+function roundToStep(value: number, step: number): number {
+  return Math.max(step, Math.round(value / step) * step);
+}
+
+function generationRequestBody(
+  form: GenerateForm,
+  turnstileToken: string,
+  referenceImage: ReferenceImagePreview | null,
+  maskImage?: ImageSelectionMask | null,
+): BodyInit {
+  if (!referenceImage) {
+    return JSON.stringify({ ...form, turnstileToken });
+  }
+
+  const body = new FormData();
+  for (const [key, value] of Object.entries(form)) {
+    body.set(key, String(value));
+  }
+  if (turnstileToken) body.set("turnstileToken", turnstileToken);
+  body.set("referenceImage", referenceImage.file, referenceImage.name);
+  if (maskImage) body.set("maskImage", maskImage.file, maskImage.name);
+  return body;
+}
+
+function promptOptimizationPayload(form: GenerateForm) {
+  return {
+    prompt: form.prompt,
+    aspectRatio: form.aspectRatio,
+    width: form.width,
+    height: form.height,
+    quality: form.quality,
+    outputFormat: form.outputFormat,
+  };
+}
+
+function imageFileFromClipboard(data: DataTransfer): File | null {
+  for (const file of Array.from(data.files)) {
+    if (file.type.startsWith("image/")) return file;
+  }
+
+  for (const item of Array.from(data.items)) {
+    if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+    const file = item.getAsFile();
+    if (file) return file;
+  }
+
+  return null;
+}
+
+function normalizeImageMime(value: string): string {
+  const mimeType = value.trim().toLowerCase();
+  return mimeType === "image/jpg" ? "image/jpeg" : mimeType;
+}
+
+async function imageItemToFile(image: ImageItem): Promise<File> {
+  const response = await fetch(image.url, { credentials: "include" });
+  if (!response.ok) {
+    throw new Error("图片文件加载失败，无法进入编辑。");
+  }
+  const blob = await response.blob();
+  const mimeType = normalizeImageMime(blob.type || `image/${image.format || "png"}`);
+  return new File([blob], imageDownloadName(image), { type: mimeType });
+}
+
+function imageDownloadName(image: ImageItem): string {
+  return `${image.id}.${image.format || "png"}`;
+}
+
+function currentViewportSize(): { width: number; height: number } {
+  if (typeof window === "undefined") {
+    return { width: 1024, height: 768 };
+  }
+  return { width: window.innerWidth, height: window.innerHeight };
+}
+
+function imageContainRect(containerWidth: number, containerHeight: number, imageWidth: number, imageHeight: number) {
+  const ratio = imageWidth > 0 && imageHeight > 0 ? imageWidth / imageHeight : 1;
+  const containerRatio = containerWidth / containerHeight;
+  const width = containerRatio > ratio ? containerHeight * ratio : containerWidth;
+  const height = containerRatio > ratio ? containerHeight : containerWidth / ratio;
+  return {
+    x: (containerWidth - width) / 2,
+    y: (containerHeight - height) / 2,
+    width,
+    height,
+  };
+}
+
+function imageSelectionPointFromEvent(
+  event: ReactPointerEvent<HTMLCanvasElement>,
+  stage: HTMLDivElement | null,
+  image: ImageItem,
+): ImageSelectionPoint | null {
+  if (!stage) return null;
+  const bounds = stage.getBoundingClientRect();
+  const imageRect = imageContainRect(bounds.width, bounds.height, image.width, image.height);
+  const x = event.clientX - bounds.left - imageRect.x;
+  const y = event.clientY - bounds.top - imageRect.y;
+  if (x < 0 || y < 0 || x > imageRect.width || y > imageRect.height) return null;
+  return {
+    x: clampNumber(x / imageRect.width, 0, 1),
+    y: clampNumber(y / imageRect.height, 0, 1),
+  };
+}
+
+function drawImageSelectionCanvas(
+  canvas: HTMLCanvasElement | null,
+  stage: HTMLDivElement | null,
+  image: ImageItem,
+  strokes: ImageSelectionStroke[],
+): void {
+  if (!canvas || !stage) return;
+  const bounds = stage.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(bounds.width));
+  const height = Math.max(1, Math.round(bounds.height));
+  if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+  }
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  context.clearRect(0, 0, width, height);
+
+  const imageRect = imageContainRect(width, height, image.width, image.height);
+  context.save();
+  context.beginPath();
+  context.rect(imageRect.x, imageRect.y, imageRect.width, imageRect.height);
+  context.clip();
+  context.strokeStyle = "rgba(110, 255, 48, 0.78)";
+  context.fillStyle = "rgba(110, 255, 48, 0.78)";
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  for (const stroke of strokes) {
+    drawSelectionStroke(context, stroke, imageRect);
+  }
+  context.restore();
+}
+
+function drawSelectionStroke(
+  context: CanvasRenderingContext2D,
+  stroke: ImageSelectionStroke,
+  imageRect: { x: number; y: number; width: number; height: number },
+): void {
+  const points = stroke.points;
+  if (points.length === 0) return;
+  const lineWidth = Math.max(8, stroke.brushRatio * Math.min(imageRect.width, imageRect.height));
+  context.lineWidth = lineWidth;
+  const first = points[0];
+  if (points.length === 1) {
+    context.beginPath();
+    context.arc(imageRect.x + first.x * imageRect.width, imageRect.y + first.y * imageRect.height, lineWidth / 2, 0, Math.PI * 2);
+    context.fill();
+    return;
+  }
+  context.beginPath();
+  context.moveTo(imageRect.x + first.x * imageRect.width, imageRect.y + first.y * imageRect.height);
+  for (const point of points.slice(1)) {
+    context.lineTo(imageRect.x + point.x * imageRect.width, imageRect.y + point.y * imageRect.height);
+  }
+  context.stroke();
+}
+
+async function createSelectionMask(image: ImageItem, strokes: ImageSelectionStroke[]): Promise<ImageSelectionMask> {
+  if (!image.width || !image.height) {
+    throw new Error("图片尺寸无效，无法生成选区遮罩。");
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = image.width;
+  canvas.height = image.height;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("浏览器不支持选区遮罩生成。");
+  }
+
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.globalCompositeOperation = "destination-out";
+  context.strokeStyle = "#000";
+  context.fillStyle = "#000";
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  for (const stroke of strokes) {
+    drawSelectionStroke(context, stroke, { x: 0, y: 0, width: canvas.width, height: canvas.height });
+  }
+
+  const blob = await canvasToBlob(canvas, "image/png");
+  const name = `${image.id}-mask.png`;
+  return {
+    file: new File([blob], name, { type: "image/png" }),
+    name,
+  };
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, type: string): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("选区遮罩生成失败。"));
+    }, type);
+  });
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function imagePreviewSize(
+  imageWidth: number,
+  imageHeight: number,
+  viewportWidth: number,
+  viewportHeight: number,
+  editing: boolean,
+): { panelWidth: number; panelHeight: number; editorWidth: number } {
+  const ratio = imageWidth > 0 && imageHeight > 0 ? imageWidth / imageHeight : 1;
+  const maxEditorWidth = Math.max(0, viewportWidth - IMAGE_PREVIEW_VIEWPORT_GAP * 2 - IMAGE_PREVIEW_IMAGE_INSET * 2 - IMAGE_PREVIEW_MIN_STAGE_SIZE);
+  const editorWidth = editing ? Math.min(IMAGE_PREVIEW_EDITOR_WIDTH, maxEditorWidth) : 0;
+  const maxStageWidth = Math.max(
+    IMAGE_PREVIEW_MIN_STAGE_SIZE,
+    viewportWidth - IMAGE_PREVIEW_VIEWPORT_GAP * 2 - IMAGE_PREVIEW_IMAGE_INSET * 2 - editorWidth,
+  );
+  const maxStageHeight = Math.max(IMAGE_PREVIEW_MIN_STAGE_SIZE, viewportHeight - IMAGE_PREVIEW_VIEWPORT_GAP * 2 - IMAGE_PREVIEW_IMAGE_INSET * 2);
+  const widthLimited = maxStageWidth / maxStageHeight <= ratio;
+  const stageWidth = widthLimited ? maxStageWidth : maxStageHeight * ratio;
+  const stageHeight = widthLimited ? maxStageWidth / ratio : maxStageHeight;
+
+  return {
+    panelWidth: Math.round(editorWidth + stageWidth + IMAGE_PREVIEW_IMAGE_INSET * 2),
+    panelHeight: Math.round(stageHeight + IMAGE_PREVIEW_IMAGE_INSET * 2),
+    editorWidth: Math.round(editorWidth),
+  };
+}
+
+function thumbnailSize(width: number, height: number): { width: number; height: number } {
+  if (!width || !height) return { width: 128, height: 128 };
+  if (width >= height) return { width: 128, height: Math.max(16, Math.round((128 * height) / width)) };
+  return { width: Math.max(16, Math.round((128 * width) / height)), height: 128 };
+}
+
+function formatResolution(width: number, height: number): string {
+  const longEdge = Math.max(width, height);
+  for (const resolution of RESOLUTIONS) {
+    for (const ratio of FIGMA_RATIOS) {
+      const [presetWidth, presetHeight] = sizeForRatioResolution(ratio, resolution);
+      if (width === presetWidth && height === presetHeight) return resolution;
+    }
+  }
+  if (longEdge >= 3584) return "4K";
+  if (longEdge >= 2048) return "2K";
+  return "1K";
+}
+
+function estimateJobElapsed(job: GenerationJob): number | null {
+  const start = parseUtcTimestamp(job.started_at ?? job.created_at);
+  const end = job.completed_at ? parseUtcTimestamp(job.completed_at) : Date.now();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
+  return Math.round((end - start) / 1000);
+}
+
+function formatRecordElapsed(seconds: number | null): string {
+  if (seconds === null) return "耗时：--";
+  return `耗时：${seconds.toFixed(1)}s`;
+}
+
+function statusLabel(status: GenerationJob["status"]): string {
+  return {
+    queued: "任务排队中",
+    running: "正在生成",
+    succeeded: "生成完成",
+    partial_succeeded: "部分完成",
+    failed: "生成失败",
+    cancelled: "已取消",
+  }[status];
+}
+
+function generationJobErrorMessage(job: Pick<GenerationJob, "error_code" | "error_message">, fallback: string): string {
+  const message = job.error_message?.trim();
+  const cloudflareTimeoutMatch = message?.match(/\berror code:\s*(522|524)\b/i);
+  if (cloudflareTimeoutMatch) {
+    return `模型服务返回 ${cloudflareTimeoutMatch[1]}，上游网关等待模型服务超时。请检查 baseURL 前面的 Cloudflare、反向代理、负载均衡或模型服务超时设置。`;
+  }
+  if (message) return message;
+  if (job.error_code === "provider_timeout") {
+    return "模型服务等待超时，请稍后重试，或检查 baseURL 的网关与模型服务超时设置。";
+  }
+  return fallback;
+}
+
+function isTerminalJobStatus(status: GenerationJob["status"]): boolean {
+  return status === "succeeded" || status === "partial_succeeded" || status === "failed" || status === "cancelled";
+}
+
+async function copyPrompt(prompt: string): Promise<void> {
+  if (!navigator.clipboard) return;
+  await navigator.clipboard.writeText(prompt);
+}
+
+function downloadAllImages(record: GenerationRecord): void {
+  record.images.forEach((image, index) => {
+    const anchor = document.createElement("a");
+    anchor.href = image.url;
+    anchor.download = `${record.job.id}-${index + 1}.${image.format}`;
+    anchor.rel = "noreferrer";
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+  });
 }
 
 function statusText(status: GenerationJob["status"]): string {
@@ -1155,35 +2425,15 @@ function statusText(status: GenerationJob["status"]): string {
     queued: "任务排队中",
     running: "正在生成",
     succeeded: "生成完成",
+    partial_succeeded: "部分完成",
     failed: "生成失败",
     cancelled: "已取消",
   }[status];
 }
 
-function statusBadgeClass(status?: GenerationJob["status"]): string {
-  return {
-    queued: "border-cyan-300 bg-cyan-50 text-cyan-800",
-    running: "border-blue-300 bg-blue-50 text-blue-800",
-    succeeded: "border-emerald-300 bg-emerald-50 text-emerald-800",
-    failed: "border-red-300 bg-red-50 text-red-800",
-    cancelled: "border-muted bg-muted text-muted-foreground",
-    idle: "border-border bg-background text-muted-foreground",
-  }[status ?? "idle"];
-}
-
-function formatElapsed(seconds: number): string {
-  if (seconds < 60) return `${seconds} 秒`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  return remainingSeconds ? `${minutes} 分 ${remainingSeconds} 秒` : `${minutes} 分钟`;
-}
-
-function splitTags(value: string): string[] {
-  return value
-    .split(/[,\n，]/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .slice(0, 12);
+function parseUtcTimestamp(value: string): number {
+  if (/[zZ]|[+-]\d{2}:\d{2}$/.test(value)) return Date.parse(value);
+  return Date.parse(`${value.replace(" ", "T")}Z`);
 }
 
 declare global {
@@ -1195,7 +2445,7 @@ declare global {
           sitekey: string;
           callback: (token: string) => void;
           "expired-callback": () => void;
-          theme: "light";
+          theme: "light" | "dark";
         },
       ) => string;
       remove?: (widgetId: string) => void;
@@ -1217,7 +2467,7 @@ function Turnstile({ siteKey, onToken }: { siteKey: string; onToken: (token: str
         sitekey: siteKey,
         callback: onToken,
         "expired-callback": () => onToken(""),
-        theme: "light",
+        theme: "dark",
       });
     }
 

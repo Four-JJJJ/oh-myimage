@@ -53,8 +53,8 @@ export default {
         sm: "calc(var(--radius) - 4px)",
       },
       boxShadow: {
-        canvas: "0 28px 80px rgb(15 23 42 / 0.12)",
-        panel: "0 1px 0 rgb(15 23 42 / 0.05)",
+        float: "0 28px 80px rgb(0 0 0 / 0.36), 0 1px 0 rgb(255 255 255 / 0.05) inset",
+        panel: "0 1px 0 rgb(255 255 255 / 0.04) inset, 0 12px 34px rgb(0 0 0 / 0.22)",
       },
     },
   },

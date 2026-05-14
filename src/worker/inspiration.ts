@@ -1,6 +1,6 @@
 import { sha256Hex } from "./crypto";
 import { envNumber, randomId, redactSecrets } from "./http";
-import { Env, InspirationItemRecord, InspirationQueueMessage, InspirationSourceRecord } from "./types";
+import { AppDatabase, Env, InspirationItemRecord, InspirationQueueMessage, InspirationSourceRecord } from "./types";
 
 const DEFAULT_MAX_ITEMS_PER_RUN = 12;
 const DEFAULT_THUMBNAIL_MAX_BYTES = 1_048_576;
@@ -80,7 +80,7 @@ export function normalizeInspirationUrl(rawUrl: string): NormalizedInspirationUr
   return { normalizedUrl: url.toString(), sourceKey: "generic" };
 }
 
-export async function listInspirations(db: D1Database, spaceId: string, filters: InspirationFilters): Promise<InspirationListResult> {
+export async function listInspirations(db: AppDatabase, spaceId: string, filters: InspirationFilters): Promise<InspirationListResult> {
   const conditions = ["items.status = 'published'"];
   const values: unknown[] = [spaceId];
 
@@ -134,7 +134,7 @@ export async function listInspirations(db: D1Database, spaceId: string, filters:
   };
 }
 
-export async function getInspirationItem(db: D1Database, itemId: string): Promise<InspirationItemRecord | null> {
+export async function getInspirationItem(db: AppDatabase, itemId: string): Promise<InspirationItemRecord | null> {
   return db
     .prepare(
       `SELECT items.*, sources.source_key, sources.name AS source_name
@@ -147,7 +147,7 @@ export async function getInspirationItem(db: D1Database, itemId: string): Promis
 }
 
 export async function toggleInspirationFavorite(
-  db: D1Database,
+  db: AppDatabase,
   spaceId: string,
   itemId: string,
   favorite?: boolean,
@@ -172,7 +172,7 @@ export async function toggleInspirationFavorite(
   return next;
 }
 
-export async function recordInspirationUse(db: D1Database, itemId: string): Promise<void> {
+export async function recordInspirationUse(db: AppDatabase, itemId: string): Promise<void> {
   await db.prepare("UPDATE inspiration_items SET use_count = use_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(itemId).run();
 }
 
@@ -204,7 +204,7 @@ export async function importInspirationUrl(env: Env, input: ManualImportInput): 
   }
 }
 
-export async function listEnabledInspirationSources(db: D1Database): Promise<InspirationSourceRecord[]> {
+export async function listEnabledInspirationSources(db: AppDatabase): Promise<InspirationSourceRecord[]> {
   const result = await db
     .prepare("SELECT * FROM inspiration_sources WHERE enabled = 1 ORDER BY source_key ASC")
     .all<InspirationSourceRecord>();
@@ -520,7 +520,7 @@ async function headContentLength(url: string): Promise<string | null> {
   }
 }
 
-async function getOrCreateSource(db: D1Database, sourceKey: NormalizedInspirationUrl["sourceKey"]): Promise<InspirationSourceRecord> {
+async function getOrCreateSource(db: AppDatabase, sourceKey: NormalizedInspirationUrl["sourceKey"]): Promise<InspirationSourceRecord> {
   const existing = await db.prepare("SELECT * FROM inspiration_sources WHERE source_key = ?").bind(sourceKey).first<InspirationSourceRecord>();
   if (existing) return existing;
 
@@ -536,7 +536,7 @@ async function getOrCreateSource(db: D1Database, sourceKey: NormalizedInspiratio
   return created;
 }
 
-async function startImportRun(db: D1Database, source: InspirationSourceRecord, trigger: "scheduled" | "manual"): Promise<string> {
+async function startImportRun(db: AppDatabase, source: InspirationSourceRecord, trigger: "scheduled" | "manual"): Promise<string> {
   const id = randomId("run");
   await db
     .prepare("INSERT INTO inspiration_import_runs (id, source_id, source_key, trigger_type, status) VALUES (?, ?, ?, ?, 'running')")
@@ -546,7 +546,7 @@ async function startImportRun(db: D1Database, source: InspirationSourceRecord, t
 }
 
 async function finishImportRun(
-  db: D1Database,
+  db: AppDatabase,
   runId: string,
   status: "succeeded" | "failed",
   itemsSeen: number,

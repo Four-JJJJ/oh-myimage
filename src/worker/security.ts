@@ -60,6 +60,14 @@ export function buildProviderEndpoint(baseURL: string, endpoint: string): string
   return base.toString();
 }
 
+export function isTokenFourjBaseURL(baseURL: string): boolean {
+  try {
+    return new URL(baseURL).hostname.toLowerCase() === "token.fourj.space";
+  } catch {
+    return false;
+  }
+}
+
 function isIpLiteral(hostname: string): boolean {
   if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname)) return true;
   if (hostname.includes(":")) return true;

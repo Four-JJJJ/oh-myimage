@@ -7,3 +7,5 @@ dist/
 !.env.example
 *.log
 coverage/
+.playwright-cli/
+output/

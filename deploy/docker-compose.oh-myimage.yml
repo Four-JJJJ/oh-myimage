@@ -1,0 +1,70 @@
+services:
+  oh-myimage-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: oh-myimage:latest
+    container_name: oh-myimage-api
+    restart: unless-stopped
+    env_file:
+      - /etc/oh-myimage/oh-myimage.env
+    command: ["npm", "run", "start:node"]
+    ports:
+      - "127.0.0.1:8788:8788"
+    depends_on:
+      oh-myimage-postgres:
+        condition: service_healthy
+      oh-myimage-redis:
+        condition: service_healthy
+
+  oh-myimage-worker:
+    image: oh-myimage:latest
+    container_name: oh-myimage-worker
+    restart: unless-stopped
+    env_file:
+      - /etc/oh-myimage/oh-myimage.env
+    command: ["npm", "run", "worker:node"]
+    depends_on:
+      oh-myimage-api:
+        condition: service_started
+      oh-myimage-postgres:
+        condition: service_healthy
+      oh-myimage-redis:
+        condition: service_healthy
+
+  oh-myimage-postgres:
+    image: postgres:16
+    container_name: oh-myimage-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: oh_myimage
+      POSTGRES_USER: oh_myimage
+      POSTGRES_PASSWORD: ${OH_MYIMAGE_POSTGRES_PASSWORD:?set OH_MYIMAGE_POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - oh-myimage-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oh_myimage -d oh_myimage"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  oh-myimage-redis:
+    image: redis:7
+    container_name: oh-myimage-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - oh-myimage-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  oh-myimage-postgres-data:
+  oh-myimage-redis-data:

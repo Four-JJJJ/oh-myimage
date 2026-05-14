@@ -39,6 +39,12 @@ export function todayStartIso(): string {
   return date.toISOString();
 }
 
+export function todayStartTimestamp(): string {
+  const date = new Date();
+  date.setUTCHours(0, 0, 0, 0);
+  return date.toISOString().slice(0, 19).replace("T", " ");
+}
+
 export function randomId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
 }
