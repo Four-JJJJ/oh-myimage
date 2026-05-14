@@ -43,6 +43,7 @@ type View = "generate" | "gallery" | "settings";
 interface MeState {
   space: { id: string; name: string };
   providerConfigured: boolean;
+  usesTokenFourjProvider?: boolean;
   dailyLimitExempt?: boolean;
   dailyRemaining?: number;
   dailyLimit?: number;
@@ -121,12 +122,19 @@ const formatLabels: Record<string, string> = {
   webp: "WEBP",
 };
 
-const GENERATION_POLL_INTERVAL_MS = 6000;
+const GENERATION_POLL_INTERVAL_MS = 2000;
 const IMAGE_PREVIEW_VIEWPORT_GAP = 24;
 const IMAGE_PREVIEW_IMAGE_INSET = 61;
 const IMAGE_PREVIEW_EDITOR_WIDTH = 400;
 const IMAGE_PREVIEW_MIN_STAGE_SIZE = 120;
 const IMAGE_SELECTION_BRUSH_RATIO = 0.08;
+const DOT_MATRIX_COLUMNS = 13;
+const DOT_MATRIX_ROWS = 9;
+const DOT_MATRIX_DOTS = Array.from({ length: DOT_MATRIX_COLUMNS * DOT_MATRIX_ROWS }, (_, index) => ({
+  index,
+  column: index % DOT_MATRIX_COLUMNS,
+  row: Math.floor(index / DOT_MATRIX_COLUMNS),
+}));
 
 const defaultForm: GenerateForm = {
   prompt: "",
@@ -170,13 +178,15 @@ export function App() {
   const [booting, setBooting] = useState(true);
 
   const effectiveConfig = config ?? fallbackConfig;
-  const dailyRemainingLabel = me?.dailyLimitExempt ? "不限" : (me?.dailyRemaining ?? effectiveConfig.maxDailyImagesPerSpace);
+  const dailyRemainingLabel = me?.dailyRemaining ?? effectiveConfig.maxDailyImagesPerSpace;
+  const hideSmallTokenPromos = Boolean(me?.usesTokenFourjProvider);
 
   const refreshMe = useCallback(async () => {
     const result = await api<{
       ok: true;
       space: MeState["space"];
       providerConfigured: boolean;
+      usesTokenFourjProvider?: boolean;
       dailyLimitExempt?: boolean;
       dailyRemaining?: number;
       dailyLimit?: number;
@@ -184,6 +194,7 @@ export function App() {
     setMe({
       space: result.space,
       providerConfigured: result.providerConfigured,
+      usesTokenFourjProvider: result.usesTokenFourjProvider,
       dailyLimitExempt: result.dailyLimitExempt,
       dailyRemaining: result.dailyRemaining,
       dailyLimit: result.dailyLimit,
@@ -216,6 +227,7 @@ export function App() {
         ok: true;
         space: MeState["space"];
         providerConfigured: boolean;
+        usesTokenFourjProvider?: boolean;
         dailyLimitExempt?: boolean;
         dailyRemaining?: number;
         dailyLimit?: number;
@@ -228,6 +240,7 @@ export function App() {
           ? {
               space: user.space,
               providerConfigured: user.providerConfigured,
+              usesTokenFourjProvider: user.usesTokenFourjProvider,
               dailyLimitExempt: user.dailyLimitExempt,
               dailyRemaining: user.dailyRemaining,
               dailyLimit: user.dailyLimit,
@@ -317,15 +330,31 @@ export function App() {
                 <span className="shrink-0 text-base leading-6 text-white/60">Studio</span>
               </div>
               <div className="flex shrink-0 items-center gap-3 text-xs">
-                <div className="hidden items-center gap-2 rounded-md border border-white/10 px-2 py-1 text-white/60 md:flex">
-                  <span>使用 Small Token 解除张数限制</span>
-                  <button type="button" className="font-medium text-[#6eff30]">
-                    去购买
-                  </button>
-                </div>
-                <div className="flex items-center gap-2 rounded-md bg-[#373737] px-2 py-1">
-                  <span className="text-white/60">剩余张数</span>
-                  <span className="font-semibold text-[#6eff30]">{dailyRemainingLabel}</span>
+                {!hideSmallTokenPromos && (
+                  <div className="hidden items-center gap-2 rounded-md border border-white/10 px-2 py-1 text-white/60 md:flex">
+                    <span>使用 Small Token 解除张数限制</span>
+                    <button type="button" className="font-medium text-[#6eff30]">
+                      去购买
+                    </button>
+                  </div>
+                )}
+                <div
+                  className={cn(
+                    "flex items-center gap-2 rounded-md px-2 py-1",
+                    me.dailyLimitExempt ? "border border-white/10 text-white/60" : "bg-[#373737]",
+                  )}
+                >
+                  {me.dailyLimitExempt ? (
+                    <>
+                      <CheckCircle2 className="size-3" aria-hidden="true" />
+                      <span className="text-white/60">已解锁数量限制</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="text-white/60">剩余张数</span>
+                      <span className="font-semibold text-[#6eff30]">{dailyRemainingLabel}</span>
+                    </>
+                  )}
                 </div>
               </div>
             </header>
@@ -341,6 +370,7 @@ export function App() {
                 pendingGenerateForm={pendingGenerateForm}
                 onPendingEditImageConsumed={clearImageToEdit}
                 onPendingGenerateFormConsumed={clearPendingGenerateForm}
+                onUsageChanged={refreshMe}
               />
             )}
             {view === "gallery" && (
@@ -350,6 +380,7 @@ export function App() {
                 onProviderNeeded={() => setView("settings")}
                 onEditImage={editImageFromGallery}
                 onEditPrompt={editPromptFromGallery}
+                onUsageChanged={refreshMe}
               />
             )}
             {view === "settings" && <SettingsView config={effectiveConfig} onSaved={refreshMe} />}
@@ -438,15 +469,6 @@ function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Pr
           </Button>
 
           <p className="mt-1.5 text-xs font-normal leading-[18px] text-white/40">新空间会自动创建；忘记空间名或密码无法找回</p>
-          <div className="mt-10 flex h-[42px] items-center gap-2 overflow-hidden rounded-[10px] border border-white/15 p-2">
-            <div className="grid size-6 shrink-0 place-items-center overflow-hidden rounded bg-white/10">
-              <img src={openaiIcon} alt="" className="size-4" />
-            </div>
-            <p className="min-w-0 flex-1 text-xs font-semibold leading-none text-white/90">推荐使用 Small Token</p>
-            <a href="https://smalltoken.ai/" target="_blank" rel="noreferrer" className="shrink-0 text-xs font-normal leading-[18px] text-[#6eff30]">
-              去购买
-            </a>
-          </div>
 
           <div className="mt-3 flex flex-col gap-3">
             {config.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={setTurnstileToken} />}
@@ -469,6 +491,7 @@ function GenerateView({
   pendingGenerateForm,
   onPendingEditImageConsumed,
   onPendingGenerateFormConsumed,
+  onUsageChanged,
 }: {
   config: AppConfig;
   providerConfigured: boolean;
@@ -479,6 +502,7 @@ function GenerateView({
   pendingGenerateForm: GenerateForm | null;
   onPendingEditImageConsumed: () => void;
   onPendingGenerateFormConsumed: () => void;
+  onUsageChanged: () => Promise<void>;
 }) {
   const [form, setForm] = useState<GenerateForm>(defaultForm);
   const [job, setJob] = useState<GenerationJob | null>(null);
@@ -510,6 +534,9 @@ function GenerateView({
     () => FORMAT_OPTIONS.filter((format) => config.formats.includes(format) || fallbackConfig.formats.includes(format)),
     [config.formats],
   );
+  const refreshUsage = useCallback(() => {
+    void onUsageChanged().catch(() => undefined);
+  }, [onUsageChanged]);
   const setReferenceFile = useCallback((file: File) => {
     const mimeType = normalizeImageMime(file.type);
     if (!REFERENCE_IMAGE_MIME_TYPES.has(mimeType)) {
@@ -602,7 +629,7 @@ function GenerateView({
     try {
       const path = cursor ? `/api/generations?cursor=${encodeURIComponent(cursor)}` : "/api/generations";
       const result = await api<{ ok: true; records: GenerationRecord[]; nextCursor: string | null }>(path);
-      setRecords((current) => (cursor ? [...current, ...result.records] : result.records));
+      setRecords((current) => mergeGenerationRecordList(current, result.records, cursor ? "append" : "replace"));
       setNextCursor(result.nextCursor);
     } catch (err) {
       setRecordsError(err instanceof Error ? err.message : "生成记录加载失败。");
@@ -618,8 +645,10 @@ function GenerateView({
         images: nextImages,
         elapsedSeconds: estimateJobElapsed(nextJob),
       };
+      const existing = current.find((item) => item.job.id === nextJob.id);
+      const mergedRecord = existing ? mergeGenerationRecord(existing, record) : record;
       const rest = current.filter((item) => item.job.id !== nextJob.id);
-      return [record, ...rest];
+      return [mergedRecord, ...rest];
     });
   }, []);
 
@@ -637,6 +666,7 @@ function GenerateView({
         upsertRecord(result.job, result.images);
         if (isTerminalJobStatus(result.job.status)) {
           window.clearInterval(timer);
+          refreshUsage();
           void loadRecords(undefined, { background: true });
         }
       } catch (err) {
@@ -644,7 +674,7 @@ function GenerateView({
       }
     }, GENERATION_POLL_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [job?.id, job?.status, loadRecords, upsertRecord]);
+  }, [job?.id, job?.status, loadRecords, refreshUsage, upsertRecord]);
 
   useEffect(() => {
     if (!job || isTerminalJobStatus(job.status)) {
@@ -722,11 +752,13 @@ function GenerateView({
         method: "POST",
         body: generationRequestBody(form, turnstileToken, referenceImage, referenceMask),
       });
+      refreshUsage();
       setForm((current) => (current.prompt === submittedPrompt ? { ...current, prompt: "" } : current));
       const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
       setJob(firstPoll.job);
       setImages(firstPoll.images);
       upsertRecord(firstPoll.job, firstPoll.images);
+      if (isTerminalJobStatus(firstPoll.job.status)) refreshUsage();
       void loadRecords(undefined, { background: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "创建任务失败。");
@@ -763,10 +795,12 @@ function GenerateView({
       const result = await api<{ ok: true; jobId: string; status: "queued" }>(`/api/generations/${record.job.id}/regenerate`, {
         method: "POST",
       });
+      refreshUsage();
       const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
       setJob(firstPoll.job);
       setImages(firstPoll.images);
       upsertRecord(firstPoll.job, firstPoll.images);
+      if (isTerminalJobStatus(firstPoll.job.status)) refreshUsage();
       void loadRecords(undefined, { background: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "重新生成失败。");
@@ -806,10 +840,12 @@ function GenerateView({
         method: "POST",
         body: generationRequestBody(draft, turnstileToken, referenceImageDraft, mask ?? null),
       });
+      refreshUsage();
       const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
       setJob(firstPoll.job);
       setImages(firstPoll.images);
       upsertRecord(firstPoll.job, firstPoll.images);
+      if (isTerminalJobStatus(firstPoll.job.status)) refreshUsage();
       void loadRecords(undefined, { background: true });
     } catch (err) {
       const message = err instanceof Error ? err.message : "创建任务失败。";
@@ -1054,8 +1090,8 @@ function GenerationRecordCard({
 }) {
   const [previewImage, setPreviewImage] = useState<ImageItem | null>(null);
   const isGenerating = record.job.status === "queued" || record.job.status === "running";
-  const pendingThumbnailCount = isGenerating ? Math.max(0, record.job.quantity - record.images.length) : 0;
-  const showEmptyPlaceholder = record.images.length === 0 && pendingThumbnailCount === 0;
+  const slotCount = Math.max(record.job.quantity, record.images.length);
+  const showEmptyPlaceholder = slotCount === 0;
   const recordError =
     record.job.status === "failed" || record.job.status === "partial_succeeded"
       ? generationJobErrorMessage(
@@ -1080,11 +1116,15 @@ function GenerationRecordCard({
       )}
     >
       <div className="flex flex-wrap items-start gap-3">
-        {record.images.map((image) => (
-          <GenerationThumbnail key={image.id} image={image} onOpen={() => setPreviewImage(image)} />
-        ))}
-        {Array.from({ length: pendingThumbnailCount }, (_, index) => (
-          <GenerationPlaceholderThumbnail key={`pending-${record.job.id}-${index}`} job={record.job} loading />
+        {Array.from({ length: slotCount }, (_, index) => (
+          <GenerationImageSlot
+            key={`${record.job.id}-${index}`}
+            job={record.job}
+            image={record.images[index]}
+            loading={isGenerating && !record.images[index]}
+            index={index}
+            onOpen={(image) => setPreviewImage(image)}
+          />
         ))}
         {showEmptyPlaceholder && <GenerationPlaceholderThumbnail job={record.job} />}
       </div>
@@ -1141,15 +1181,82 @@ function GenerationRecordCard({
   );
 }
 
-function GenerationPlaceholderThumbnail({ job, loading = false }: { job: GenerationJob; loading?: boolean }) {
+function GenerationImageSlot({
+  job,
+  image,
+  loading,
+  index,
+  onOpen,
+}: {
+  job: GenerationJob;
+  image?: ImageItem;
+  loading: boolean;
+  index: number;
+  onOpen: (image: ImageItem) => void;
+}) {
+  if (image) {
+    return <GenerationThumbnail image={image} onOpen={() => onOpen(image)} />;
+  }
+
+  return <GenerationPlaceholderThumbnail job={job} loading={loading} loadingIndex={index} />;
+}
+
+function GenerationPlaceholderThumbnail({
+  job,
+  loading = false,
+  loadingIndex = 0,
+}: {
+  job: GenerationJob;
+  loading?: boolean;
+  loadingIndex?: number;
+}) {
   const size = thumbnailSize(job.width, job.height);
+  const dotSize = Math.min(3, Math.max(2, Math.min(size.width / 32, size.height / 24)));
+  const dotGap = Math.min(
+    5,
+    Math.max(
+      2.6,
+      Math.min(
+        (size.width - DOT_MATRIX_COLUMNS * dotSize) / Math.max(1, DOT_MATRIX_COLUMNS - 1),
+        (size.height - DOT_MATRIX_ROWS * dotSize) / Math.max(1, DOT_MATRIX_ROWS - 1),
+      ),
+    ),
+  );
   return (
     <div
-      className="grid shrink-0 place-items-center rounded-md border border-white/10 bg-white/10 text-white/40"
-      style={{ width: size.width, height: size.height }}
+      className={cn(
+        "grid shrink-0 place-items-center overflow-hidden rounded-md border border-white/10 bg-white/10 text-white/40",
+        loading && "generation-loading-thumbnail",
+      )}
+      style={
+        {
+          width: size.width,
+          height: size.height,
+          "--dot-size": `${dotSize}px`,
+          "--dot-gap": `${dotGap}px`,
+        } as CSSProperties
+      }
       aria-label={loading ? "图片生成中" : "暂无生成图片"}
     >
-      {loading ? <Loader2 className="size-5 animate-spin" /> : <FileText className="size-5" />}
+      {loading ? <GenerationDotMatrixLoader delayIndex={loadingIndex} /> : <FileText className="size-5" />}
+    </div>
+  );
+}
+
+function GenerationDotMatrixLoader({ delayIndex }: { delayIndex: number }) {
+  return (
+    <div className="generation-dot-matrix-loader" aria-hidden="true">
+      {DOT_MATRIX_DOTS.map((dot) => (
+        <span
+          key={dot.index}
+          className="generation-dot-matrix-dot"
+          style={
+            {
+              "--dot-delay": `${delayIndex * 120 + dot.column * 34 - dot.row * 16}ms`,
+            } as CSSProperties
+          }
+        />
+      ))}
     </div>
   );
 }
@@ -1164,7 +1271,7 @@ function GenerationThumbnail({ image, onOpen }: { image: ImageItem; onOpen: () =
       aria-label="查看大图"
       onClick={onOpen}
     >
-      <img src={image.url} alt={image.prompt ?? "生成图片"} loading="lazy" className="size-full object-cover" />
+      <img key={image.id} src={image.url} alt={image.prompt ?? "生成图片"} loading="lazy" className="size-full object-cover" />
     </button>
   );
 }
@@ -1600,12 +1707,14 @@ function GalleryView({
   onProviderNeeded,
   onEditImage,
   onEditPrompt,
+  onUsageChanged,
 }: {
   config: AppConfig;
   providerConfigured: boolean;
   onProviderNeeded: () => void;
   onEditImage: (image: ImageItem, draft?: GenerateForm, mask?: ImageSelectionMask) => void;
   onEditPrompt: (draft: GenerateForm) => void;
+  onUsageChanged: () => Promise<void>;
 }) {
   const [records, setRecords] = useState<GenerationRecord[]>([]);
   const [recordsLoading, setRecordsLoading] = useState(true);
@@ -1628,6 +1737,9 @@ function GalleryView({
     () => FORMAT_OPTIONS.filter((format) => config.formats.includes(format) || fallbackConfig.formats.includes(format)),
     [config.formats],
   );
+  const refreshUsage = useCallback(() => {
+    void onUsageChanged().catch(() => undefined);
+  }, [onUsageChanged]);
 
   const loadRecords = useCallback(async (cursor?: string, options?: { background?: boolean }) => {
     if (!cursor && !options?.background) setRecordsLoading(true);
@@ -1635,7 +1747,7 @@ function GalleryView({
     try {
       const path = cursor ? `/api/generations?cursor=${encodeURIComponent(cursor)}` : "/api/generations";
       const result = await api<{ ok: true; records: GenerationRecord[]; nextCursor: string | null }>(path);
-      setRecords((current) => (cursor ? [...current, ...result.records] : result.records));
+      setRecords((current) => mergeGenerationRecordList(current, result.records, cursor ? "append" : "replace"));
       setNextCursor(result.nextCursor);
     } catch (err) {
       setError(err instanceof Error ? err.message : "生成记录加载失败。");
@@ -1651,8 +1763,10 @@ function GalleryView({
         images: nextImages,
         elapsedSeconds: estimateJobElapsed(nextJob),
       };
+      const existing = current.find((item) => item.job.id === nextJob.id);
+      const mergedRecord = existing ? mergeGenerationRecord(existing, record) : record;
       const rest = current.filter((item) => item.job.id !== nextJob.id);
-      return [record, ...rest];
+      return [mergedRecord, ...rest];
     });
   }, []);
 
@@ -1670,6 +1784,7 @@ function GalleryView({
         upsertRecord(result.job, result.images);
         if (isTerminalJobStatus(result.job.status)) {
           window.clearInterval(timer);
+          refreshUsage();
           void loadRecords(undefined, { background: true });
         }
       } catch (err) {
@@ -1677,7 +1792,7 @@ function GalleryView({
       }
     }, GENERATION_POLL_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [activeJob?.id, activeJob?.status, loadRecords, upsertRecord]);
+  }, [activeJob?.id, activeJob?.status, loadRecords, refreshUsage, upsertRecord]);
 
   useEffect(() => {
     if (!activeJob || isTerminalJobStatus(activeJob.status)) {
@@ -1714,16 +1829,19 @@ function GalleryView({
     if (regeneratingId) return;
     setRegeneratingId(record.job.id);
     setError("");
+    setActiveJob(null);
     setActiveImages([]);
     setElapsedSeconds(0);
     try {
       const result = await api<{ ok: true; jobId: string; status: "queued" }>(`/api/generations/${record.job.id}/regenerate`, {
         method: "POST",
       });
+      refreshUsage();
       const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
       setActiveJob(firstPoll.job);
       setActiveImages(firstPoll.images);
       upsertRecord(firstPoll.job, firstPoll.images);
+      if (isTerminalJobStatus(firstPoll.job.status)) refreshUsage();
       void loadRecords(undefined, { background: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "重新生成失败。");
@@ -1746,6 +1864,7 @@ function GalleryView({
 
     setRegeneratingId(image.jobId);
     setError("");
+    setActiveJob(null);
     setActiveImages([]);
     setElapsedSeconds(0);
     try {
@@ -1759,10 +1878,12 @@ function GalleryView({
         method: "POST",
         body: generationRequestBody(draft, "", referenceImageDraft, mask ?? null),
       });
+      refreshUsage();
       const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
       setActiveJob(firstPoll.job);
       setActiveImages(firstPoll.images);
       upsertRecord(firstPoll.job, firstPoll.images);
+      if (isTerminalJobStatus(firstPoll.job.status)) refreshUsage();
       void loadRecords(undefined, { background: true });
     } catch (err) {
       const message = err instanceof Error ? err.message : "创建任务失败。";
@@ -1827,6 +1948,7 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
   const [apiKey, setApiKey] = useState("");
   const [promptOptimizerModel, setPromptOptimizerModel] = useState(optionOrFallback(config.promptOptimizerModel, PROMPT_OPTIMIZER_MODEL_OPTIONS));
   const [model, setModel] = useState(optionOrFallback(config.model, IMAGE_MODEL_OPTIONS));
+  const [usesTokenFourjProvider, setUsesTokenFourjProvider] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
@@ -1838,6 +1960,9 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
       if (result.provider) {
         setPromptOptimizerModel(optionOrFallback(result.provider.promptOptimizerModel, PROMPT_OPTIMIZER_MODEL_OPTIONS));
         setModel(optionOrFallback(result.provider.model, IMAGE_MODEL_OPTIONS));
+        setUsesTokenFourjProvider(result.provider.usesTokenFourjProvider);
+      } else {
+        setUsesTokenFourjProvider(false);
       }
     });
     return () => {
@@ -1851,10 +1976,11 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
     setError("");
     setMessage("");
     try {
-      await api<{ ok: true; provider: ProviderSettings }>("/api/settings/provider", {
+      const result = await api<{ ok: true; provider: ProviderSettings }>("/api/settings/provider", {
         method: "POST",
         body: JSON.stringify({ baseURL, apiKey, model, promptOptimizerModel }),
       });
+      setUsesTokenFourjProvider(result.provider.usesTokenFourjProvider);
       setBaseURL("");
       setApiKey("");
       setMessage("Provider 已保存，API Key 不会回显。");
@@ -1887,15 +2013,17 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
   return (
     <section className="entry-fade thin-scrollbar h-[calc(100dvh-64px)] flex-1 overflow-y-auto bg-[#191919]">
       <form className="mx-auto flex w-[368px] max-w-[calc(100vw-32px)] flex-col pt-10" onSubmit={save}>
-        <div className="flex h-10 items-center gap-2 overflow-hidden rounded-[10px] border border-white/15 p-2">
-          <span className="grid size-6 shrink-0 place-items-center overflow-hidden rounded bg-white/10">
-            <img src={openaiIcon} alt="" className="size-4" />
-          </span>
-          <strong className="min-w-0 flex-1 truncate text-xs font-semibold leading-none text-white">推荐使用 Small Token</strong>
-          <button type="button" className="shrink-0 text-xs leading-[18px] text-[#6eff30]">
-            去购买
-          </button>
-        </div>
+        {!usesTokenFourjProvider && (
+          <div className="flex h-10 items-center gap-2 overflow-hidden rounded-[10px] border border-white/15 p-2">
+            <span className="grid size-6 shrink-0 place-items-center overflow-hidden rounded bg-white/10">
+              <img src={openaiIcon} alt="" className="size-4" />
+            </span>
+            <strong className="min-w-0 flex-1 truncate text-xs font-semibold leading-none text-white">推荐使用 Small Token</strong>
+            <button type="button" className="shrink-0 text-xs leading-[18px] text-[#6eff30]">
+              去购买
+            </button>
+          </div>
+        )}
 
         <div className="mt-10 flex flex-col gap-2">
           <SettingsTextField
@@ -2348,6 +2476,42 @@ function thumbnailSize(width: number, height: number): { width: number; height: 
   if (!width || !height) return { width: 128, height: 128 };
   if (width >= height) return { width: 128, height: Math.max(16, Math.round((128 * height) / width)) };
   return { width: Math.max(16, Math.round((128 * width) / height)), height: 128 };
+}
+
+function mergeGenerationRecordList(
+  current: GenerationRecord[],
+  next: GenerationRecord[],
+  mode: "replace" | "append",
+): GenerationRecord[] {
+  const currentById = new Map(current.map((record) => [record.job.id, record]));
+  const mergedNext = next.map((record) => {
+    const existing = currentById.get(record.job.id);
+    return existing ? mergeGenerationRecord(existing, record) : record;
+  });
+
+  if (mode === "replace") return mergedNext;
+
+  const mergedNextById = new Map(mergedNext.map((record) => [record.job.id, record]));
+  return [
+    ...current.map((record) => mergedNextById.get(record.job.id) ?? record),
+    ...mergedNext.filter((record) => !currentById.has(record.job.id)),
+  ];
+}
+
+function mergeGenerationRecord(current: GenerationRecord, next: GenerationRecord): GenerationRecord {
+  return {
+    ...next,
+    images: mergeImageItems(current.images, next.images),
+    elapsedSeconds: next.elapsedSeconds ?? current.elapsedSeconds,
+  };
+}
+
+function mergeImageItems(current: ImageItem[], next: ImageItem[]): ImageItem[] {
+  if (current.length === 0) return next;
+  if (next.length === 0) return current;
+
+  const nextIds = new Set(next.map((image) => image.id));
+  return [...next, ...current.filter((image) => !nextIds.has(image.id))];
 }
 
 function formatResolution(width: number, height: number): string {

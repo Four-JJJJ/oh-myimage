@@ -62,7 +62,7 @@ describe("daily image usage accounting", () => {
     vi.useRealTimers();
   });
 
-  it("counts generated images from usage events using database timestamp format", async () => {
+  it("counts generated images from usage events and image assets missing events", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-05-15T08:30:00.000Z"));
     const db = new FakeDatabase([{ count: "3" }]);
@@ -70,7 +70,15 @@ describe("daily image usage accounting", () => {
     await expect(countDailyGeneratedImages(db, "space_1")).resolves.toBe(3);
 
     expect(db.calls[0]?.query).toContain("rate_limit_events");
-    expect(db.calls[0]?.values).toEqual(["space_1", IMAGE_GENERATED_EVENT, "2026-05-15 00:00:00"]);
+    expect(db.calls[0]?.query).toContain("image_assets");
+    expect(db.calls[0]?.query).toContain("evt_usage_");
+    expect(db.calls[0]?.values).toEqual([
+      "space_1",
+      IMAGE_GENERATED_EVENT,
+      "2026-05-15 00:00:00",
+      "space_1",
+      "2026-05-15 00:00:00",
+    ]);
   });
 
   it("reserves unfinished images from active generation jobs", async () => {

@@ -376,11 +376,13 @@ app.get("/api/me", async (c) => {
   const credential = await getCredential(c.env.DB, space.id);
   const dailyLimit = dailyImageLimit(c.env);
   const usage = await countDailyImageUsage(c.env.DB, space.id);
+  const usesTokenFourjProvider = credential ? isTokenFourjBaseURL(credential.base_url) : false;
   const dailyLimitExempt = credential ? hasUnlimitedDailyImageQuota(credential) : false;
   return c.json({
     ok: true,
     space: { id: space.id, name: space.space_name },
     providerConfigured: Boolean(credential),
+    usesTokenFourjProvider,
     dailyLimitExempt,
     dailyRemaining: Math.max(0, dailyLimit - usage.total),
     dailyLimit,
@@ -401,6 +403,7 @@ app.get("/api/settings/provider", async (c) => {
           apiKeyHint: credential.api_key_hint,
           lastTestOk: Boolean(credential.last_test_ok),
           lastTestedAt: credential.last_tested_at,
+          usesTokenFourjProvider: isTokenFourjBaseURL(credential.base_url),
         }
       : null,
   });
@@ -436,6 +439,9 @@ app.post("/api/settings/provider", async (c) => {
       model: selectedModel,
       promptOptimizerModel: selectedPromptOptimizerModel,
       apiKeyHint: apiKeyHint(apiKey.trim()),
+      lastTestOk: false,
+      lastTestedAt: null,
+      usesTokenFourjProvider: isTokenFourjBaseURL(validation.normalized),
     },
   });
 });

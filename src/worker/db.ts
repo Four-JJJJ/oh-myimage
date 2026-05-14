@@ -259,9 +259,29 @@ export async function getImage(db: AppDatabase, spaceId: string, imageId: string
 }
 
 export async function countDailyGeneratedImages(db: AppDatabase, spaceId: string): Promise<number> {
+  const todayStart = todayStartTimestamp();
   const row = await db
-    .prepare("SELECT COUNT(*) AS count FROM rate_limit_events WHERE space_id = ? AND event_type = ? AND created_at >= ?")
-    .bind(spaceId, IMAGE_GENERATED_EVENT, todayStartTimestamp())
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM (
+         SELECT rate_limit_events.id
+         FROM rate_limit_events
+         WHERE rate_limit_events.space_id = ?
+           AND rate_limit_events.event_type = ?
+           AND rate_limit_events.created_at >= ?
+         UNION ALL
+         SELECT image_assets.id
+         FROM image_assets
+         WHERE image_assets.space_id = ?
+           AND image_assets.created_at >= ?
+           AND NOT EXISTS (
+             SELECT 1
+             FROM rate_limit_events
+             WHERE rate_limit_events.id = 'evt_usage_' || image_assets.id
+           )
+       ) daily_usage`,
+    )
+    .bind(spaceId, IMAGE_GENERATED_EVENT, todayStart, spaceId, todayStart)
     .first<{ count: number | string }>();
   return dbNumber(row?.count);
 }

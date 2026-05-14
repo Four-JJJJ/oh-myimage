@@ -84,16 +84,18 @@ class S3ObjectStore implements AppObjectStore {
 }
 
 class S3Object implements AppObject {
-  readonly body: ReadableStream | null;
   readonly httpMetadata: AppObject["httpMetadata"];
 
   constructor(private readonly result: GetObjectCommandOutput) {
-    const body = result.Body;
-    this.body = body ? toWebStream(body) : null;
     this.httpMetadata = {
       contentType: result.ContentType,
       contentDisposition: result.ContentDisposition,
     };
+  }
+
+  get body(): ReadableStream | null {
+    const body = this.result.Body;
+    return body ? toWebStream(body) : null;
   }
 
   async arrayBuffer(): Promise<ArrayBuffer> {

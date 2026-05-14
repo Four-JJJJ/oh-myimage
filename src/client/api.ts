@@ -19,6 +19,7 @@ export interface ProviderSettings {
   apiKeyHint: string;
   lastTestOk: boolean;
   lastTestedAt: string | null;
+  usesTokenFourjProvider: boolean;
 }
 
 export interface ImageItem {
