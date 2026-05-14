@@ -62,7 +62,7 @@ export function buildProviderEndpoint(baseURL: string, endpoint: string): string
 
 export function isTokenFourjBaseURL(baseURL: string): boolean {
   try {
-    return new URL(baseURL).hostname.toLowerCase() === "token.fourj.space";
+    return ["token.fourj.space", "image.fourj.space"].includes(new URL(baseURL).hostname.toLowerCase());
   } catch {
     return false;
   }

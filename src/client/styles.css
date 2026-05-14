@@ -228,6 +228,23 @@
     --tw-ring-offset-width: 0px;
   }
 
+  .figma-settings-input,
+  .figma-settings-input:focus,
+  .figma-settings-input:focus-visible {
+    background: transparent !important;
+    color: rgb(255 255 255 / 0.9);
+    font-weight: 700;
+  }
+
+  .figma-settings-input:-webkit-autofill,
+  .figma-settings-input:-webkit-autofill:hover,
+  .figma-settings-input:-webkit-autofill:focus {
+    box-shadow: 0 0 0 1000px #191919 inset !important;
+    caret-color: rgb(255 255 255 / 0.9);
+    -webkit-text-fill-color: rgb(255 255 255 / 0.9);
+    transition: background-color 9999s ease-out 0s;
+  }
+
   .figma-segment {
     transition:
       border-color 140ms ease,

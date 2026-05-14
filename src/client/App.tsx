@@ -1946,6 +1946,7 @@ function GalleryView({
 function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => Promise<void> }) {
   const [baseURL, setBaseURL] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [apiKeyHint, setApiKeyHint] = useState("");
   const [promptOptimizerModel, setPromptOptimizerModel] = useState(optionOrFallback(config.promptOptimizerModel, PROMPT_OPTIMIZER_MODEL_OPTIONS));
   const [model, setModel] = useState(optionOrFallback(config.model, IMAGE_MODEL_OPTIONS));
   const [usesTokenFourjProvider, setUsesTokenFourjProvider] = useState(false);
@@ -1958,10 +1959,13 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
     api<{ ok: true; provider: ProviderSettings | null }>("/api/settings/provider").then((result) => {
       if (!mounted) return;
       if (result.provider) {
+        setBaseURL(result.provider.baseURL);
+        setApiKeyHint(result.provider.apiKeyHint);
         setPromptOptimizerModel(optionOrFallback(result.provider.promptOptimizerModel, PROMPT_OPTIMIZER_MODEL_OPTIONS));
         setModel(optionOrFallback(result.provider.model, IMAGE_MODEL_OPTIONS));
         setUsesTokenFourjProvider(result.provider.usesTokenFourjProvider);
       } else {
+        setApiKeyHint("");
         setUsesTokenFourjProvider(false);
       }
     });
@@ -1976,14 +1980,21 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
     setError("");
     setMessage("");
     try {
+      const trimmedApiKey = apiKey.trim();
       const result = await api<{ ok: true; provider: ProviderSettings }>("/api/settings/provider", {
         method: "POST",
-        body: JSON.stringify({ baseURL, apiKey, model, promptOptimizerModel }),
+        body: JSON.stringify({
+          baseURL: baseURL.trim(),
+          ...(trimmedApiKey ? { apiKey: trimmedApiKey } : {}),
+          model,
+          promptOptimizerModel,
+        }),
       });
       setUsesTokenFourjProvider(result.provider.usesTokenFourjProvider);
-      setBaseURL("");
+      setBaseURL(result.provider.baseURL);
       setApiKey("");
-      setMessage("Provider 已保存，API Key 不会回显。");
+      setApiKeyHint(result.provider.apiKeyHint);
+      setMessage("Provider 已保存。");
       await onSaved();
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存失败。");
@@ -1996,13 +2007,24 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
     setError("");
     setMessage("");
     try {
-      const testsUnsavedProvider = Boolean(apiKey.trim());
+      const trimmedBaseURL = baseURL.trim();
+      const trimmedApiKey = apiKey.trim();
+      const testsFormProvider = Boolean(trimmedBaseURL);
       const result = await api<{ ok: true; result: { ok: boolean; message: string; status: number } }>("/api/provider/test", {
         method: "POST",
-        body: JSON.stringify(testsUnsavedProvider ? { baseURL, apiKey, model, promptOptimizerModel } : {}),
+        body: JSON.stringify(
+          testsFormProvider
+            ? {
+                baseURL: trimmedBaseURL,
+                ...(trimmedApiKey ? { apiKey: trimmedApiKey } : {}),
+                model,
+                promptOptimizerModel,
+              }
+            : {},
+        ),
       });
       setMessage(result.result.message);
-      if (!testsUnsavedProvider) {
+      if (!testsFormProvider) {
         await onSaved();
       }
     } catch (err) {
@@ -2040,7 +2062,7 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
             onChange={(event) => setApiKey(event.target.value)}
             type="password"
             autoComplete="new-password"
-            placeholder="请输入 API Key"
+            placeholder={apiKeyHint ? `已保存：${apiKeyHint}` : "请输入 API Key"}
           />
           <SettingsSelectField
             label="提示词优化模型"
@@ -2096,7 +2118,7 @@ function SettingsTextField({
       <Input
         id={id}
         className={cn(
-          "h-10 rounded-[10px] border-white/15 bg-transparent px-2 py-2.5 text-xs font-semibold leading-none text-white shadow-none placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0",
+          "figma-settings-input h-10 rounded-[10px] border-white/15 bg-transparent px-2 py-2.5 text-xs font-bold leading-none text-white/90 shadow-none caret-white/90 placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0",
           className,
         )}
         {...props}

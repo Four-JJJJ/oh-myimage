@@ -22,8 +22,9 @@ describe("baseURL safety", () => {
     );
   });
 
-  it("detects token.fourj.space provider URLs", () => {
+  it("detects Small Token provider URLs", () => {
     expect(isTokenFourjBaseURL("https://token.fourj.space/v1")).toBe(true);
+    expect(isTokenFourjBaseURL("https://image.fourj.space/v1")).toBe(true);
     expect(isTokenFourjBaseURL("https://api.openai.com/v1")).toBe(false);
     expect(isTokenFourjBaseURL("https://not-token.fourj.space/v1")).toBe(false);
   });

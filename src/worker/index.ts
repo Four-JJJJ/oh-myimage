@@ -414,14 +414,22 @@ app.post("/api/settings/provider", async (c) => {
   if (!body || typeof body !== "object") throw jsonError(400, "invalid_request", "请求体格式不正确。");
   const { baseURL, apiKey, model, promptOptimizerModel } = body as Record<string, unknown>;
   if (typeof baseURL !== "string") throw jsonError(400, "invalid_base_url", "请输入 baseURL。");
-  if (typeof apiKey !== "string" || apiKey.trim().length < 8) throw jsonError(400, "invalid_api_key", "请输入有效 API Key。");
   const validation = validateBaseURL(baseURL);
   if (!validation.ok || !validation.normalized) throw jsonError(400, "invalid_base_url", validation.error ?? "baseURL 不合法。");
+  const existingCredential = await getCredential(c.env.DB, c.get("space").id);
+  const rawApiKey = typeof apiKey === "string" ? apiKey.trim() : "";
+  if (rawApiKey && rawApiKey.length < 8) throw jsonError(400, "invalid_api_key", "请输入有效 API Key。");
+  if (!rawApiKey && !existingCredential) throw jsonError(400, "invalid_api_key", "请输入有效 API Key。");
   const selectedModel = optionOrFallback(typeof model === "string" ? model : c.env.DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS);
   const selectedPromptOptimizerModel = optionOrFallback(
     typeof promptOptimizerModel === "string" ? promptOptimizerModel : c.env.PROMPT_OPTIMIZER_MODEL,
     PROMPT_OPTIMIZER_MODEL_OPTIONS,
   );
+  const encryptedApiKey = rawApiKey
+    ? await encryptSecret(rawApiKey, c.env.APP_ENCRYPTION_KEY ?? "")
+    : existingCredential?.encrypted_api_key;
+  const savedApiKeyHint = rawApiKey ? apiKeyHint(rawApiKey) : existingCredential?.api_key_hint;
+  if (!encryptedApiKey || !savedApiKeyHint) throw jsonError(400, "invalid_api_key", "请输入有效 API Key。");
 
   await upsertCredential(
     c.env.DB,
@@ -429,8 +437,8 @@ app.post("/api/settings/provider", async (c) => {
     validation.normalized,
     selectedModel,
     selectedPromptOptimizerModel,
-    await encryptSecret(apiKey.trim(), c.env.APP_ENCRYPTION_KEY ?? ""),
-    apiKeyHint(apiKey.trim()),
+    encryptedApiKey,
+    savedApiKeyHint,
   );
   return c.json({
     ok: true,
@@ -438,7 +446,7 @@ app.post("/api/settings/provider", async (c) => {
       baseURL: validation.normalized,
       model: selectedModel,
       promptOptimizerModel: selectedPromptOptimizerModel,
-      apiKeyHint: apiKeyHint(apiKey.trim()),
+      apiKeyHint: savedApiKeyHint,
       lastTestOk: false,
       lastTestedAt: null,
       usesTokenFourjProvider: isTokenFourjBaseURL(validation.normalized),
@@ -461,9 +469,15 @@ app.post("/api/provider/test", async (c) => {
     const raw = body as Record<string, unknown>;
     const validation = validateBaseURL(raw.baseURL as string);
     if (!validation.ok || !validation.normalized) throw jsonError(400, "invalid_base_url", validation.error ?? "baseURL 不合法。");
-    if (typeof raw.apiKey !== "string") throw jsonError(400, "invalid_api_key", "请输入 API Key。");
+    const rawApiKey = typeof raw.apiKey === "string" ? raw.apiKey.trim() : "";
     baseURL = validation.normalized;
-    apiKey = raw.apiKey;
+    if (rawApiKey) {
+      apiKey = rawApiKey;
+    } else {
+      const credential = await getCredential(c.env.DB, spaceId);
+      if (!credential) throw jsonError(400, "invalid_api_key", "请输入 API Key。");
+      apiKey = await decryptSecret(credential.encrypted_api_key, c.env.APP_ENCRYPTION_KEY ?? "");
+    }
   } else {
     const credential = await getCredential(c.env.DB, spaceId);
     if (!credential) throw jsonError(400, "provider_missing", "请先保存 provider 配置。");
