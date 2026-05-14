@@ -1992,7 +1992,7 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
       });
       setUsesTokenFourjProvider(result.provider.usesTokenFourjProvider);
       setBaseURL(result.provider.baseURL);
-      setApiKey("");
+      setApiKey(trimmedApiKey);
       setApiKeyHint(result.provider.apiKeyHint);
       setMessage("Provider 已保存。");
       await onSaved();
