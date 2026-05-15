@@ -1354,6 +1354,7 @@ function ImagePreviewDialog({
   const [redoSelectionStrokes, setRedoSelectionStrokes] = useState<ImageSelectionStroke[]>([]);
   const [draft, setDraft] = useState<GenerateForm>(() => panelOptions.initialForm);
   const [optimizing, setOptimizing] = useState(false);
+  const [submittingEdit, setSubmittingEdit] = useState(false);
   const [editError, setEditError] = useState("");
   const stageRef = useRef<HTMLDivElement | null>(null);
   const selectionCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -1375,6 +1376,7 @@ function ImagePreviewDialog({
     setRedoSelectionStrokes([]);
     activeSelectionStrokeRef.current = null;
     setDraft(panelOptions.initialForm);
+    setSubmittingEdit(false);
     setEditError("");
   }, [image.id]);
 
@@ -1508,6 +1510,7 @@ function ImagePreviewDialog({
 
   async function submitEdit(event: FormEvent) {
     event.preventDefault();
+    if (panelOptions.submitting || submittingEdit) return;
     setEditError("");
     let selectionMask: ImageSelectionMask | undefined;
     if (selectionEditing) {
@@ -1527,15 +1530,15 @@ function ImagePreviewDialog({
       onClose();
       return;
     }
-    let submitPromise: Promise<void>;
+    setSubmittingEdit(true);
     try {
-      submitPromise = editOptions.onSubmit(image, draft, selectionMask);
+      await editOptions.onSubmit(image, draft, selectionMask);
+      setSubmittingEdit(false);
+      onClose();
     } catch (err) {
       setEditError(err instanceof Error ? err.message : "创建任务失败。");
-      return;
+      setSubmittingEdit(false);
     }
-    onClose();
-    void submitPromise.catch(() => undefined);
   }
 
   return createPortal(
@@ -1553,7 +1556,7 @@ function ImagePreviewDialog({
             draft={draft}
             error={editError}
             optimizing={optimizing}
-            submitting={panelOptions.submitting}
+            submitting={panelOptions.submitting || submittingEdit}
             availableRatios={panelOptions.availableRatios}
             qualityOptions={panelOptions.qualityOptions}
             formatOptions={panelOptions.formatOptions}
@@ -1594,7 +1597,7 @@ function ImagePreviewDialog({
                 <span>编辑图片</span>
               </button>
             )}
-            <a className="image-preview-action" href={image.url} download={imageDownloadName(image)}>
+            <a className="image-preview-action" href={imageDownloadUrl(image)} download={imageDownloadName(image)}>
               <Download />
               <span>下载图片</span>
             </a>
@@ -1881,14 +1884,16 @@ function GalleryView({
   async function createEditTaskFromImage(image: ImageItem, draft: GenerateForm, mask?: ImageSelectionMask): Promise<void> {
     if (!providerConfigured) {
       onProviderNeeded();
-      return;
+      throw new Error("请先配置 Provider 后再生成。");
     }
     if (!draft.prompt.trim()) {
       const message = "请输入提示词后再生成。";
       setError(message);
       throw new Error(message);
     }
-    if (regeneratingId) return;
+    if (regeneratingId) {
+      throw new Error("已有生成任务正在提交，请稍后再试。");
+    }
 
     setRegeneratingId(image.jobId);
     setError("");
@@ -2324,22 +2329,33 @@ function imageFileFromClipboard(data: DataTransfer): File | null {
 }
 
 function normalizeImageMime(value: string): string {
-  const mimeType = value.trim().toLowerCase();
+  const mimeType = value.split(";")[0]?.trim().toLowerCase() ?? "";
   return mimeType === "image/jpg" ? "image/jpeg" : mimeType;
 }
 
 async function imageItemToFile(image: ImageItem): Promise<File> {
-  const response = await fetch(image.url, { credentials: "include" });
+  const response = await fetch(`/api/images/${encodeURIComponent(image.id)}/download?raw=1`, { credentials: "include" });
   if (!response.ok) {
     throw new Error("图片文件加载失败，无法进入编辑。");
   }
   const blob = await response.blob();
-  const mimeType = normalizeImageMime(blob.type || `image/${image.format || "png"}`);
+  const responseMimeType = normalizeImageMime(response.headers.get("content-type") ?? "");
+  const blobMimeType = normalizeImageMime(blob.type);
+  const fallbackMimeType = normalizeImageMime(`image/${image.format || "png"}`);
+  const mimeType = REFERENCE_IMAGE_MIME_TYPES.has(responseMimeType)
+    ? responseMimeType
+    : REFERENCE_IMAGE_MIME_TYPES.has(blobMimeType)
+      ? blobMimeType
+      : fallbackMimeType;
   return new File([blob], imageDownloadName(image), { type: mimeType });
 }
 
 function imageDownloadName(image: ImageItem): string {
   return `${image.id}.${image.format || "png"}`;
+}
+
+function imageDownloadUrl(image: ImageItem): string {
+  return `/api/images/${encodeURIComponent(image.id)}/download?raw=1&download=1`;
 }
 
 function currentViewportSize(): { width: number; height: number } {
@@ -2614,7 +2630,7 @@ async function copyPrompt(prompt: string): Promise<void> {
 function downloadAllImages(record: GenerationRecord): void {
   record.images.forEach((image, index) => {
     const anchor = document.createElement("a");
-    anchor.href = image.url;
+    anchor.href = imageDownloadUrl(image);
     anchor.download = `${record.job.id}-${index + 1}.${image.format}`;
     anchor.rel = "noreferrer";
     document.body.appendChild(anchor);

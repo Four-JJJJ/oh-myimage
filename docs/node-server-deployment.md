@@ -116,7 +116,7 @@ docker logs --tail=100 oh-myimage-worker
 - 上传参考图可写入 R2。
 - 生图任务进入队列并成功完成。
 - 超过 120 秒的生图请求不会再被 Cloudflare Worker 链路截断。
-- 图库下载接口返回 302 到 R2 presigned URL。
+- 图库预览接口可继续使用 R2 presigned URL；点击下载图片时返回同源原始文件流，并触发浏览器下载。
 
 ## 回滚
 

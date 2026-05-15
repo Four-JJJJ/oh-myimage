@@ -642,12 +642,27 @@ app.get("/api/images", async (c) => {
 app.get("/api/images/:imageId/download", async (c) => {
   const image = await getImage(c.env.DB, c.get("space").id, c.req.param("imageId"));
   if (!image) throw jsonError(404, "image_not_found", "图片不存在。");
-  const contentDisposition = `inline; filename="${image.id}.${image.format}"`;
+  const filename = `${image.id}.${image.format}`;
+  const inlineContentDisposition = `inline; filename="${filename}"`;
+  const attachmentContentDisposition = `attachment; filename="${filename}"`;
+  const rawDownload = c.req.query("raw") === "1";
+  const attachmentDownload = c.req.query("download") === "1";
+  if (rawDownload) {
+    const object = await c.env.IMAGES.get(image.storage_key);
+    if (!object) throw jsonError(404, "image_file_missing", "图片文件不存在。");
+    return new Response(object.body, {
+      headers: {
+        "Content-Type": image.mime_type,
+        "Cache-Control": "private, max-age=300",
+        "Content-Disposition": attachmentDownload ? attachmentContentDisposition : inlineContentDisposition,
+      },
+    });
+  }
   if (c.env.IMAGES.createPresignedGetUrl) {
     const url = await c.env.IMAGES.createPresignedGetUrl(image.storage_key, {
       expiresInSeconds: 300,
       contentType: image.mime_type,
-      contentDisposition,
+      contentDisposition: inlineContentDisposition,
     });
     return c.redirect(url, 302);
   }
@@ -657,7 +672,7 @@ app.get("/api/images/:imageId/download", async (c) => {
     headers: {
       "Content-Type": image.mime_type,
       "Cache-Control": "private, max-age=300",
-      "Content-Disposition": contentDisposition,
+      "Content-Disposition": inlineContentDisposition,
     },
   });
 });
