@@ -1588,14 +1588,17 @@ function ImagePreviewDialog({
       setEditError("请先完成人机验证。");
       return;
     }
+    const submitEditTask = editOptions.onSubmit;
     setSubmittingEdit(true);
-    try {
-      await editOptions.onSubmit(image, draft, maskFactory, turnstileToken);
-      onClose();
-    } catch (err) {
-      setEditError(err instanceof Error ? err.message : "创建任务失败。");
-      setSubmittingEdit(false);
-    }
+    onClose();
+    window.setTimeout(() => {
+      try {
+        const submitPromise = submitEditTask(image, draft, maskFactory, turnstileToken);
+        void submitPromise.catch(() => undefined);
+      } catch {
+        // The dialog is already closed; submission handlers surface failures in the parent view.
+      }
+    }, 0);
   }
 
   return createPortal(
