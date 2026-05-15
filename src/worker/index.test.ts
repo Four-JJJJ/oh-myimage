@@ -69,11 +69,69 @@ describe("image downloads", () => {
   });
 });
 
-function testEnv({ images }: { images: AppObjectStore }): Env {
+describe("generation creation", () => {
+  it("stores reference and mask images before enqueueing edit generation jobs", async () => {
+    const db = new FakeRouteDatabase();
+    const images = new FakeObjectStore();
+    const generationQueue = new RecordingQueue();
+    const formData = new FormData();
+    formData.set("prompt", "edit the selected area");
+    formData.set("aspectRatio", "1:1");
+    formData.set("width", "1024");
+    formData.set("height", "1024");
+    formData.set("quality", "auto");
+    formData.set("quantity", "2");
+    formData.set("outputFormat", "png");
+    formData.set("compression", "100");
+    formData.set("referenceImage", new File(["reference-bytes"], "source.png", { type: "image/png" }));
+    formData.set("maskImage", new File(["mask-bytes"], "source-mask.png", { type: "image/png" }));
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token" },
+        body: formData,
+      },
+      testEnv({ db, images, generationQueue }),
+    );
+    const json = (await response.json()) as { ok: true; jobId: string; status: "queued" };
+
+    expect(response.status).toBe(200);
+    expect(json.status).toBe("queued");
+    expect(generationQueue.messages).toEqual([{ jobId: json.jobId, spaceId: "space_1" }]);
+    expect(images.putCalls.map((call) => call.key)).toEqual([
+      `space_1/${json.jobId}/reference.png`,
+      `space_1/${json.jobId}/mask.png`,
+    ]);
+    expect(images.putCalls.map((call) => call.options?.customMetadata?.kind)).toEqual(["reference", "mask"]);
+    expect(db.generationJobInserts).toHaveLength(1);
+    expect(db.generationJobInserts[0]).toEqual(
+      expect.arrayContaining([
+        json.jobId,
+        "space_1",
+        "edit the selected area",
+        "space_1",
+        `space_1/${json.jobId}/reference.png`,
+        `space_1/${json.jobId}/mask.png`,
+      ]),
+    );
+  });
+});
+
+function testEnv({
+  db = new FakeRouteDatabase(),
+  images,
+  generationQueue = disabledQueue(),
+}: {
+  db?: AppDatabase;
+  images: AppObjectStore;
+  generationQueue?: Env["GENERATION_QUEUE"];
+}): Env {
   return {
-    DB: new FakeRouteDatabase(),
+    DB: db,
     IMAGES: images,
-    GENERATION_QUEUE: disabledQueue(),
+    GENERATION_QUEUE: generationQueue,
     INSPIRATION_QUEUE: disabledQueue(),
   };
 }
@@ -87,15 +145,20 @@ function disabledQueue() {
 }
 
 class FakeRouteDatabase implements AppDatabase {
+  readonly generationJobInserts: unknown[][] = [];
+
   prepare(query: string): AppPreparedStatement {
-    return new FakeRoutePreparedStatement(query);
+    return new FakeRoutePreparedStatement(this, query);
   }
 }
 
 class FakeRoutePreparedStatement implements AppPreparedStatement {
   private values: unknown[] = [];
 
-  constructor(private readonly query: string) {}
+  constructor(
+    private readonly db: FakeRouteDatabase,
+    private readonly query: string,
+  ) {}
 
   bind(...values: unknown[]): AppPreparedStatement {
     this.values = values;
@@ -131,6 +194,24 @@ class FakeRoutePreparedStatement implements AppPreparedStatement {
         created_at: "2026-05-15T00:00:00.000Z",
       } as T;
     }
+    if (this.query.includes("FROM api_credentials")) {
+      return {
+        id: "cred_1",
+        space_id: "space_1",
+        base_url: "https://token.fourj.space/v1",
+        model: "gpt-image-2",
+        prompt_optimizer_model: "gpt-5.5",
+        encrypted_api_key: "encrypted",
+        api_key_hint: "test",
+        last_test_ok: 1,
+        last_tested_at: "2026-05-15T00:00:00.000Z",
+        created_at: "2026-05-15T00:00:00.000Z",
+        updated_at: "2026-05-15T00:00:00.000Z",
+      } as T;
+    }
+    if (this.query.includes("COUNT(*) AS count FROM generation_jobs")) {
+      return { count: 0 } as T;
+    }
     return null;
   }
 
@@ -139,21 +220,26 @@ class FakeRoutePreparedStatement implements AppPreparedStatement {
   }
 
   async run(): Promise<unknown> {
+    if (this.query.includes("INSERT INTO generation_jobs")) {
+      this.db.generationJobInserts.push([...this.values]);
+    }
     return { success: true };
   }
 }
 
 class FakeObjectStore implements AppObjectStore {
   readonly getCalls: string[] = [];
+  readonly putCalls: Array<{ key: string; value: unknown; options?: AppObjectStorePutOptions }> = [];
   readonly presignedCalls: string[] = [];
 
   constructor(private readonly options: { presignedUrl?: string } = {}) {}
 
   async put(
-    _key: string,
-    _value: ArrayBuffer | ArrayBufferView | Blob | ReadableStream | string,
-    _options?: AppObjectStorePutOptions,
+    key: string,
+    value: ArrayBuffer | ArrayBufferView | Blob | ReadableStream | string,
+    options?: AppObjectStorePutOptions,
   ): Promise<unknown> {
+    this.putCalls.push({ key, value, options });
     return {};
   }
 
@@ -174,5 +260,13 @@ class FakeObjectStore implements AppObjectStore {
     this.presignedCalls.push(key);
     if (!this.options.presignedUrl) throw new Error("Presigned URL is not configured.");
     return this.options.presignedUrl;
+  }
+}
+
+class RecordingQueue {
+  readonly messages: Array<{ jobId: string; spaceId: string }> = [];
+
+  async send(message: { jobId: string; spaceId: string }): Promise<void> {
+    this.messages.push(message);
   }
 }

@@ -858,7 +858,12 @@ function GenerateView({
     });
   }
 
-  async function createEditTaskFromImage(image: ImageItem, draft: GenerateForm, mask?: ImageSelectionMask): Promise<void> {
+  async function createEditTaskFromImage(
+    image: ImageItem,
+    draft: GenerateForm,
+    mask: ImageSelectionMask | undefined,
+    editTurnstileToken: string,
+  ): Promise<void> {
     if (!providerConfigured) {
       throw new Error("请先配置 Provider 后再生成。");
     }
@@ -879,7 +884,7 @@ function GenerateView({
       };
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
-        body: generationRequestBody(draft, turnstileToken, referenceImageDraft, mask ?? null),
+        body: generationRequestBody(draft, editTurnstileToken, referenceImageDraft, mask ?? null),
       });
       refreshUsage();
       const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
@@ -1062,6 +1067,8 @@ function GenerateView({
                 qualityOptions,
                 formatOptions,
                 maxImagesPerRequest: config.maxImagesPerRequest,
+                turnstileSiteKey: config.turnstileSiteKey,
+                turnstileRequired: config.turnstileRequired,
                 submitting: loading,
                 onSubmit: createEditTaskFromImage,
               }}
@@ -1322,8 +1329,10 @@ interface ImagePreviewEditOptions {
   qualityOptions: readonly string[];
   formatOptions: readonly string[];
   maxImagesPerRequest: number;
+  turnstileSiteKey: string;
+  turnstileRequired: boolean;
   submitting: boolean;
-  onSubmit?: (image: ImageItem, draft: GenerateForm, mask?: ImageSelectionMask) => Promise<void>;
+  onSubmit?: (image: ImageItem, draft: GenerateForm, mask: ImageSelectionMask | undefined, turnstileToken: string) => Promise<void>;
 }
 
 const fallbackImagePreviewEditOptions = {
@@ -1332,6 +1341,8 @@ const fallbackImagePreviewEditOptions = {
   qualityOptions: QUALITY_OPTIONS,
   formatOptions: FORMAT_OPTIONS,
   maxImagesPerRequest: fallbackConfig.maxImagesPerRequest,
+  turnstileSiteKey: fallbackConfig.turnstileSiteKey,
+  turnstileRequired: fallbackConfig.turnstileRequired,
   submitting: false,
 } satisfies ImagePreviewEditOptions;
 
@@ -1353,6 +1364,7 @@ function ImagePreviewDialog({
   const [selectionStrokes, setSelectionStrokes] = useState<ImageSelectionStroke[]>([]);
   const [redoSelectionStrokes, setRedoSelectionStrokes] = useState<ImageSelectionStroke[]>([]);
   const [draft, setDraft] = useState<GenerateForm>(() => panelOptions.initialForm);
+  const [turnstileToken, setTurnstileToken] = useState("");
   const [optimizing, setOptimizing] = useState(false);
   const [submittingEdit, setSubmittingEdit] = useState(false);
   const [editError, setEditError] = useState("");
@@ -1376,9 +1388,14 @@ function ImagePreviewDialog({
     setRedoSelectionStrokes([]);
     activeSelectionStrokeRef.current = null;
     setDraft(panelOptions.initialForm);
+    setTurnstileToken("");
     setSubmittingEdit(false);
     setEditError("");
   }, [image.id]);
+
+  useEffect(() => {
+    setTurnstileToken("");
+  }, [panelOptions.turnstileSiteKey]);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -1530,9 +1547,17 @@ function ImagePreviewDialog({
       onClose();
       return;
     }
+    if (panelOptions.turnstileRequired && !panelOptions.turnstileSiteKey) {
+      setEditError("Turnstile 已启用，请先配置站点 Key。");
+      return;
+    }
+    if (panelOptions.turnstileSiteKey && !turnstileToken) {
+      setEditError("请先完成人机验证。");
+      return;
+    }
     setSubmittingEdit(true);
     try {
-      await editOptions.onSubmit(image, draft, selectionMask);
+      await editOptions.onSubmit(image, draft, selectionMask, turnstileToken);
       setSubmittingEdit(false);
       onClose();
     } catch (err) {
@@ -1561,7 +1586,10 @@ function ImagePreviewDialog({
             qualityOptions={panelOptions.qualityOptions}
             formatOptions={panelOptions.formatOptions}
             maxImagesPerRequest={panelOptions.maxImagesPerRequest}
+            turnstileSiteKey={panelOptions.turnstileSiteKey}
+            turnstileRequired={panelOptions.turnstileRequired}
             onDraftChange={updateDraft}
+            onTurnstileToken={setTurnstileToken}
             onOptimize={() => void optimizeDraftPrompt()}
             onSubmit={(event) => void submitEdit(event)}
           />
@@ -1635,7 +1663,10 @@ function ImagePreviewEditPanel({
   qualityOptions,
   formatOptions,
   maxImagesPerRequest,
+  turnstileSiteKey,
+  turnstileRequired,
   onDraftChange,
+  onTurnstileToken,
   onOptimize,
   onSubmit,
 }: {
@@ -1647,7 +1678,10 @@ function ImagePreviewEditPanel({
   qualityOptions: readonly string[];
   formatOptions: readonly string[];
   maxImagesPerRequest: number;
+  turnstileSiteKey: string;
+  turnstileRequired: boolean;
   onDraftChange: <K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) => void;
+  onTurnstileToken: (token: string) => void;
   onOptimize: () => void;
   onSubmit: (event: FormEvent) => void;
 }) {
@@ -1723,6 +1757,10 @@ function ImagePreviewEditPanel({
                 </SegmentButton>
               ))}
             </OptionGroup>
+          </div>
+          <div className="mt-4 flex flex-col gap-3">
+            {turnstileSiteKey && <Turnstile siteKey={turnstileSiteKey} onToken={onTurnstileToken} />}
+            {turnstileRequired && !turnstileSiteKey && <Notice tone="warn" text="Turnstile 已启用，请配置站点 Key。" />}
           </div>
           {error && <p className="mt-3 text-xs leading-[18px] text-destructive">{error}</p>}
         </section>
@@ -1881,7 +1919,12 @@ function GalleryView({
     }
   }
 
-  async function createEditTaskFromImage(image: ImageItem, draft: GenerateForm, mask?: ImageSelectionMask): Promise<void> {
+  async function createEditTaskFromImage(
+    image: ImageItem,
+    draft: GenerateForm,
+    mask: ImageSelectionMask | undefined,
+    turnstileToken: string,
+  ): Promise<void> {
     if (!providerConfigured) {
       onProviderNeeded();
       throw new Error("请先配置 Provider 后再生成。");
@@ -1909,7 +1952,7 @@ function GalleryView({
       };
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
-        body: generationRequestBody(draft, "", referenceImageDraft, mask ?? null),
+        body: generationRequestBody(draft, turnstileToken, referenceImageDraft, mask ?? null),
       });
       refreshUsage();
       const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
@@ -1960,6 +2003,8 @@ function GalleryView({
                 qualityOptions,
                 formatOptions,
                 maxImagesPerRequest: config.maxImagesPerRequest,
+                turnstileSiteKey: config.turnstileSiteKey,
+                turnstileRequired: config.turnstileRequired,
                 submitting: regeneratingId === record.job.id,
                 onSubmit: createEditTaskFromImage,
               }}
