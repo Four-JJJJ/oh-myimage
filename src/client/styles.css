@@ -168,6 +168,9 @@
           rgb(110 255 48 / 0.14)
         )
         border-box;
+    box-shadow:
+      0 0 0 1px rgb(110 255 48 / 0.08),
+      0 0 32px rgb(110 255 48 / 0.08);
     animation: record-border-flow 2.4s linear infinite;
   }
 
