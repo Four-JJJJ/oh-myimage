@@ -865,7 +865,10 @@ function GenerateView({
     editTurnstileToken: string,
   ): Promise<void> {
     if (!providerConfigured) {
-      throw new Error("请先配置 Provider 后再生成。");
+      const message = "请先配置 Provider 后再生成。";
+      setError(message);
+      onProviderNeeded();
+      throw new Error(message);
     }
     if (!draft.prompt.trim()) {
       throw new Error("请输入提示词后再生成。");
@@ -1557,9 +1560,9 @@ function ImagePreviewDialog({
     }
     setSubmittingEdit(true);
     try {
-      await editOptions.onSubmit(image, draft, selectionMask, turnstileToken);
-      setSubmittingEdit(false);
+      const submitPromise = editOptions.onSubmit(image, draft, selectionMask, turnstileToken);
       onClose();
+      void submitPromise.catch(() => undefined);
     } catch (err) {
       setEditError(err instanceof Error ? err.message : "创建任务失败。");
       setSubmittingEdit(false);
