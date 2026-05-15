@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { app, hasUnlimitedDailyImageQuota } from "./index";
-import type { AppDatabase, AppObject, AppObjectStore, AppObjectStorePutOptions, AppPreparedStatement, Env } from "./types";
+import type { AppDatabase, AppObject, AppObjectStore, AppObjectStorePutOptions, AppPreparedStatement, Env, ImageAssetRecord } from "./types";
 
 describe("daily image quota exemption", () => {
   it("exempts Small Token providers without requiring a connection test", () => {
@@ -117,6 +117,148 @@ describe("generation creation", () => {
       ]),
     );
   });
+
+  it("copies source images before enqueueing edit generation jobs", async () => {
+    const db = new FakeRouteDatabase();
+    const images = new FakeObjectStore();
+    const generationQueue = new RecordingQueue();
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: "edit from existing image",
+          aspectRatio: "1:1",
+          width: 1024,
+          height: 1024,
+          quality: "auto",
+          quantity: 1,
+          outputFormat: "png",
+          compression: 100,
+          sourceImageId: "img_1",
+        }),
+      },
+      testEnv({ db, images, generationQueue }),
+    );
+    const json = (await response.json()) as { ok: true; jobId: string; status: "queued" };
+
+    expect(response.status).toBe(200);
+    expect(json.status).toBe("queued");
+    expect(generationQueue.messages).toEqual([{ jobId: json.jobId, spaceId: "space_1" }]);
+    expect(images.copyCalls.map((call) => [call.sourceKey, call.destinationKey])).toEqual([["space_1/img_1.png", `space_1/${json.jobId}/reference.png`]]);
+    expect(images.putCalls).toEqual([]);
+    expect(db.generationJobInserts[0]).toEqual(
+      expect.arrayContaining([
+        json.jobId,
+        "space_1",
+        "edit from existing image",
+        "space_1",
+        `space_1/${json.jobId}/reference.png`,
+      ]),
+    );
+  });
+
+  it("stores masks while copying source images for selected-area edits", async () => {
+    const db = new FakeRouteDatabase();
+    const images = new FakeObjectStore();
+    const generationQueue = new RecordingQueue();
+    const formData = new FormData();
+    formData.set("prompt", "edit selected area from existing image");
+    formData.set("aspectRatio", "1:1");
+    formData.set("width", "1024");
+    formData.set("height", "1024");
+    formData.set("quality", "auto");
+    formData.set("quantity", "1");
+    formData.set("outputFormat", "png");
+    formData.set("compression", "100");
+    formData.set("sourceImageId", "img_1");
+    formData.set("maskImage", new File(["mask-bytes"], "source-mask.png", { type: "image/png" }));
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token" },
+        body: formData,
+      },
+      testEnv({ db, images, generationQueue }),
+    );
+    const json = (await response.json()) as { ok: true; jobId: string; status: "queued" };
+
+    expect(response.status).toBe(200);
+    expect(generationQueue.messages).toEqual([{ jobId: json.jobId, spaceId: "space_1" }]);
+    expect(images.copyCalls.map((call) => call.destinationKey)).toEqual([`space_1/${json.jobId}/reference.png`]);
+    expect(images.putCalls.map((call) => call.key)).toEqual([`space_1/${json.jobId}/mask.png`]);
+    expect(db.generationJobInserts[0]).toEqual(
+      expect.arrayContaining([
+        json.jobId,
+        "space_1",
+        "edit selected area from existing image",
+        "space_1",
+        `space_1/${json.jobId}/reference.png`,
+        `space_1/${json.jobId}/mask.png`,
+      ]),
+    );
+  });
+
+  it("rejects requests that mix uploaded reference images with source image ids", async () => {
+    const formData = new FormData();
+    formData.set("prompt", "bad edit request");
+    formData.set("aspectRatio", "1:1");
+    formData.set("width", "1024");
+    formData.set("height", "1024");
+    formData.set("quality", "auto");
+    formData.set("quantity", "1");
+    formData.set("outputFormat", "png");
+    formData.set("compression", "100");
+    formData.set("sourceImageId", "img_1");
+    formData.set("referenceImage", new File(["reference-bytes"], "source.png", { type: "image/png" }));
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token" },
+        body: formData,
+      },
+      testEnv({ images: new FakeObjectStore(), generationQueue: new RecordingQueue() }),
+    );
+    const json = (await response.json()) as { error: { code: string } };
+
+    expect(response.status).toBe(400);
+    expect(json.error.code).toBe("reference_source_conflict");
+  });
+
+  it("rejects source image ids outside the current space", async () => {
+    const db = new FakeRouteDatabase();
+    db.imageRecords.set("foreign_img", makeImageRecord({ id: "foreign_img", space_id: "space_2", storage_key: "space_2/foreign_img.png" }));
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: "edit foreign image",
+          aspectRatio: "1:1",
+          width: 1024,
+          height: 1024,
+          quality: "auto",
+          quantity: 1,
+          outputFormat: "png",
+          compression: 100,
+          sourceImageId: "foreign_img",
+        }),
+      },
+      testEnv({ db, images: new FakeObjectStore(), generationQueue: new RecordingQueue() }),
+    );
+    const json = (await response.json()) as { error: { code: string } };
+
+    expect(response.status).toBe(404);
+    expect(json.error.code).toBe("source_image_not_found");
+  });
 });
 
 function testEnv({
@@ -146,6 +288,7 @@ function disabledQueue() {
 
 class FakeRouteDatabase implements AppDatabase {
   readonly generationJobInserts: unknown[][] = [];
+  readonly imageRecords = new Map<string, ImageAssetRecord>([["img_1", makeImageRecord()]]);
 
   prepare(query: string): AppPreparedStatement {
     return new FakeRoutePreparedStatement(this, query);
@@ -180,19 +323,8 @@ class FakeRoutePreparedStatement implements AppPreparedStatement {
       } as T;
     }
     if (this.query.includes("FROM image_assets")) {
-      return {
-        id: "img_1",
-        space_id: "space_1",
-        job_id: "job_1",
-        storage_key: "space_1/img_1.png",
-        mime_type: "image/png",
-        format: "png",
-        width: 1024,
-        height: 1024,
-        byte_size: 11,
-        sha256: "sha",
-        created_at: "2026-05-15T00:00:00.000Z",
-      } as T;
+      const image = this.db.imageRecords.get(String(this.values[0] ?? ""));
+      return image && image.space_id === this.values[1] ? (image as T) : null;
     }
     if (this.query.includes("FROM api_credentials")) {
       return {
@@ -230,6 +362,7 @@ class FakeRoutePreparedStatement implements AppPreparedStatement {
 class FakeObjectStore implements AppObjectStore {
   readonly getCalls: string[] = [];
   readonly putCalls: Array<{ key: string; value: unknown; options?: AppObjectStorePutOptions }> = [];
+  readonly copyCalls: Array<{ sourceKey: string; destinationKey: string; options?: AppObjectStorePutOptions }> = [];
   readonly presignedCalls: string[] = [];
 
   constructor(private readonly options: { presignedUrl?: string } = {}) {}
@@ -254,6 +387,11 @@ class FakeObjectStore implements AppObjectStore {
     };
   }
 
+  async copy(sourceKey: string, destinationKey: string, options?: AppObjectStorePutOptions): Promise<unknown> {
+    this.copyCalls.push({ sourceKey, destinationKey, options });
+    return {};
+  }
+
   async delete(_key: string): Promise<void> {}
 
   async createPresignedGetUrl(key: string): Promise<string> {
@@ -261,6 +399,23 @@ class FakeObjectStore implements AppObjectStore {
     if (!this.options.presignedUrl) throw new Error("Presigned URL is not configured.");
     return this.options.presignedUrl;
   }
+}
+
+function makeImageRecord(overrides: Partial<ImageAssetRecord> = {}): ImageAssetRecord {
+  return {
+    id: "img_1",
+    space_id: "space_1",
+    job_id: "job_1",
+    storage_key: "space_1/img_1.png",
+    mime_type: "image/png",
+    format: "png",
+    width: 1024,
+    height: 1024,
+    byte_size: 11,
+    sha256: "sha",
+    created_at: "2026-05-15T00:00:00.000Z",
+    ...overrides,
+  };
 }
 
 class RecordingQueue {

@@ -33,6 +33,7 @@ export interface AppObjectStore {
     options?: AppObjectStorePutOptions,
   ): Promise<unknown>;
   get(key: string): Promise<AppObject | null>;
+  copy?(sourceKey: string, destinationKey: string, options?: AppObjectStorePutOptions): Promise<unknown>;
   delete(key: string): Promise<void>;
   createPresignedGetUrl?(
     key: string,

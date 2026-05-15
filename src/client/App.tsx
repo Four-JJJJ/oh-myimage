@@ -881,18 +881,10 @@ function GenerateView({
     setImages([]);
     setElapsedSeconds(0);
     try {
-      const [file, selectionMask] = await Promise.all([
-        imageItemToFile(image),
-        maskFactory ? maskFactory() : Promise.resolve(undefined),
-      ]);
-      const referenceImageDraft: ReferenceImagePreview = {
-        file,
-        url: image.url,
-        name: file.name || "编辑参考图",
-      };
+      const selectionMask = maskFactory ? await maskFactory() : undefined;
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
-        body: generationRequestBody(draft, editTurnstileToken, referenceImageDraft, selectionMask ?? null),
+        body: generationRequestBody(draft, editTurnstileToken, null, selectionMask ?? null, image.id),
       });
       if (result.status !== "queued") {
         throw new Error("创建任务未进入队列，请稍后重试。");
@@ -1982,18 +1974,10 @@ function GalleryView({
     setActiveImages([]);
     setElapsedSeconds(0);
     try {
-      const [file, selectionMask] = await Promise.all([
-        imageItemToFile(image),
-        maskFactory ? maskFactory() : Promise.resolve(undefined),
-      ]);
-      const referenceImageDraft: ReferenceImagePreview = {
-        file,
-        url: image.url,
-        name: file.name || "编辑参考图",
-      };
+      const selectionMask = maskFactory ? await maskFactory() : undefined;
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
-        body: generationRequestBody(draft, turnstileToken, referenceImageDraft, selectionMask ?? null),
+        body: generationRequestBody(draft, turnstileToken, null, selectionMask ?? null, image.id),
       });
       if (result.status !== "queued") {
         throw new Error("创建任务未进入队列，请稍后重试。");
@@ -2383,9 +2367,10 @@ function generationRequestBody(
   turnstileToken: string,
   referenceImage: ReferenceImagePreview | null,
   maskImage?: ImageSelectionMask | null,
+  sourceImageId?: string,
 ): BodyInit {
-  if (!referenceImage) {
-    return JSON.stringify({ ...form, turnstileToken });
+  if (!referenceImage && !maskImage) {
+    return JSON.stringify({ ...form, turnstileToken, ...(sourceImageId ? { sourceImageId } : {}) });
   }
 
   const body = new FormData();
@@ -2393,7 +2378,8 @@ function generationRequestBody(
     body.set(key, String(value));
   }
   if (turnstileToken) body.set("turnstileToken", turnstileToken);
-  body.set("referenceImage", referenceImage.file, referenceImage.name);
+  if (sourceImageId) body.set("sourceImageId", sourceImageId);
+  if (referenceImage) body.set("referenceImage", referenceImage.file, referenceImage.name);
   if (maskImage) body.set("maskImage", maskImage.file, maskImage.name);
   return body;
 }

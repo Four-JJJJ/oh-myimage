@@ -1,5 +1,5 @@
 import { Readable } from "node:stream";
-import { DeleteObjectCommand, GetObjectCommand, GetObjectCommandOutput, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { CopyObjectCommand, DeleteObjectCommand, GetObjectCommand, GetObjectCommandOutput, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import type { AppObject, AppObjectStore, AppObjectStorePutOptions } from "../worker/types";
 
@@ -61,6 +61,21 @@ class S3ObjectStore implements AppObjectStore {
     }
   }
 
+  async copy(sourceKey: string, destinationKey: string, options?: AppObjectStorePutOptions): Promise<unknown> {
+    await this.client.send(
+      new CopyObjectCommand({
+        Bucket: this.bucket,
+        Key: destinationKey,
+        CopySource: s3CopySource(this.bucket, sourceKey),
+        ContentType: options?.httpMetadata?.contentType,
+        ContentDisposition: options?.httpMetadata?.contentDisposition,
+        Metadata: options?.customMetadata,
+        MetadataDirective: "REPLACE",
+      }),
+    );
+    return {};
+  }
+
   async delete(key: string): Promise<void> {
     await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
   }
@@ -81,6 +96,10 @@ class S3ObjectStore implements AppObjectStore {
     });
     return getSignedUrl(this.client, command, { expiresIn: options?.expiresInSeconds ?? 300 });
   }
+}
+
+function s3CopySource(bucket: string, key: string): string {
+  return `${bucket}/${key.split("/").map(encodeURIComponent).join("/")}`;
 }
 
 class S3Object implements AppObject {

@@ -44,6 +44,7 @@ import { GenerationInput, parseGenerationInput, parsePromptOptimizationInput, RA
 
 const SESSION_COOKIE = "image2_session";
 const SESSION_DAYS = 30;
+const SOURCE_IMAGE_ID_FIELD = "sourceImageId";
 const REFERENCE_IMAGE_FIELD = "referenceImage";
 const MASK_IMAGE_FIELD = "maskImage";
 const REFERENCE_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
@@ -122,6 +123,50 @@ async function storeReferenceImage(env: Env, spaceId: string, jobId: string, fil
     mimeType,
     name,
     byteSize: bytes.byteLength,
+  };
+}
+
+async function cloneSourceImageAsReference(env: Env, spaceId: string, jobId: string, sourceImageId: string): Promise<StoredReferenceImage> {
+  const sourceImage = await getImage(env.DB, spaceId, sourceImageId);
+  if (!sourceImage) {
+    throw jsonError(404, "source_image_not_found", "源图片不存在。");
+  }
+
+  const mimeType = normalizeReferenceImageMime(sourceImage.mime_type);
+  if (!REFERENCE_IMAGE_MIME_TYPES.has(mimeType)) {
+    throw jsonError(400, "invalid_source_image", "源图片格式不支持编辑。");
+  }
+
+  const extension = extensionForReferenceImage(mimeType);
+  const name = safeReferenceImageName(`${sourceImage.id}.${extension}`, extension);
+  const storageKey = `${spaceId}/${jobId}/reference.${extension}`;
+  const putOptions = {
+    httpMetadata: {
+      contentType: mimeType,
+      contentDisposition: `inline; filename="${name}"`,
+    },
+    customMetadata: {
+      jobId,
+      spaceId,
+      kind: "reference",
+    },
+  };
+
+  if (env.IMAGES.copy) {
+    await env.IMAGES.copy(sourceImage.storage_key, storageKey, putOptions);
+  } else {
+    const sourceObject = await env.IMAGES.get(sourceImage.storage_key);
+    if (!sourceObject) {
+      throw jsonError(404, "source_image_file_missing", "源图片文件不存在。");
+    }
+    await env.IMAGES.put(storageKey, await sourceObject.arrayBuffer(), putOptions);
+  }
+
+  return {
+    storageKey,
+    mimeType,
+    name,
+    byteSize: sourceImage.byte_size,
   };
 }
 
@@ -516,6 +561,8 @@ app.post("/api/generations", async (c) => {
   const requestPayload = await parseGenerationRequest(c.req.raw);
   const parsed = parseGenerationInput(requestPayload.body, c.env.MAX_IMAGES_PER_REQUEST);
   if (!parsed.input) throw jsonError(400, "invalid_generation_input", parsed.error ?? "生图参数不正确。");
+  const sourceImageId =
+    typeof requestPayload.body?.[SOURCE_IMAGE_ID_FIELD] === "string" ? requestPayload.body[SOURCE_IMAGE_ID_FIELD].trim() : "";
 
   const turnstileOk = await verifyTurnstile(parsed.input.turnstileToken, c.req.raw, c.env);
   if (!turnstileOk) throw jsonError(403, "turnstile_failed", "人机验证失败。");
@@ -525,14 +572,19 @@ app.post("/api/generations", async (c) => {
   if (!credential) throw jsonError(400, "provider_missing", "请先在设置中配置 baseURL 和 API Key。");
   await assertGenerationLimitsForRequest(c.env, space.id, parsed.input.quantity, credential);
 
-  if (requestPayload.maskImage && !requestPayload.referenceImage) {
+  if (requestPayload.referenceImage && sourceImageId) {
+    throw jsonError(400, "reference_source_conflict", "参考图上传和源图片编辑不能同时使用。");
+  }
+  if (requestPayload.maskImage && !requestPayload.referenceImage && !sourceImageId) {
     throw jsonError(400, "mask_requires_reference_image", "选区遮罩需要和参考图一起提交。");
   }
 
   const jobId = randomId("job");
   const referenceImage = requestPayload.referenceImage
     ? await storeReferenceImage(c.env, space.id, jobId, requestPayload.referenceImage)
-    : undefined;
+    : sourceImageId
+      ? await cloneSourceImageAsReference(c.env, space.id, jobId, sourceImageId)
+      : undefined;
   const maskImage = requestPayload.maskImage ? await storeMaskImage(c.env, space.id, jobId, requestPayload.maskImage) : undefined;
 
   await createGenerationJob(
