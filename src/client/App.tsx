@@ -861,7 +861,7 @@ function GenerateView({
   async function createEditTaskFromImage(
     image: ImageItem,
     draft: GenerateForm,
-    mask: ImageSelectionMask | undefined,
+    maskFactory: ImageSelectionMaskFactory | undefined,
     editTurnstileToken: string,
   ): Promise<void> {
     if (!providerConfigured) {
@@ -871,7 +871,9 @@ function GenerateView({
       throw new Error(message);
     }
     if (!draft.prompt.trim()) {
-      throw new Error("请输入提示词后再生成。");
+      const message = "请输入提示词后再生成。";
+      setError(message);
+      throw new Error(message);
     }
 
     setLoading(true);
@@ -879,7 +881,10 @@ function GenerateView({
     setImages([]);
     setElapsedSeconds(0);
     try {
-      const file = await imageItemToFile(image);
+      const [file, selectionMask] = await Promise.all([
+        imageItemToFile(image),
+        maskFactory ? maskFactory() : Promise.resolve(undefined),
+      ]);
       const referenceImageDraft: ReferenceImagePreview = {
         file,
         url: image.url,
@@ -887,15 +892,24 @@ function GenerateView({
       };
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
-        body: generationRequestBody(draft, editTurnstileToken, referenceImageDraft, mask ?? null),
+        body: generationRequestBody(draft, editTurnstileToken, referenceImageDraft, selectionMask ?? null),
       });
+      if (result.status !== "queued") {
+        throw new Error("创建任务未进入队列，请稍后重试。");
+      }
       refreshUsage();
-      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
-      setJob(firstPoll.job);
-      setImages(firstPoll.images);
-      upsertRecord(firstPoll.job, firstPoll.images);
-      if (isTerminalJobStatus(firstPoll.job.status)) refreshUsage();
-      void loadRecords(undefined, { background: true });
+      void (async () => {
+        try {
+          const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+          setJob(firstPoll.job);
+          setImages(firstPoll.images);
+          upsertRecord(firstPoll.job, firstPoll.images);
+          if (isTerminalJobStatus(firstPoll.job.status)) refreshUsage();
+          void loadRecords(undefined, { background: true });
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "刷新任务状态失败。");
+        }
+      })();
     } catch (err) {
       const message = err instanceof Error ? err.message : "创建任务失败。";
       setError(message);
@@ -1335,8 +1349,10 @@ interface ImagePreviewEditOptions {
   turnstileSiteKey: string;
   turnstileRequired: boolean;
   submitting: boolean;
-  onSubmit?: (image: ImageItem, draft: GenerateForm, mask: ImageSelectionMask | undefined, turnstileToken: string) => Promise<void>;
+  onSubmit?: (image: ImageItem, draft: GenerateForm, maskFactory: ImageSelectionMaskFactory | undefined, turnstileToken: string) => Promise<void>;
 }
+
+type ImageSelectionMaskFactory = () => Promise<ImageSelectionMask>;
 
 const fallbackImagePreviewEditOptions = {
   initialForm: defaultForm,
@@ -1532,20 +1548,34 @@ function ImagePreviewDialog({
     event.preventDefault();
     if (panelOptions.submitting || submittingEdit) return;
     setEditError("");
-    let selectionMask: ImageSelectionMask | undefined;
+    if (!draft.prompt.trim()) {
+      setEditError("请输入提示词后再生成。");
+      return;
+    }
+
+    let maskFactory: ImageSelectionMaskFactory | undefined;
     if (selectionEditing) {
       if (selectionStrokes.length === 0) {
         setEditError("请先涂抹要优化的区域。");
         return;
       }
-      try {
-        selectionMask = await createSelectionMask(image, selectionStrokes);
-      } catch (err) {
-        setEditError(err instanceof Error ? err.message : "选区遮罩生成失败。");
-        return;
-      }
+      const maskStrokes = selectionStrokes.map((stroke) => ({
+        ...stroke,
+        points: [...stroke.points],
+      }));
+      maskFactory = () => createSelectionMask(image, maskStrokes);
     }
+
     if (!editOptions?.onSubmit) {
+      let selectionMask: ImageSelectionMask | undefined;
+      if (maskFactory) {
+        try {
+          selectionMask = await maskFactory();
+        } catch (err) {
+          setEditError(err instanceof Error ? err.message : "选区遮罩生成失败。");
+          return;
+        }
+      }
       onEdit(draft, selectionMask);
       onClose();
       return;
@@ -1560,9 +1590,8 @@ function ImagePreviewDialog({
     }
     setSubmittingEdit(true);
     try {
-      const submitPromise = editOptions.onSubmit(image, draft, selectionMask, turnstileToken);
+      await editOptions.onSubmit(image, draft, maskFactory, turnstileToken);
       onClose();
-      void submitPromise.catch(() => undefined);
     } catch (err) {
       setEditError(err instanceof Error ? err.message : "创建任务失败。");
       setSubmittingEdit(false);
@@ -1925,10 +1954,11 @@ function GalleryView({
   async function createEditTaskFromImage(
     image: ImageItem,
     draft: GenerateForm,
-    mask: ImageSelectionMask | undefined,
+    maskFactory: ImageSelectionMaskFactory | undefined,
     turnstileToken: string,
   ): Promise<void> {
     if (!providerConfigured) {
+      setError("请先配置 Provider 后再生成。");
       onProviderNeeded();
       throw new Error("请先配置 Provider 后再生成。");
     }
@@ -1938,7 +1968,9 @@ function GalleryView({
       throw new Error(message);
     }
     if (regeneratingId) {
-      throw new Error("已有生成任务正在提交，请稍后再试。");
+      const message = "已有生成任务正在提交，请稍后再试。";
+      setError(message);
+      throw new Error(message);
     }
 
     setRegeneratingId(image.jobId);
@@ -1947,7 +1979,10 @@ function GalleryView({
     setActiveImages([]);
     setElapsedSeconds(0);
     try {
-      const file = await imageItemToFile(image);
+      const [file, selectionMask] = await Promise.all([
+        imageItemToFile(image),
+        maskFactory ? maskFactory() : Promise.resolve(undefined),
+      ]);
       const referenceImageDraft: ReferenceImagePreview = {
         file,
         url: image.url,
@@ -1955,15 +1990,24 @@ function GalleryView({
       };
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
-        body: generationRequestBody(draft, turnstileToken, referenceImageDraft, mask ?? null),
+        body: generationRequestBody(draft, turnstileToken, referenceImageDraft, selectionMask ?? null),
       });
+      if (result.status !== "queued") {
+        throw new Error("创建任务未进入队列，请稍后重试。");
+      }
       refreshUsage();
-      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
-      setActiveJob(firstPoll.job);
-      setActiveImages(firstPoll.images);
-      upsertRecord(firstPoll.job, firstPoll.images);
-      if (isTerminalJobStatus(firstPoll.job.status)) refreshUsage();
-      void loadRecords(undefined, { background: true });
+      void (async () => {
+        try {
+          const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+          setActiveJob(firstPoll.job);
+          setActiveImages(firstPoll.images);
+          upsertRecord(firstPoll.job, firstPoll.images);
+          if (isTerminalJobStatus(firstPoll.job.status)) refreshUsage();
+          void loadRecords(undefined, { background: true });
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "刷新任务状态失败。");
+        }
+      })();
     } catch (err) {
       const message = err instanceof Error ? err.message : "创建任务失败。";
       setError(message);

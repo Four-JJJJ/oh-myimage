@@ -33,7 +33,7 @@ interface ProviderTextResponse {
   output?: unknown;
 }
 
-interface ImageGenerationPayload {
+export interface ImageGenerationPayload {
   model: string;
   prompt: string;
   n: number;
@@ -56,6 +56,10 @@ const DEFAULT_RESPONSES_MODEL = "gpt-5.5";
 const DEFAULT_PROMPT_OPTIMIZER_MODEL = DEFAULT_RESPONSES_MODEL;
 const DEFAULT_PROMPT_OPTIMIZER_TIMEOUT_MS = 45_000;
 const PROMPT_OPTIMIZER_MODELS = new Set(["gpt-5.5", "gpt-5.4"]);
+const MASKED_IMAGE_EDIT_PROMPT_SUFFIX = [
+  "Only edit the area selected by the alpha mask's transparent pixels.",
+  "Preserve every unmasked area of the input image, including composition, objects, lighting, texture, and background, as unchanged as possible.",
+].join(" ");
 
 interface StoredGenerationImage {
   revisedPrompt: string | null;
@@ -354,14 +358,11 @@ async function providerRequestBody(job: GenerationJobRecord, env: Env): Promise<
   }
 
   const referenceImage = await loadReferenceImageBlob(job, env);
-  const formData = new FormData();
-  appendImageGenerationFormFields(formData, payload);
-  formData.append("image", referenceImage.blob, referenceImage.filename);
+  let maskImage: ProviderImageFilePart | undefined;
   if (job.mask_image_storage_key) {
-    const maskImage = await loadMaskImageBlob(job, env);
-    formData.append("mask", maskImage.blob, maskImage.filename);
+    maskImage = await loadMaskImageBlob(job, env);
   }
-  return formData;
+  return buildImageGenerationFormData(payload, referenceImage, maskImage);
 }
 
 function providerRequestHeaders(apiKey: string, body: BodyInit): HeadersInit {
@@ -461,7 +462,7 @@ export function extractResponsesOutputText(response: ProviderTextResponse): stri
 export function buildImageGenerationPayload(job: GenerationJobRecord, count: number): ImageGenerationPayload {
   const payload: ImageGenerationPayload = {
     model: job.model,
-    prompt: job.prompt,
+    prompt: buildProviderImagePrompt(job),
     n: count,
     size: `${job.width}x${job.height}`,
     quality: job.quality,
@@ -474,6 +475,12 @@ export function buildImageGenerationPayload(job: GenerationJobRecord, count: num
     payload.output_compression = job.compression;
   }
   return payload;
+}
+
+export function buildProviderImagePrompt(job: Pick<GenerationJobRecord, "prompt" | "mask_image_storage_key">): string {
+  const prompt = job.prompt.trim();
+  if (!job.mask_image_storage_key) return prompt;
+  return [prompt, MASKED_IMAGE_EDIT_PROMPT_SUFFIX].filter(Boolean).join("\n\n");
 }
 
 export function imageGenerationEndpointPath(job: Pick<GenerationJobRecord, "reference_image_storage_key">): "/images/edits" | "/images/generations" {
@@ -527,6 +534,25 @@ function promptRequestsTransparentBackground(prompt: string): boolean {
     /\bcutout\b/,
   ];
   return positivePatterns.some((pattern) => pattern.test(normalized));
+}
+
+export interface ProviderImageFilePart {
+  blob: Blob;
+  filename: string;
+}
+
+export function buildImageGenerationFormData(
+  payload: ImageGenerationPayload,
+  referenceImage: ProviderImageFilePart,
+  maskImage?: ProviderImageFilePart,
+): FormData {
+  const formData = new FormData();
+  appendImageGenerationFormFields(formData, payload);
+  formData.append("image[]", referenceImage.blob, referenceImage.filename);
+  if (maskImage) {
+    formData.append("mask", maskImage.blob, maskImage.filename);
+  }
+  return formData;
 }
 
 function appendImageGenerationFormFields(formData: FormData, payload: ImageGenerationPayload): void {

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildImageGenerationFormData,
   buildImageGenerationPayload,
+  buildProviderImagePrompt,
   extractResponsesOutputText,
   imageGenerationEndpointPath,
   providerErrorCode,
@@ -111,6 +113,64 @@ describe("Image API generation helpers", () => {
       moderation: "auto",
       user: "space_1",
     });
+  });
+
+  it("keeps reference-only edit prompts unchanged", () => {
+    const payload = buildImageGenerationPayload(makeJob({ reference_image_storage_key: "space/job/reference.png" }), 1);
+
+    expect(payload.prompt).toBe("product shot");
+  });
+
+  it("adds provider-only mask instructions for selected-area edits", () => {
+    const payload = buildImageGenerationPayload(
+      makeJob({
+        prompt: "把选区改成玻璃舷窗",
+        reference_image_storage_key: "space/job/reference.png",
+        mask_image_storage_key: "space/job/mask.png",
+      }),
+      1,
+    );
+
+    expect(payload.prompt).toContain("把选区改成玻璃舷窗");
+    expect(payload.prompt).toContain("Only edit the area selected by the alpha mask's transparent pixels.");
+    expect(payload.prompt).toContain("Preserve every unmasked area");
+  });
+
+  it("uses the original prompt when resolving masked edit background behavior", () => {
+    const payload = buildImageGenerationPayload(
+      makeJob({
+        prompt: "把选区改成玻璃舷窗",
+        reference_image_storage_key: "space/job/reference.png",
+        mask_image_storage_key: "space/job/mask.png",
+      }),
+      1,
+    );
+
+    expect(payload.background).toBe("auto");
+  });
+
+  it("builds Image Edits multipart fields with image array and optional mask", () => {
+    const payload = buildImageGenerationPayload(
+      makeJob({
+        reference_image_storage_key: "space/job/reference.png",
+        mask_image_storage_key: "space/job/mask.png",
+      }),
+      1,
+    );
+    const formData = buildImageGenerationFormData(
+      payload,
+      { blob: new Blob(["reference"], { type: "image/png" }), filename: "source.png" },
+      { blob: new Blob(["mask"], { type: "image/png" }), filename: "source-mask.png" },
+    );
+    const referenceImage = formData.get("image[]") as File;
+    const maskImage = formData.get("mask") as File;
+
+    expect(formData.get("image")).toBeNull();
+    expect(formData.get("prompt")).toBe(buildProviderImagePrompt(makeJob({ mask_image_storage_key: "space/job/mask.png" })));
+    expect(referenceImage).toBeInstanceOf(File);
+    expect(referenceImage.name).toBe("source.png");
+    expect(maskImage).toBeInstanceOf(File);
+    expect(maskImage.name).toBe("source-mask.png");
   });
 
   it("includes compression for jpeg and webp Image API payloads", () => {
