@@ -3,8 +3,11 @@ import {
   countDailyGeneratedImages,
   countDailyImageUsage,
   countPendingGenerationImages,
+  countRateLimitEvents,
+  countSecurityEvents,
   IMAGE_GENERATED_EVENT,
   insertImageUsageEvent,
+  insertSecurityEvent,
 } from "./db";
 import type { AppDatabase, AppPreparedStatement } from "./types";
 
@@ -110,5 +113,35 @@ describe("daily image usage accounting", () => {
       method: "run",
       values: ["evt_usage_img_abc", "space_1", IMAGE_GENERATED_EVENT],
     });
+  });
+
+  it("counts recent rate limit events by space and event type", async () => {
+    const db = new FakeDatabase([{ count: "5" }]);
+
+    await expect(countRateLimitEvents(db, "space_1", "space_login_failure:key:ip", "2026-05-15 08:00:00")).resolves.toBe(5);
+
+    expect(db.calls[0]).toMatchObject({
+      method: "first",
+      values: ["space_1", "space_login_failure:key:ip", "2026-05-15 08:00:00"],
+    });
+    expect(db.calls[0]?.query).toContain("FROM rate_limit_events");
+    expect(db.calls[0]?.query).toContain("created_at >= ?");
+  });
+
+  it("records and counts security events outside a space", async () => {
+    const db = new FakeDatabase([{ count: "10" }]);
+
+    await insertSecurityEvent(db, "ip:fingerprint", "space_creation");
+    await expect(countSecurityEvents(db, "ip:fingerprint", "space_creation", "2026-05-15 08:00:00")).resolves.toBe(10);
+
+    expect(db.calls[0]).toMatchObject({
+      method: "run",
+      values: [expect.stringMatching(/^sec_/), "ip:fingerprint", "space_creation"],
+    });
+    expect(db.calls[1]).toMatchObject({
+      method: "first",
+      values: ["ip:fingerprint", "space_creation", "2026-05-15 08:00:00"],
+    });
+    expect(db.calls[1]?.query).toContain("FROM security_events");
   });
 });

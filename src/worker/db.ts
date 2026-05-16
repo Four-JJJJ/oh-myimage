@@ -336,6 +336,41 @@ export async function insertRateLimitEvent(db: AppDatabase, spaceId: string, eve
     .run();
 }
 
+export async function countRateLimitEvents(db: AppDatabase, spaceId: string, eventType: string, sinceTimestamp: string): Promise<number> {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM rate_limit_events
+       WHERE space_id = ?
+         AND event_type = ?
+         AND created_at >= ?`,
+    )
+    .bind(spaceId, eventType, sinceTimestamp)
+    .first<{ count: number | string }>();
+  return dbNumber(row?.count);
+}
+
+export async function insertSecurityEvent(db: AppDatabase, eventKey: string, eventType: string): Promise<void> {
+  await db
+    .prepare("INSERT INTO security_events (id, event_key, event_type) VALUES (?, ?, ?)")
+    .bind(randomId("sec"), eventKey, eventType)
+    .run();
+}
+
+export async function countSecurityEvents(db: AppDatabase, eventKey: string, eventType: string, sinceTimestamp: string): Promise<number> {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM security_events
+       WHERE event_key = ?
+         AND event_type = ?
+         AND created_at >= ?`,
+    )
+    .bind(eventKey, eventType, sinceTimestamp)
+    .first<{ count: number | string }>();
+  return dbNumber(row?.count);
+}
+
 export async function insertImageUsageEvent(db: AppDatabase, spaceId: string, imageId: string): Promise<void> {
   await db
     .prepare("INSERT INTO rate_limit_events (id, space_id, event_type) VALUES (?, ?, ?)")

@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { lookup } from "node:dns/promises";
 import { createPostgresDatabase, PostgresD1Database } from "./postgres-d1";
 import { createBullQueues, BullQueues } from "./queue";
 import { createR2Store } from "./r2-store";
@@ -33,6 +34,13 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions = {}): NodeR
     }),
     GENERATION_QUEUE: queues?.generationQueue ?? disabledQueue("generation"),
     INSPIRATION_QUEUE: queues?.inspirationQueue ?? disabledQueue("inspiration"),
+    RESOLVE_BASE_URL_ADDRESSES: async (hostname) =>
+      (await lookup(hostname, { all: true, verbatim: true })).map((item) => ({
+        address: item.address,
+        family: item.family === 6 ? 6 : 4,
+      })),
+    PROVIDER_BASE_URL_ALLOWLIST: process.env.PROVIDER_BASE_URL_ALLOWLIST ?? "",
+    TRUST_PROXY_HEADERS: process.env.TRUST_PROXY_HEADERS ?? "false",
     APP_ENCRYPTION_KEY: requiredEnv("APP_ENCRYPTION_KEY"),
     TURNSTILE_SECRET_KEY: process.env.TURNSTILE_SECRET_KEY ?? "",
     TURNSTILE_SITE_KEY: process.env.TURNSTILE_SITE_KEY ?? "",

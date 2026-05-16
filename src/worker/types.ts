@@ -55,6 +55,9 @@ export interface Env {
   ASSETS?: Fetcher;
   GENERATION_QUEUE: AppQueue<GenerationMessage>;
   INSPIRATION_QUEUE: AppQueue<InspirationQueueMessage>;
+  RESOLVE_BASE_URL_ADDRESSES?: (hostname: string) => Promise<Array<string | { address: string; family?: 4 | 6 }>>;
+  PROVIDER_BASE_URL_ALLOWLIST?: string;
+  TRUST_PROXY_HEADERS?: string;
   APP_ENCRYPTION_KEY?: string;
   TURNSTILE_SECRET_KEY?: string;
   TURNSTILE_SITE_KEY?: string;
