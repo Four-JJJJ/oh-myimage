@@ -1,9 +1,12 @@
 import { Hono } from "hono";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { cors } from "hono/cors";
+import { HTTPException } from "hono/http-exception";
 import {
   countActiveJobs,
   countDailyImageUsage,
+  countRateLimitEvents,
+  countSecurityEvents,
   createGenerationJob,
   deleteGenerationJob,
   createSession,
@@ -16,6 +19,7 @@ import {
   getSession,
   getSpaceByKey,
   insertRateLimitEvent,
+  insertSecurityEvent,
   listGenerationJobs,
   listImages,
   listImagesForJob,
@@ -23,10 +27,18 @@ import {
   markCredentialTested,
   StoredReferenceImage,
   upsertCredential,
+  updateJobStatus,
 } from "./db";
 import { apiKeyHint, decryptSecret, encryptSecret, hashPassword, makeSessionToken, sha256Hex, verifyPassword } from "./crypto";
 import { daysFromNow, envNumber, jsonError, randomId } from "./http";
-import { buildProviderEndpoint, isTokenFourjBaseURL, normalizeSpaceName, validateBaseURL, verifyTurnstile } from "./security";
+import {
+  buildProviderEndpoint,
+  isTokenFourjBaseURL,
+  normalizeSpaceName,
+  validateBaseURL,
+  validateResolvedBaseURL,
+  verifyTurnstile,
+} from "./security";
 import { optimizePrompt, processGenerationMessage, ProviderError, resolveGenerationTimeoutMs, testProvider } from "./provider";
 import {
   getInspirationItem,
@@ -57,14 +69,25 @@ const DEFAULT_PROVIDER_RETRY_ATTEMPTS = 2;
 const MAX_PROVIDER_RETRY_ATTEMPTS = 4;
 const DEFAULT_PROVIDER_RETRY_DELAY_SECONDS = 120;
 const MAX_PROVIDER_RETRY_DELAY_SECONDS = 600;
+const SPACE_LOGIN_FAILURE_EVENT_PREFIX = "space_login_failure";
+const SPACE_LOGIN_FAILURE_LIMIT = 5;
+const SPACE_LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
+const SPACE_CREATION_EVENT_TYPE = "space_creation";
+const SPACE_CREATION_LIMIT = 10;
+const SPACE_CREATION_WINDOW_MS = 15 * 60 * 1000;
+const DEFAULT_PROVIDER_BASE_URL_HOSTS = ["api.openai.com", "token.fourj.space", "image.fourj.space"];
 
 export const app = new Hono<AppBindings>();
 
 app.use("/api/*", cors({ origin: [], credentials: true }));
 
 app.onError((error, c) => {
+  if (error instanceof HTTPException) {
+    if (error.status >= 500) console.error(error);
+    if (error.res instanceof Response) return error.res;
+    return c.json({ ok: false, error: { code: "http_error", message: error.message } }, error.status as never);
+  }
   console.error(error);
-  if ("res" in error && error.res instanceof Response) return error.res;
   return c.json({ ok: false, error: { code: "internal_error", message: "服务暂时不可用。" } }, 500);
 });
 
@@ -244,6 +267,95 @@ function dailyImageLimit(env: Env): number {
   return Math.max(0, Math.trunc(envNumber(env.MAX_DAILY_IMAGES_PER_SPACE ?? env.MAX_DAILY_JOBS_PER_SPACE, 50)));
 }
 
+async function assertSpaceLoginNotRateLimited(env: Env, spaceId: string, failureEventType: string): Promise<void> {
+  const since = timestampFromDate(new Date(Date.now() - SPACE_LOGIN_FAILURE_WINDOW_MS));
+  const failures = await countRateLimitEvents(env.DB, spaceId, failureEventType, since);
+  if (failures >= SPACE_LOGIN_FAILURE_LIMIT) {
+    throw jsonError(429, "space_login_rate_limited", "登录失败次数过多，请稍后再试。");
+  }
+}
+
+async function assertSpaceCreationNotRateLimited(env: Env, request: Request): Promise<string> {
+  const eventKey = await spaceCreationEventKey(env, request);
+  const since = timestampFromDate(new Date(Date.now() - SPACE_CREATION_WINDOW_MS));
+  const creations = await countSecurityEvents(env.DB, eventKey, SPACE_CREATION_EVENT_TYPE, since);
+  if (creations >= SPACE_CREATION_LIMIT) {
+    throw jsonError(429, "space_creation_rate_limited", "空间创建过于频繁，请稍后再试。");
+  }
+  return eventKey;
+}
+
+async function spaceLoginFailureEventType(env: Env, spaceKey: string, request: Request): Promise<string> {
+  const ipFingerprint = await sha256Hex(clientIp(env, request));
+  const spaceFingerprint = await sha256Hex(spaceKey);
+  return `${SPACE_LOGIN_FAILURE_EVENT_PREFIX}:${spaceFingerprint.slice(0, 16)}:${ipFingerprint.slice(0, 16)}`;
+}
+
+async function spaceCreationEventKey(env: Env, request: Request): Promise<string> {
+  const ipFingerprint = await sha256Hex(clientIp(env, request));
+  return `ip:${ipFingerprint.slice(0, 32)}`;
+}
+
+function clientIp(env: Env, request: Request): string {
+  const cloudflareIp = request.headers.get("CF-Connecting-IP")?.trim();
+  if (cloudflareIp) return cloudflareIp;
+  if (env.TRUST_PROXY_HEADERS === "true") {
+    const directIp = request.headers.get("True-Client-IP") ?? request.headers.get("X-Real-IP");
+    if (directIp?.trim()) return directIp.trim();
+    const forwardedFor = request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim();
+    if (forwardedFor) return forwardedFor;
+  }
+  return "unknown";
+}
+
+function timestampFromDate(date: Date): string {
+  return date.toISOString().slice(0, 19).replace("T", " ");
+}
+
+function providerOriginChanged(existingBaseURL: string, nextBaseURL: string): boolean {
+  try {
+    return new URL(existingBaseURL).origin !== new URL(nextBaseURL).origin;
+  } catch {
+    return true;
+  }
+}
+
+async function validateProviderBaseURL(env: Env, value: string) {
+  if (env.RESOLVE_BASE_URL_ADDRESSES) return validateResolvedBaseURL(value, env.RESOLVE_BASE_URL_ADDRESSES);
+
+  const validation = validateBaseURL(value);
+  if (!validation.ok || !validation.normalized) return validation;
+  if (!providerBaseURLAllowedWithoutResolver(env, validation.normalized)) {
+    return {
+      ok: false,
+      error: "baseURL 当前运行环境无法执行 DNS 安全校验，请使用允许列表中的公开域名或配置 DNS 校验。",
+    };
+  }
+  return validation;
+}
+
+function providerBaseURLAllowedWithoutResolver(env: Env, normalizedBaseURL: string): boolean {
+  const hostname = new URL(normalizedBaseURL).hostname.toLowerCase().replace(/\.$/, "");
+  const configuredHosts =
+    env.PROVIDER_BASE_URL_ALLOWLIST?.split(",")
+      .map((host) => host.trim().toLowerCase().replace(/\.$/, ""))
+      .filter(Boolean) ?? [];
+  return [...DEFAULT_PROVIDER_BASE_URL_HOSTS, ...configuredHosts].includes(hostname);
+}
+
+async function enqueueGenerationJobOrFail(env: Env, jobId: string, spaceId: string): Promise<void> {
+  try {
+    await env.GENERATION_QUEUE.send({ jobId, spaceId });
+  } catch (error) {
+    try {
+      await updateJobStatus(env.DB, jobId, "failed", "queue_send_failed", "生成任务入队失败，请稍后重试。");
+    } catch (updateError) {
+      console.error("failed to mark generation job after queue send failure", updateError);
+    }
+    throw jsonError(503, "queue_send_failed", "生成任务入队失败，请稍后重试。");
+  }
+}
+
 function generationInputFromJob(job: GenerationJobRecord): GenerationInput {
   return {
     prompt: job.prompt,
@@ -368,10 +480,17 @@ app.post("/api/auth/space-login", async (c) => {
   const normalized = normalizeSpaceName(spaceName);
   let space = await getSpaceByKey(c.env.DB, normalized.key);
   if (space) {
+    const failureEventType = await spaceLoginFailureEventType(c.env, normalized.key, c.req.raw);
+    await assertSpaceLoginNotRateLimited(c.env, space.id, failureEventType);
     const ok = await verifyPassword(password, space.password_hash);
-    if (!ok) throw jsonError(401, "invalid_credentials", "空间名或密码不正确。");
+    if (!ok) {
+      await insertRateLimitEvent(c.env.DB, space.id, failureEventType);
+      throw jsonError(401, "invalid_credentials", "空间名或密码不正确。");
+    }
   } else {
+    const creationEventKey = await assertSpaceCreationNotRateLimited(c.env, c.req.raw);
     space = await createSpace(c.env.DB, normalized.displayName, normalized.key, await hashPassword(password));
+    await insertSecurityEvent(c.env.DB, creationEventKey, SPACE_CREATION_EVENT_TYPE);
   }
 
   const token = makeSessionToken();
@@ -459,12 +578,15 @@ app.post("/api/settings/provider", async (c) => {
   if (!body || typeof body !== "object") throw jsonError(400, "invalid_request", "请求体格式不正确。");
   const { baseURL, apiKey, model, promptOptimizerModel } = body as Record<string, unknown>;
   if (typeof baseURL !== "string") throw jsonError(400, "invalid_base_url", "请输入 baseURL。");
-  const validation = validateBaseURL(baseURL);
+  const validation = await validateProviderBaseURL(c.env, baseURL);
   if (!validation.ok || !validation.normalized) throw jsonError(400, "invalid_base_url", validation.error ?? "baseURL 不合法。");
   const existingCredential = await getCredential(c.env.DB, c.get("space").id);
   const rawApiKey = typeof apiKey === "string" ? apiKey.trim() : "";
   if (rawApiKey && rawApiKey.length < 8) throw jsonError(400, "invalid_api_key", "请输入有效 API Key。");
   if (!rawApiKey && !existingCredential) throw jsonError(400, "invalid_api_key", "请输入有效 API Key。");
+  if (!rawApiKey && existingCredential && providerOriginChanged(existingCredential.base_url, validation.normalized)) {
+    throw jsonError(400, "invalid_api_key", "baseURL 主机变化后需要重新输入 API Key。");
+  }
   const selectedModel = optionOrFallback(typeof model === "string" ? model : c.env.DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS);
   const selectedPromptOptimizerModel = optionOrFallback(
     typeof promptOptimizerModel === "string" ? promptOptimizerModel : c.env.PROMPT_OPTIMIZER_MODEL,
@@ -512,7 +634,7 @@ app.post("/api/provider/test", async (c) => {
 
   if (body && typeof body === "object" && typeof (body as Record<string, unknown>).baseURL === "string") {
     const raw = body as Record<string, unknown>;
-    const validation = validateBaseURL(raw.baseURL as string);
+    const validation = await validateProviderBaseURL(c.env, raw.baseURL as string);
     if (!validation.ok || !validation.normalized) throw jsonError(400, "invalid_base_url", validation.error ?? "baseURL 不合法。");
     const rawApiKey = typeof raw.apiKey === "string" ? raw.apiKey.trim() : "";
     baseURL = validation.normalized;
@@ -521,6 +643,9 @@ app.post("/api/provider/test", async (c) => {
     } else {
       const credential = await getCredential(c.env.DB, spaceId);
       if (!credential) throw jsonError(400, "invalid_api_key", "请输入 API Key。");
+      if (providerOriginChanged(credential.base_url, baseURL)) {
+        throw jsonError(400, "invalid_api_key", "baseURL 主机变化后需要重新输入 API Key。");
+      }
       apiKey = await decryptSecret(credential.encrypted_api_key, c.env.APP_ENCRYPTION_KEY ?? "");
     }
   } else {
@@ -597,7 +722,7 @@ app.post("/api/generations", async (c) => {
     maskImage,
     jobId,
   );
-  await c.env.GENERATION_QUEUE.send({ jobId, spaceId: space.id });
+  await enqueueGenerationJobOrFail(c.env, jobId, space.id);
   return c.json({ ok: true, jobId, status: "queued" });
 });
 
@@ -661,6 +786,11 @@ app.post("/api/generations/:jobId/regenerate", async (c) => {
   const sourceJob = await getGenerationJob(c.env.DB, space.id, c.req.param("jobId"));
   if (!sourceJob) throw jsonError(404, "job_not_found", "任务不存在。");
 
+  const body = await c.req.json().catch(() => null);
+  const turnstileToken = body && typeof body === "object" ? (body as Record<string, unknown>).turnstileToken : undefined;
+  const turnstileOk = await verifyTurnstile(typeof turnstileToken === "string" ? turnstileToken : undefined, c.req.raw, c.env);
+  if (!turnstileOk) throw jsonError(403, "turnstile_failed", "人机验证失败。");
+
   const credential = await getCredential(c.env.DB, space.id);
   if (!credential) throw jsonError(400, "provider_missing", "请先在设置中配置 baseURL 和 API Key。");
   await assertGenerationLimitsForRequest(c.env, space.id, sourceJob.quantity, credential);
@@ -678,7 +808,7 @@ app.post("/api/generations/:jobId/regenerate", async (c) => {
     maskImage,
     jobId,
   );
-  await c.env.GENERATION_QUEUE.send({ jobId, spaceId: space.id });
+  await enqueueGenerationJobOrFail(c.env, jobId, space.id);
   return c.json({ ok: true, jobId, status: "queued" });
 });
 

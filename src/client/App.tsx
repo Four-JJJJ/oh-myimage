@@ -195,6 +195,7 @@ export function App() {
   const [generationRecordsError, setGenerationRecordsError] = useState("");
   const [generationNextCursor, setGenerationNextCursor] = useState<string | null>(null);
   const [booting, setBooting] = useState(true);
+  const [bootError, setBootError] = useState("");
 
   const effectiveConfig = config ?? fallbackConfig;
   const dailyRemainingLabel = me?.dailyRemaining ?? effectiveConfig.maxDailyImagesPerSpace;
@@ -250,21 +251,23 @@ export function App() {
     setPendingGenerateForm(null);
   }, []);
 
-  useEffect(() => {
-    let mounted = true;
-    Promise.all([
-      api<{ ok: true; config: AppConfig }>("/api/config").then((result) => result.config),
-      api<{
-        ok: true;
-        space: MeState["space"];
-        providerConfigured: boolean;
-        usesTokenFourjProvider?: boolean;
-        dailyLimitExempt?: boolean;
-        dailyRemaining?: number;
-        dailyLimit?: number;
-      }>("/api/me").catch(() => null),
-    ]).then(([appConfig, user]) => {
-      if (!mounted) return;
+  const loadInitialData = useCallback(async (mounted: () => boolean = () => true) => {
+    setBooting(true);
+    setBootError("");
+    try {
+      const [appConfig, user] = await Promise.all([
+        api<{ ok: true; config: AppConfig }>("/api/config").then((result) => result.config),
+        api<{
+          ok: true;
+          space: MeState["space"];
+          providerConfigured: boolean;
+          usesTokenFourjProvider?: boolean;
+          dailyLimitExempt?: boolean;
+          dailyRemaining?: number;
+          dailyLimit?: number;
+        }>("/api/me").catch(() => null),
+      ]);
+      if (!mounted()) return;
       setConfig(appConfig);
       setMe(
         user
@@ -278,12 +281,23 @@ export function App() {
             }
           : null,
       );
-      setBooting(false);
-    });
+    } catch (err) {
+      if (!mounted()) return;
+      setConfig(null);
+      setMe(null);
+      setBootError(err instanceof Error ? err.message : "配置加载失败。");
+    } finally {
+      if (mounted()) setBooting(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    void loadInitialData(() => mounted);
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [loadInitialData]);
 
   useEffect(() => {
     if (!me) {
@@ -309,6 +323,10 @@ export function App() {
         </div>
       </main>
     );
+  }
+
+  if (bootError) {
+    return <BootErrorScreen message={bootError} onRetry={() => void loadInitialData()} />;
   }
 
   if (!me) {
@@ -445,6 +463,25 @@ export function App() {
   );
 }
 
+function BootErrorScreen({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <main className="app-shell grid min-h-screen place-items-center px-4">
+      <div className="entry-fade flex w-full max-w-sm flex-col gap-4 rounded-lg border bg-card p-5 text-center">
+        <span className="mx-auto grid size-10 place-items-center rounded-md bg-destructive/15 text-destructive">
+          <AlertCircle />
+        </span>
+        <div className="flex flex-col gap-1">
+          <h1 className="text-sm font-semibold text-foreground">配置加载失败</h1>
+          <p className="text-xs leading-[18px] text-muted-foreground">{message || "无法读取 /api/config，请检查服务状态后重试。"}</p>
+        </div>
+        <Button className="h-9 rounded-[10px]" onClick={onRetry}>
+          重试
+        </Button>
+      </div>
+    </main>
+  );
+}
+
 function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Promise<void> }) {
   const [spaceName, setSpaceName] = useState("");
   const [password, setPassword] = useState("");
@@ -454,6 +491,11 @@ function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Pr
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    const turnstileError = turnstileSubmitError(config.turnstileRequired, config.turnstileSiteKey, turnstileToken);
+    if (turnstileError) {
+      setError(turnstileError);
+      return;
+    }
     setLoading(true);
     setError("");
     try {
@@ -683,6 +725,10 @@ function GenerateView({
     onPendingGenerateFormConsumed();
   }, [onPendingGenerateFormConsumed, pendingGenerateForm]);
 
+  useEffect(() => {
+    setTurnstileToken("");
+  }, [config.turnstileSiteKey]);
+
   const upsertRecord = useCallback((nextJob: GenerationJob, nextImages: ImageItem[]) => {
     setRecords((current) => {
       const record: GenerationRecord = {
@@ -783,6 +829,11 @@ function GenerateView({
       onProviderNeeded();
       return;
     }
+    const turnstileError = turnstileSubmitError(config.turnstileRequired, config.turnstileSiteKey, turnstileToken);
+    if (turnstileError) {
+      setError(turnstileError);
+      return;
+    }
     setLoading(true);
     setError("");
     setImages([]);
@@ -828,6 +879,11 @@ function GenerateView({
       onProviderNeeded();
       return;
     }
+    const turnstileError = turnstileSubmitError(config.turnstileRequired, config.turnstileSiteKey, turnstileToken);
+    if (turnstileError) {
+      setError(turnstileError);
+      return;
+    }
     setLoading(true);
     setError("");
     setImages([]);
@@ -835,6 +891,7 @@ function GenerateView({
     try {
       const result = await api<{ ok: true; jobId: string; status: "queued" }>(`/api/generations/${record.job.id}/regenerate`, {
         method: "POST",
+        body: JSON.stringify({ turnstileToken }),
       });
       refreshUsage();
       const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
@@ -1033,6 +1090,7 @@ function GenerateView({
             <div className="mt-4 flex flex-col gap-3">
               {error && <Notice tone="error" text={error} />}
               {config.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={setTurnstileToken} />}
+              {config.turnstileRequired && !config.turnstileSiteKey && <Notice tone="warn" text="Turnstile 已启用，请配置站点 Key。" />}
             </div>
           </section>
         </div>
@@ -1572,12 +1630,9 @@ function ImagePreviewDialog({
       onClose();
       return;
     }
-    if (panelOptions.turnstileRequired && !panelOptions.turnstileSiteKey) {
-      setEditError("Turnstile 已启用，请先配置站点 Key。");
-      return;
-    }
-    if (panelOptions.turnstileSiteKey && !turnstileToken) {
-      setEditError("请先完成人机验证。");
+    const turnstileError = turnstileSubmitError(panelOptions.turnstileRequired, panelOptions.turnstileSiteKey, turnstileToken);
+    if (turnstileError) {
+      setEditError(turnstileError);
       return;
     }
     const submitEditTask = editOptions.onSubmit;
@@ -1838,6 +1893,7 @@ function GalleryView({
   const [activeImages, setActiveImages] = useState<ImageItem[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
+  const [turnstileToken, setTurnstileToken] = useState("");
   const [error, setError] = useState("");
 
   const availableRatios = useMemo(
@@ -1855,6 +1911,10 @@ function GalleryView({
   const refreshUsage = useCallback(() => {
     void onUsageChanged().catch(() => undefined);
   }, [onUsageChanged]);
+
+  useEffect(() => {
+    setTurnstileToken("");
+  }, [config.turnstileSiteKey]);
 
   const upsertRecord = useCallback((nextJob: GenerationJob, nextImages: ImageItem[]) => {
     setRecords((current) => {
@@ -1923,6 +1983,11 @@ function GalleryView({
       return;
     }
     if (regeneratingId) return;
+    const turnstileError = turnstileSubmitError(config.turnstileRequired, config.turnstileSiteKey, turnstileToken);
+    if (turnstileError) {
+      setError(turnstileError);
+      return;
+    }
     setRegeneratingId(record.job.id);
     setError("");
     setActiveJob(null);
@@ -1931,6 +1996,7 @@ function GalleryView({
     try {
       const result = await api<{ ok: true; jobId: string; status: "queued" }>(`/api/generations/${record.job.id}/regenerate`, {
         method: "POST",
+        body: JSON.stringify({ turnstileToken }),
       });
       refreshUsage();
       const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
@@ -2009,6 +2075,8 @@ function GalleryView({
       <div className="mx-auto flex w-[800px] max-w-full flex-col gap-3">
         {recordsError && <Notice tone="error" text={recordsError} />}
         {error && <Notice tone="error" text={error} />}
+        {config.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={setTurnstileToken} />}
+        {config.turnstileRequired && !config.turnstileSiteKey && <Notice tone="warn" text="Turnstile 已启用，请配置站点 Key。" />}
         {records.length === 0 && (
           <div className="figma-record-card grid min-h-[188px] place-items-center rounded-[10px] border border-white/15 p-6 text-center">
             <div className="flex flex-col items-center gap-3 text-white/40">
@@ -2104,7 +2172,7 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
       });
       setUsesTokenFourjProvider(result.provider.usesTokenFourjProvider);
       setBaseURL(result.provider.baseURL);
-      setApiKey(trimmedApiKey);
+      setApiKey("");
       setApiKeyHint(result.provider.apiKeyHint);
       setMessage("Provider 已保存。");
       await onSaved();
@@ -2208,6 +2276,11 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
         </div>
 
         <p className="mt-2 text-xs leading-[18px] text-white/40">所有数据均加密保存</p>
+        {config.turnstileRequired && !config.turnstileSiteKey && (
+          <div className="mt-3">
+            <Notice tone="warn" text="Turnstile 已启用但缺少站点 Key，生成提交会被阻止。" />
+          </div>
+        )}
         {message && <p className="mt-2 text-xs leading-[18px] text-[#6eff30]">{message}</p>}
         {error && <p className="mt-2 text-xs leading-[18px] text-destructive">{error}</p>}
       </form>
@@ -2382,6 +2455,12 @@ function generationRequestBody(
   if (referenceImage) body.set("referenceImage", referenceImage.file, referenceImage.name);
   if (maskImage) body.set("maskImage", maskImage.file, maskImage.name);
   return body;
+}
+
+function turnstileSubmitError(turnstileRequired: boolean, turnstileSiteKey: string, turnstileToken: string): string {
+  if (turnstileRequired && !turnstileSiteKey) return "Turnstile 已启用，请先配置站点 Key。";
+  if (turnstileSiteKey && !turnstileToken) return "请先完成人机验证。";
+  return "";
 }
 
 function promptOptimizationPayload(form: GenerateForm) {
