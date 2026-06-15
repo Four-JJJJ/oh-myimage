@@ -1,4 +1,4 @@
-import type { AppConfig, GenerationJob, GenerationRecord, ImageItem } from "./api";
+import type { AppConfig, GenerationJob, GenerationRecord, GenerationReferenceImage, ImageItem } from "./api";
 
 const previewStorageKey = "oh-myimage.preview";
 const previewDemoImageUrl = "/demo-preview.png";
@@ -167,25 +167,38 @@ export interface PreviewGenerationInput {
   quality: string;
   quantity: number;
   outputFormat: string;
+  sourceImageId?: string;
+  referenceImages?: GenerationReferenceImage[];
 }
 
 export async function previewGenerationInputFromRequest(request: Request): Promise<PreviewGenerationInput> {
   const contentType = request.headers.get("content-type") ?? "";
   let body: Record<string, unknown>;
+  let referenceImages: GenerationReferenceImage[] = [];
   if (contentType.includes("multipart/form-data")) {
     const form = await request.formData().catch(() => null);
     body = formDataObject(form);
+    referenceImages = formDataReferenceImages(form);
   } else {
     body = objectBody(await request.json().catch(() => ({})));
   }
-  return previewGenerationInputFromBody(body);
+  return previewGenerationInputFromBody(body, referenceImages);
 }
 
-export function previewGenerationInputFromBody(body: Record<string, unknown>): PreviewGenerationInput {
+export function previewGenerationInputFromBody(
+  body: Record<string, unknown>,
+  uploadedReferenceImages: GenerationReferenceImage[] = [],
+): PreviewGenerationInput {
   const aspectRatio = typeof body.aspectRatio === "string" && body.aspectRatio.trim() ? body.aspectRatio.trim() : "9:16";
   const ratioSize = previewRatioSizes[aspectRatio] ?? [previewDemoImageWidth, previewDemoImageHeight];
   const width = toPreviewInt(body.width, ratioSize[0]);
   const height = toPreviewInt(body.height, ratioSize[1]);
+  const sourceImageId = typeof body.sourceImageId === "string" && body.sourceImageId.trim() ? body.sourceImageId.trim() : undefined;
+  const referenceImages = uploadedReferenceImages.length > 0
+    ? uploadedReferenceImages
+    : sourceImageId
+      ? [previewReferenceImage("参考图 1")]
+      : [];
   return {
     prompt: typeof body.prompt === "string" ? body.prompt.trim() : "",
     aspectRatio,
@@ -194,6 +207,8 @@ export function previewGenerationInputFromBody(body: Record<string, unknown>): P
     quality: typeof body.quality === "string" && body.quality.trim() ? body.quality.trim() : "auto",
     quantity: clampPreviewQuantity(toPreviewInt(body.quantity, 1)),
     outputFormat: typeof body.outputFormat === "string" && body.outputFormat.trim() ? body.outputFormat.trim() : "png",
+    sourceImageId,
+    referenceImages,
   };
 }
 
@@ -205,6 +220,13 @@ function formDataObject(form: FormData | null): Record<string, unknown> {
     body[key] = value;
   }
   return body;
+}
+
+function formDataReferenceImages(form: FormData | null): GenerationReferenceImage[] {
+  if (!form) return [];
+  return form.getAll("referenceImage")
+    .filter((value): value is File => value instanceof File)
+    .map((file, index) => previewReferenceImage(file.name || `参考图 ${index + 1}`, file.type || "image/png", file.size));
 }
 
 function objectBody(value: unknown): Record<string, unknown> {
@@ -269,6 +291,7 @@ function createRecord(
     compression: 100,
     error_code: null,
     error_message: null,
+    referenceImages: input.referenceImages ?? [],
     created_at: createdAt,
     started_at: createdAt,
     completed_at: status === "running" ? null : createdAt,
@@ -306,6 +329,7 @@ function settingsFromJob(job?: GenerationJob): Partial<PreviewGenerationInput> {
     quality: job.quality,
     quantity: job.quantity,
     outputFormat: job.output_format,
+    referenceImages: job.referenceImages,
   };
 }
 
@@ -325,5 +349,14 @@ function previewImage(job: GenerationJob, index: number, createdAt: string): Ima
     prompt: job.prompt,
     quality: job.quality,
     aspectRatio: job.aspect_ratio,
+  };
+}
+
+function previewReferenceImage(name: string, mimeType = "image/png", byteSize = 0): GenerationReferenceImage {
+  return {
+    name,
+    mimeType,
+    byteSize,
+    url: previewDemoImageUrl,
   };
 }
