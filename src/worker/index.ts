@@ -16,6 +16,8 @@ import {
   getSession,
   getSpaceByKey,
   insertRateLimitEvent,
+  listGenerationResultsForJob,
+  listGenerationResultsForJobs,
   listGenerationJobs,
   listImages,
   listImagesForJob,
@@ -48,6 +50,7 @@ const SOURCE_IMAGE_ID_FIELD = "sourceImageId";
 const REFERENCE_IMAGE_FIELD = "referenceImage";
 const MASK_IMAGE_FIELD = "maskImage";
 const REFERENCE_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+const MAX_REFERENCE_IMAGES = 8;
 const MASK_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 const REFERENCE_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const MASK_IMAGE_MIME_TYPES = new Set(["image/png"]);
@@ -68,11 +71,11 @@ app.onError((error, c) => {
   return c.json({ ok: false, error: { code: "internal_error", message: "服务暂时不可用。" } }, 500);
 });
 
-async function parseGenerationRequest(request: Request): Promise<{ body: Record<string, unknown> | null; referenceImage?: File; maskImage?: File }> {
+async function parseGenerationRequest(request: Request): Promise<{ body: Record<string, unknown> | null; referenceImages: File[]; maskImage?: File }> {
   const contentType = request.headers.get("content-type") ?? "";
   if (contentType.toLowerCase().includes("multipart/form-data")) {
     const formData = await request.formData().catch(() => null);
-    if (!formData) return { body: null };
+    if (!formData) return { body: null, referenceImages: [] };
 
     const body: Record<string, unknown> = {};
     for (const [key, value] of formData.entries()) {
@@ -80,20 +83,22 @@ async function parseGenerationRequest(request: Request): Promise<{ body: Record<
       body[key] = value;
     }
 
-    const uploadedImage = formData.get(REFERENCE_IMAGE_FIELD);
+    const uploadedImages = formData
+      .getAll(REFERENCE_IMAGE_FIELD)
+      .filter((value): value is File => value instanceof File && value.size > 0);
     const uploadedMask = formData.get(MASK_IMAGE_FIELD);
     return {
       body,
-      referenceImage: uploadedImage instanceof File && uploadedImage.size > 0 ? uploadedImage : undefined,
+      referenceImages: uploadedImages,
       maskImage: uploadedMask instanceof File && uploadedMask.size > 0 ? uploadedMask : undefined,
     };
   }
 
   const body = await request.json().catch(() => null);
-  return { body: body && typeof body === "object" ? (body as Record<string, unknown>) : null };
+  return { body: body && typeof body === "object" ? (body as Record<string, unknown>) : null, referenceImages: [] };
 }
 
-async function storeReferenceImage(env: Env, spaceId: string, jobId: string, file: File): Promise<StoredReferenceImage> {
+async function storeReferenceImage(env: Env, spaceId: string, jobId: string, file: File, index = 0): Promise<StoredReferenceImage> {
   const mimeType = normalizeReferenceImageMime(file.type);
   if (!REFERENCE_IMAGE_MIME_TYPES.has(mimeType)) {
     throw jsonError(400, "invalid_reference_image", "参考图仅支持 PNG、JPEG 或 WebP 格式。");
@@ -105,7 +110,7 @@ async function storeReferenceImage(env: Env, spaceId: string, jobId: string, fil
   const bytes = await file.arrayBuffer();
   const extension = extensionForReferenceImage(mimeType);
   const name = safeReferenceImageName(file.name, extension);
-  const storageKey = `${spaceId}/${jobId}/reference.${extension}`;
+  const storageKey = `${spaceId}/${jobId}/reference-${index + 1}.${extension}`;
   await env.IMAGES.put(storageKey, bytes, {
     httpMetadata: {
       contentType: mimeType,
@@ -115,6 +120,7 @@ async function storeReferenceImage(env: Env, spaceId: string, jobId: string, fil
       jobId,
       spaceId,
       kind: "reference",
+      referenceIndex: String(index + 1),
     },
   });
 
@@ -124,6 +130,13 @@ async function storeReferenceImage(env: Env, spaceId: string, jobId: string, fil
     name,
     byteSize: bytes.byteLength,
   };
+}
+
+async function storeReferenceImages(env: Env, spaceId: string, jobId: string, files: File[]): Promise<StoredReferenceImage[]> {
+  if (files.length > MAX_REFERENCE_IMAGES) {
+    throw jsonError(400, "too_many_reference_images", `参考图最多 ${MAX_REFERENCE_IMAGES} 张。`);
+  }
+  return Promise.all(files.map((file, index) => storeReferenceImage(env, spaceId, jobId, file, index)));
 }
 
 async function cloneSourceImageAsReference(env: Env, spaceId: string, jobId: string, sourceImageId: string): Promise<StoredReferenceImage> {
@@ -139,7 +152,7 @@ async function cloneSourceImageAsReference(env: Env, spaceId: string, jobId: str
 
   const extension = extensionForReferenceImage(mimeType);
   const name = safeReferenceImageName(`${sourceImage.id}.${extension}`, extension);
-  const storageKey = `${spaceId}/${jobId}/reference.${extension}`;
+  const storageKey = `${spaceId}/${jobId}/reference-1.${extension}`;
   const putOptions = {
     httpMetadata: {
       contentType: mimeType,
@@ -149,6 +162,7 @@ async function cloneSourceImageAsReference(env: Env, spaceId: string, jobId: str
       jobId,
       spaceId,
       kind: "reference",
+      referenceIndex: "1",
     },
   };
 
@@ -264,36 +278,85 @@ async function cloneReferenceImage(
   spaceId: string,
   nextJobId: string,
   sourceJob: GenerationJobRecord,
-): Promise<StoredReferenceImage | undefined> {
-  if (!sourceJob.reference_image_storage_key) return undefined;
-  const sourceObject = await env.IMAGES.get(sourceJob.reference_image_storage_key);
-  if (!sourceObject) {
-    throw jsonError(404, "reference_image_missing", "参考图文件不存在，请重新上传后再试。");
+): Promise<StoredReferenceImage[]> {
+  const snapshots = referenceImagesFromJob(sourceJob);
+  if (snapshots.length === 0) return [];
+  const copied: StoredReferenceImage[] = [];
+  for (const [index, snapshot] of snapshots.entries()) {
+    const sourceObject = await env.IMAGES.get(snapshot.storageKey);
+    if (!sourceObject) {
+      throw jsonError(404, "reference_image_missing", "参考图文件不存在，请重新上传后再试。");
+    }
+
+    const mimeType = snapshot.mimeType ?? sourceObject.httpMetadata?.contentType ?? "image/png";
+    const extension = extensionForReferenceImage(mimeType);
+    const name = safeReferenceImageName(snapshot.name ?? "", extension);
+    const bytes = await sourceObject.arrayBuffer();
+    const storageKey = `${spaceId}/${nextJobId}/reference-${index + 1}.${extension}`;
+    await env.IMAGES.put(storageKey, bytes, {
+      httpMetadata: {
+        contentType: mimeType,
+        contentDisposition: `inline; filename="${name}"`,
+      },
+      customMetadata: {
+        jobId: nextJobId,
+        spaceId,
+        kind: "reference",
+        referenceIndex: String(index + 1),
+      },
+    });
+
+    copied.push({
+      storageKey,
+      mimeType,
+      name,
+      byteSize: bytes.byteLength,
+    });
   }
+  return copied;
+}
 
-  const mimeType = sourceJob.reference_image_mime_type ?? sourceObject.httpMetadata?.contentType ?? "image/png";
-  const extension = extensionForReferenceImage(mimeType);
-  const name = safeReferenceImageName(sourceJob.reference_image_name ?? "", extension);
-  const bytes = await sourceObject.arrayBuffer();
-  const storageKey = `${spaceId}/${nextJobId}/reference.${extension}`;
-  await env.IMAGES.put(storageKey, bytes, {
-    httpMetadata: {
-      contentType: mimeType,
-      contentDisposition: `inline; filename="${name}"`,
+function referenceImagesFromJob(
+  job: Pick<
+    GenerationJobRecord,
+    "reference_images_json" | "reference_image_storage_key" | "reference_image_mime_type" | "reference_image_name" | "reference_image_byte_size"
+  >,
+): StoredReferenceImage[] {
+  const parsed = parseReferenceImagesJson(job.reference_images_json);
+  if (parsed.length > 0) return parsed;
+  if (!job.reference_image_storage_key) return [];
+  return [
+    {
+      storageKey: job.reference_image_storage_key,
+      mimeType: job.reference_image_mime_type ?? "image/png",
+      name: job.reference_image_name ?? "reference.png",
+      byteSize: job.reference_image_byte_size ?? 0,
     },
-    customMetadata: {
-      jobId: nextJobId,
-      spaceId,
-      kind: "reference",
-    },
-  });
+  ];
+}
 
-  return {
-    storageKey,
-    mimeType,
-    name,
-    byteSize: bytes.byteLength,
-  };
+function parseReferenceImagesJson(value: string | null | undefined): StoredReferenceImage[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((item) => {
+        if (!item || typeof item !== "object") return null;
+        const record = item as Record<string, unknown>;
+        const storageKey = typeof record.storageKey === "string" ? record.storageKey : "";
+        if (!storageKey) return null;
+        return {
+          storageKey,
+          mimeType: typeof record.mimeType === "string" ? record.mimeType : "image/png",
+          name: typeof record.name === "string" ? record.name : "reference.png",
+          byteSize: typeof record.byteSize === "number" ? record.byteSize : 0,
+        };
+      })
+      .filter((item): item is StoredReferenceImage => Boolean(item));
+  } catch {
+    return [];
+  }
 }
 
 async function cloneMaskImage(
@@ -572,19 +635,19 @@ app.post("/api/generations", async (c) => {
   if (!credential) throw jsonError(400, "provider_missing", "请先在设置中配置 baseURL 和 API Key。");
   await assertGenerationLimitsForRequest(c.env, space.id, parsed.input.quantity, credential);
 
-  if (requestPayload.referenceImage && sourceImageId) {
+  if (requestPayload.referenceImages.length > 0 && sourceImageId) {
     throw jsonError(400, "reference_source_conflict", "参考图上传和源图片编辑不能同时使用。");
   }
-  if (requestPayload.maskImage && !requestPayload.referenceImage && !sourceImageId) {
+  if (requestPayload.maskImage && requestPayload.referenceImages.length === 0 && !sourceImageId) {
     throw jsonError(400, "mask_requires_reference_image", "选区遮罩需要和参考图一起提交。");
   }
 
   const jobId = randomId("job");
-  const referenceImage = requestPayload.referenceImage
-    ? await storeReferenceImage(c.env, space.id, jobId, requestPayload.referenceImage)
+  const referenceImages = requestPayload.referenceImages.length > 0
+    ? await storeReferenceImages(c.env, space.id, jobId, requestPayload.referenceImages)
     : sourceImageId
-      ? await cloneSourceImageAsReference(c.env, space.id, jobId, sourceImageId)
-      : undefined;
+      ? [await cloneSourceImageAsReference(c.env, space.id, jobId, sourceImageId)]
+      : [];
   const maskImage = requestPayload.maskImage ? await storeMaskImage(c.env, space.id, jobId, requestPayload.maskImage) : undefined;
 
   await createGenerationJob(
@@ -593,7 +656,7 @@ app.post("/api/generations", async (c) => {
     parsed.input,
     credential.model,
     await sha256Hex(credential.base_url),
-    referenceImage,
+    referenceImages,
     maskImage,
     jobId,
   );
@@ -604,22 +667,26 @@ app.post("/api/generations", async (c) => {
 app.get("/api/generations", async (c) => {
   const spaceId = c.get("space").id;
   const jobs = await listGenerationJobs(c.env.DB, spaceId, c.req.query("cursor"));
-  const images = await listImagesForJobs(
-    c.env.DB,
-    spaceId,
-    jobs.map((job) => job.id),
-  );
+  const jobIds = jobs.map((job) => job.id);
+  const images = await listImagesForJobs(c.env.DB, spaceId, jobIds);
+  const results = await listGenerationResultsForJobs(c.env.DB, spaceId, jobIds);
   const imagesByJob = new Map<string, typeof images>();
   for (const image of images) {
     const group = imagesByJob.get(image.job_id) ?? [];
     group.push(image);
     imagesByJob.set(image.job_id, group);
   }
+  const resultsByJob = new Map<string, typeof results>();
+  for (const result of results) {
+    const group = resultsByJob.get(result.job_id) ?? [];
+    group.push(result);
+    resultsByJob.set(result.job_id, group);
+  }
 
   return c.json({
     ok: true,
     records: jobs.map((job) => ({
-      job,
+      job: serializeGenerationJob(job, resultsByJob.get(job.id) ?? []),
       elapsedSeconds: generationElapsedSeconds(job),
       images: (imagesByJob.get(job.id) ?? []).map((image) => serializeImage(image)),
     })),
@@ -631,10 +698,30 @@ app.get("/api/generations/:jobId", async (c) => {
   const job = await getGenerationJob(c.env.DB, c.get("space").id, c.req.param("jobId"));
   if (!job) throw jsonError(404, "job_not_found", "任务不存在。");
   const images = await listImagesForJob(c.env.DB, c.get("space").id, job.id);
+  const results = await listGenerationResultsForJob(c.env.DB, c.get("space").id, job.id);
   return c.json({
     ok: true,
-    job,
+    job: serializeGenerationJob(job, results),
     images: images.map((image) => serializeImage(image)),
+  });
+});
+
+app.get("/api/generations/:jobId/references/:index", async (c) => {
+  const spaceId = c.get("space").id;
+  const job = await getGenerationJob(c.env.DB, spaceId, c.req.param("jobId"));
+  if (!job) throw jsonError(404, "job_not_found", "任务不存在。");
+  const index = Number(c.req.param("index"));
+  const reference = referenceImagesFromJob(job)[index];
+  if (!Number.isInteger(index) || index < 0 || !reference) {
+    throw jsonError(404, "reference_image_not_found", "参考图不存在。");
+  }
+  const object = await c.env.IMAGES.get(reference.storageKey);
+  if (!object) throw jsonError(404, "reference_image_missing", "参考图文件不存在。");
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": reference.mimeType,
+      "Content-Disposition": `inline; filename="${reference.name}"`,
+    },
   });
 });
 
@@ -646,7 +733,7 @@ app.delete("/api/generations/:jobId", async (c) => {
   const images = await listImagesForJob(c.env.DB, spaceId, job.id);
   const storageKeys = [
     ...images.map((image) => image.storage_key),
-    ...(job.reference_image_storage_key ? [job.reference_image_storage_key] : []),
+    ...referenceImagesFromJob(job).map((reference) => reference.storageKey),
     ...(job.mask_image_storage_key ? [job.mask_image_storage_key] : []),
   ];
   for (const storageKey of storageKeys) {
@@ -666,7 +753,7 @@ app.post("/api/generations/:jobId/regenerate", async (c) => {
   await assertGenerationLimitsForRequest(c.env, space.id, sourceJob.quantity, credential);
 
   const jobId = randomId("job");
-  const referenceImage = await cloneReferenceImage(c.env, space.id, jobId, sourceJob);
+  const referenceImages = await cloneReferenceImage(c.env, space.id, jobId, sourceJob);
   const maskImage = await cloneMaskImage(c.env, space.id, jobId, sourceJob);
   await createGenerationJob(
     c.env.DB,
@@ -674,7 +761,7 @@ app.post("/api/generations/:jobId/regenerate", async (c) => {
     generationInputFromJob(sourceJob),
     credential.model,
     await sha256Hex(credential.base_url),
-    referenceImage,
+    referenceImages,
     maskImage,
     jobId,
   );
@@ -870,6 +957,63 @@ function providerHttpStatus(error: ProviderError): number {
   if (error.code === "provider_timeout") return 504;
   if (error.code === "provider_auth_failed") return 502;
   return 502;
+}
+
+function serializeGenerationJob(job: GenerationJobRecord, results: Awaited<ReturnType<typeof listGenerationResultsForJob>>) {
+  return {
+    ...job,
+    stage: job.stage ?? stageFromStatus(job.status),
+    progress_current: job.progress_current ?? inferredProgressCurrent(job, results),
+    progress_total: job.progress_total ?? job.quantity,
+    error_reason: job.error_reason ?? job.error_message,
+    results: normalizeGenerationResults(job, results),
+    referenceImages: referenceImagesFromJob(job).map((reference, index) => ({
+      name: reference.name,
+      mimeType: reference.mimeType,
+      byteSize: reference.byteSize,
+      url: `/api/generations/${job.id}/references/${index}`,
+    })),
+  };
+}
+
+function normalizeGenerationResults(job: GenerationJobRecord, results: Awaited<ReturnType<typeof listGenerationResultsForJob>>) {
+  const byIndex = new Map(results.map((result) => [result.result_index, result]));
+  return Array.from({ length: job.quantity }, (_, index) => {
+    const result = byIndex.get(index);
+    if (result) {
+      return {
+        index,
+        status: result.status,
+        imageId: result.image_asset_id,
+        errorCode: result.error_code,
+        errorMessage: result.error_message,
+        startedAt: result.started_at,
+        completedAt: result.completed_at,
+      };
+    }
+    return {
+      index,
+      status: job.status === "queued" || job.status === "running" ? job.status : "failed",
+      imageId: null,
+      errorCode: job.status === "partial_succeeded" || job.status === "failed" ? job.error_code : null,
+      errorMessage: job.status === "partial_succeeded" || job.status === "failed" ? job.error_message : null,
+      startedAt: null,
+      completedAt: null,
+    };
+  });
+}
+
+function inferredProgressCurrent(job: GenerationJobRecord, results: Awaited<ReturnType<typeof listGenerationResultsForJob>>): number {
+  if (job.status === "succeeded" || job.status === "partial_succeeded" || job.status === "failed" || job.status === "cancelled") return job.quantity;
+  return results.filter((result) => result.status === "succeeded" || result.status === "failed").length;
+}
+
+function stageFromStatus(status: GenerationJobRecord["status"]) {
+  if (status === "queued") return "queued";
+  if (status === "running") return "waiting_provider";
+  if (status === "cancelled") return "cancelled";
+  if (status === "failed") return "failed";
+  return "completed";
 }
 
 function serializeImage(

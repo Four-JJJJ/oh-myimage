@@ -1,5 +1,5 @@
 import { bytesFromBase64, decryptSecret, sha256Hex } from "./crypto";
-import { envNumber, randomId, redactSecrets } from "./http";
+import { envNumber, redactSecrets } from "./http";
 import { buildProviderEndpoint } from "./security";
 import {
   completeJob,
@@ -7,16 +7,24 @@ import {
   getGenerationJobForWorker,
   insertImageAsset,
   insertImageUsageEvent,
+  listGenerationResultsForJob,
   listImagesForJob,
   updateJobStatus,
+  upsertGenerationJobResult,
 } from "./db";
-import { CredentialRecord, Env, GenerationJobRecord, GenerationMessage } from "./types";
+import { CredentialRecord, Env, GenerationJobRecord, GenerationMessage, GenerationReferenceImageSnapshot } from "./types";
 import { PromptOptimizationInput } from "./validation";
 
 export interface ProviderImage {
   b64_json?: string;
   url?: string;
   revised_prompt?: string;
+}
+
+export interface ProviderImageBinary {
+  bytes: Uint8Array;
+  format: string;
+  mimeType: string;
 }
 
 export interface ProviderGenerationResponse {
@@ -62,6 +70,8 @@ const MASKED_IMAGE_EDIT_PROMPT_SUFFIX = [
 ].join(" ");
 
 interface StoredGenerationImage {
+  imageId: string;
+  resultIndex: number;
   revisedPrompt: string | null;
   usage: unknown;
 }
@@ -138,10 +148,11 @@ export async function optimizePrompt(
 
     if (!response.ok) {
       const text = await providerMessage(response);
+      const code = providerErrorCode(response.status, text);
       throw new ProviderError(
-        providerErrorCode(response.status),
+        code,
         providerStatusMessage(response.status, text, DEFAULT_PROMPT_OPTIMIZER_TIMEOUT_MS),
-        response.status === 429 || response.status >= 500,
+        providerErrorRetryable(code, response.status),
       );
     }
 
@@ -176,7 +187,11 @@ export async function processGenerationMessage(message: GenerationMessage, env: 
     return;
   }
 
-  await updateJobStatus(env.DB, job.id, "running");
+  await updateJobStatus(env.DB, job.id, "running", undefined, undefined, {
+    stage: "waiting_provider",
+    progressCurrent: await completedSlotCount(env, job),
+    progressTotal: job.quantity,
+  });
 
   try {
     const apiKey = await decryptSecret(credential.encrypted_api_key, env.APP_ENCRYPTION_KEY ?? "");
@@ -224,10 +239,13 @@ async function requestGeneration(
   const concurrency = resolveProviderImageConcurrency(env.PROVIDER_IMAGE_CONCURRENCY);
   const deadline = Date.now() + timeoutMs;
   const existingImages = await listImagesForJob(env.DB, job.space_id, job.id);
+  const existingResults = await listGenerationResultsForJob(env.DB, job.space_id, job.id);
   const remainingCount = Math.max(0, job.quantity - existingImages.length);
   const storedImages: StoredGenerationImage[] = [];
   const errors: ProviderError[] = [];
-  const tasks = Array.from({ length: remainingCount }, () => async () => {
+  const availableIndexes = availableResultIndexes(job.quantity, existingResults, existingImages.length);
+  const tasks = Array.from({ length: remainingCount }, (_, index) => async () => {
+    const resultIndex = availableIndexes[index] ?? existingImages.length + index;
     const remainingTimeoutMs = deadline - Date.now();
     if (remainingTimeoutMs < 1000) {
       throw new ProviderError(
@@ -236,7 +254,54 @@ async function requestGeneration(
         true,
       );
     }
-    return generateAndStoreOneImage(job, credential, apiKey, remainingTimeoutMs, env);
+    await upsertGenerationJobResult(env.DB, {
+      id: generationResultId(job.id, resultIndex),
+      space_id: job.space_id,
+      job_id: job.id,
+      result_index: resultIndex,
+      status: "running",
+      image_asset_id: null,
+      error_code: null,
+      error_message: null,
+      started_at: new Date().toISOString(),
+      completed_at: null,
+    });
+    await updateJobStatus(env.DB, job.id, "running", undefined, undefined, {
+      stage: "waiting_provider",
+      progressCurrent: existingImages.length + storedImages.length + errors.length,
+      progressTotal: job.quantity,
+    });
+    try {
+      const stored = await generateAndStoreOneImage(job, credential, apiKey, remainingTimeoutMs, env, resultIndex);
+      await upsertGenerationJobResult(env.DB, {
+        id: generationResultId(job.id, resultIndex),
+        space_id: job.space_id,
+        job_id: job.id,
+        result_index: resultIndex,
+        status: "succeeded",
+        image_asset_id: stored.imageId,
+        error_code: null,
+        error_message: null,
+        started_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+      });
+      return stored;
+    } catch (error) {
+      const providerError = normalizeProviderError(error);
+      await upsertGenerationJobResult(env.DB, {
+        id: generationResultId(job.id, resultIndex),
+        space_id: job.space_id,
+        job_id: job.id,
+        result_index: resultIndex,
+        status: "failed",
+        image_asset_id: null,
+        error_code: providerError.code,
+        error_message: providerError.message,
+        started_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+      });
+      throw providerError;
+    }
   });
 
   for (let start = 0; start < tasks.length; start += concurrency) {
@@ -248,6 +313,11 @@ async function requestGeneration(
         errors.push(normalizeProviderError(result.reason));
       }
     }
+    await updateJobStatus(env.DB, job.id, "running", undefined, undefined, {
+      stage: "waiting_provider",
+      progressCurrent: existingImages.length + storedImages.length + errors.length,
+      progressTotal: job.quantity,
+    });
   }
 
   return { requestedCount: job.quantity, existingCount: existingImages.length, storedImages, errors };
@@ -259,34 +329,99 @@ async function generateAndStoreOneImage(
   apiKey: string,
   timeoutMs: number,
   env: Env,
+  resultIndex: number,
 ): Promise<StoredGenerationImage> {
+  const recovered = await recoverStoredImageForResult(job, resultIndex, env);
+  if (recovered) return recovered;
+
   const response = await requestGenerationBatch(job, credential, apiKey, timeoutMs, env);
-  const image = response.data?.find((item) => item.b64_json);
-  if (!image?.b64_json) {
+  const image = response.data?.find((item) => item.b64_json || item.url);
+  if (!image) {
     throw new ProviderError("empty_response", "模型服务没有返回图片。");
   }
 
-  const bytes = bytesFromBase64(image.b64_json);
-  const id = randomId("img");
+  const binary = await resolveProviderImageBinary(image, job.output_format, timeoutMs);
+  const id = imageIdForResult(job.id, resultIndex);
+  await persistGeneratedImage(job, env, id, resultIndex, binary.bytes, binary.mimeType, binary.format);
+
+  return {
+    imageId: id,
+    resultIndex,
+    revisedPrompt: image.revised_prompt ?? null,
+    usage: response.usage,
+  };
+}
+
+export async function resolveProviderImageBinary(
+  image: Pick<ProviderImage, "b64_json" | "url">,
+  fallbackFormat: string,
+  timeoutMs: number,
+): Promise<ProviderImageBinary> {
+  if (image.b64_json) {
+    const format = normalizeProviderImageFormat(fallbackFormat);
+    return {
+      bytes: bytesFromBase64(image.b64_json),
+      format,
+      mimeType: mimeFromFormat(format),
+    };
+  }
+
+  if (!image.url) {
+    throw new ProviderError("empty_response", "模型服务没有返回图片。");
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort("timeout"), Math.max(1_000, timeoutMs));
+  try {
+    const response = await fetch(image.url, {
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new ProviderError(
+        "provider_image_download_failed",
+        `模型已返回图片链接，但下载失败：${response.status}。`,
+        response.status >= 500 || response.status === 429,
+      );
+    }
+
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const contentType = normalizeProviderContentType(response.headers.get("content-type"));
+    const format = providerImageFormatFromResponse(contentType, image.url, fallbackFormat);
+    return {
+      bytes,
+      format,
+      mimeType: contentType ?? mimeFromFormat(format),
+    };
+  } catch (error) {
+    if (error instanceof ProviderError) throw error;
+    if (controller.signal.aborted) {
+      throw new ProviderError("provider_image_download_timeout", "模型已返回图片链接，但下载图片超时。", true);
+    }
+    throw new ProviderError(
+      "provider_image_download_failed",
+      `模型已返回图片链接，但下载失败：${redactSecrets(error instanceof Error ? error.message : "未知错误")}`,
+      true,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function recoverStoredImageForResult(job: GenerationJobRecord, resultIndex: number, env: Env): Promise<StoredGenerationImage | null> {
+  const id = imageIdForResult(job.id, resultIndex);
   const format = job.output_format;
   const mimeType = mimeFromFormat(format);
-  const storageKey = `${job.space_id}/${job.id}/${id}.${format}`;
-  await env.IMAGES.put(storageKey, bytes, {
-    httpMetadata: {
-      contentType: mimeType,
-      contentDisposition: `inline; filename="${id}.${format}"`,
-    },
-    customMetadata: {
-      jobId: job.id,
-      spaceId: job.space_id,
-    },
-  });
+  const storageKey = storageKeyForResult(job, id, format);
+  const object = await env.IMAGES.get(storageKey);
+  if (!object) return null;
+  const bytes = new Uint8Array(await object.arrayBuffer());
   await insertImageAsset(env.DB, {
     id,
     space_id: job.space_id,
     job_id: job.id,
     storage_key: storageKey,
-    mime_type: mimeType,
+    mime_type: object.httpMetadata?.contentType ?? mimeType,
     format,
     width: job.width,
     height: job.height,
@@ -294,11 +429,65 @@ async function generateAndStoreOneImage(
     sha256: await sha256Hex(bytes),
   });
   await insertImageUsageEvent(env.DB, job.space_id, id);
-
   return {
-    revisedPrompt: image.revised_prompt ?? null,
-    usage: response.usage,
+    imageId: id,
+    resultIndex,
+    revisedPrompt: null,
+    usage: undefined,
   };
+}
+
+async function persistGeneratedImage(
+  job: GenerationJobRecord,
+  env: Env,
+  id: string,
+  resultIndex: number,
+  bytes: Uint8Array,
+  mimeType: string,
+  format: string,
+): Promise<void> {
+  const storageKey = storageKeyForResult(job, id, format);
+  try {
+    await env.IMAGES.put(storageKey, bytes, {
+      httpMetadata: {
+        contentType: mimeType,
+        contentDisposition: `inline; filename="${id}.${format}"`,
+      },
+      customMetadata: {
+        jobId: job.id,
+        spaceId: job.space_id,
+        resultIndex: String(resultIndex),
+      },
+    });
+  } catch (error) {
+    throw new ProviderError(
+      "image_storage_failed",
+      `模型已返回图片，但保存到对象存储失败：${redactSecrets(error instanceof Error ? error.message : "未知错误")}`,
+      true,
+    );
+  }
+
+  try {
+    await insertImageAsset(env.DB, {
+      id,
+      space_id: job.space_id,
+      job_id: job.id,
+      storage_key: storageKey,
+      mime_type: mimeType,
+      format,
+      width: job.width,
+      height: job.height,
+      byte_size: bytes.byteLength,
+      sha256: await sha256Hex(bytes),
+    });
+    await insertImageUsageEvent(env.DB, job.space_id, id);
+  } catch (error) {
+    throw new ProviderError(
+      "image_asset_persist_failed",
+      `模型已返回图片并保存到对象存储，但写入图片记录失败；下次重试会优先补保存记录：${redactSecrets(error instanceof Error ? error.message : "未知错误")}`,
+      true,
+    );
+  }
 }
 
 async function requestGenerationBatch(
@@ -328,10 +517,11 @@ async function requestGenerationBatch(
 
     if (!response.ok) {
       const text = await providerMessage(response);
+      const code = providerErrorCode(response.status, text);
       throw new ProviderError(
-        providerErrorCode(response.status),
+        code,
         providerStatusMessage(response.status, text, timeoutMs),
-        response.status === 429 || response.status >= 500,
+        providerErrorRetryable(code, response.status),
       );
     }
 
@@ -353,16 +543,16 @@ async function requestGenerationBatch(
 
 async function providerRequestBody(job: GenerationJobRecord, env: Env): Promise<BodyInit> {
   const payload = buildImageGenerationPayload(job, 1);
-  if (!job.reference_image_storage_key) {
+  if (!hasReferenceImages(job)) {
     return JSON.stringify(payload);
   }
 
-  const referenceImage = await loadReferenceImageBlob(job, env);
+  const referenceImages = await loadReferenceImageBlobs(job, env);
   let maskImage: ProviderImageFilePart | undefined;
   if (job.mask_image_storage_key) {
     maskImage = await loadMaskImageBlob(job, env);
   }
-  return buildImageGenerationFormData(payload, referenceImage, maskImage);
+  return buildImageGenerationFormData(payload, referenceImages, maskImage);
 }
 
 function providerRequestHeaders(apiKey: string, body: BodyInit): HeadersInit {
@@ -375,30 +565,45 @@ function providerRequestHeaders(apiKey: string, body: BodyInit): HeadersInit {
   return headers;
 }
 
-export function providerErrorCode(status: number): string {
+export function providerErrorCode(status: number, message = ""): string {
+  if (isProviderBalanceMessage(message) || status === 402) return "provider_balance_insufficient";
+  if (isProviderContentRejectedMessage(message)) return "provider_content_rejected";
   if (status === 401 || status === 403) return "provider_auth_failed";
   if (status === 429) return "provider_rate_limited";
-  if (status === 522 || status === 524) return "provider_timeout";
-  if (status >= 500) return "provider_unavailable";
+  if (status === 408 || status === 504 || status === 522 || status === 524) return "provider_timeout";
+  if (status >= 500) return "provider_upstream_error";
   return "provider_rejected";
 }
 
 export function providerStatusMessage(status: number, message: string, timeoutMs: number): string {
+  const code = providerErrorCode(status, message);
+  if (code === "provider_auth_failed") return "模型服务鉴权失败，请检查 baseURL 和 API Key。";
+  if (code === "provider_balance_insufficient") return "模型服务余额或额度不足，请检查上游账号余额、套餐或额度限制。";
+  if (code === "provider_content_rejected") return message || "模型服务拒绝了这次请求，通常是内容安全或审核策略导致。请调整提示词或参考图后重试。";
   if (status === 522 || status === 524) {
     return `模型服务返回 ${status}，上游网关等待模型服务超时。当前 Worker 已允许最长等待 ${formatDuration(timeoutMs)}；如果单次生图经常超过 120 秒，请将 baseURL 指向 DNS-only/直连源站域名，或把上游接口改成异步任务/轮询模式。`;
   }
-  if (status === 502 || status === 503 || status === 504) {
-    return `模型服务返回 ${status}。当前 Worker 已允许最长等待 ${formatDuration(timeoutMs)}；如果仍然出现这个状态，通常是 baseURL 上游网关或模型服务在更早的位置超时。`;
+  if (code === "provider_timeout") {
+    return `模型服务返回 ${status}，请求等待超时。当前 Worker 已允许最长等待 ${formatDuration(timeoutMs)}；如果频繁超时，请检查上游网关和模型服务超时配置。`;
+  }
+  if (code === "provider_upstream_error") {
+    return `模型服务返回 ${status}，上游服务暂时不可用或内部错误。请检查 baseURL 网关、模型服务健康状态和上游错误日志。`;
   }
   return message || `模型服务返回 ${status}。`;
+}
+
+export function providerErrorRetryable(code: string, status: number): boolean {
+  if (code === "provider_timeout" || code === "provider_upstream_error" || code === "provider_rate_limited") return true;
+  return status >= 500 && code !== "provider_auth_failed" && code !== "provider_balance_insufficient" && code !== "provider_content_rejected";
 }
 
 async function providerMessage(response: Response): Promise<string> {
   const text = redactSecrets(await response.text());
   try {
     const parsed = JSON.parse(text) as { error?: { message?: string; code?: string; type?: string } };
-    if (parsed.error?.message) {
-      return redactSecrets(parsed.error.message);
+    if (parsed.error) {
+      const parts = [parsed.error.code, parsed.error.type, parsed.error.message].filter((part): part is string => Boolean(part));
+      if (parts.length > 0) return redactSecrets(parts.join(" "));
     }
   } catch {
     // Fall back to trimmed text below.
@@ -410,6 +615,14 @@ async function providerMessage(response: Response): Promise<string> {
 function normalizeProviderError(error: unknown): ProviderError {
   if (error instanceof ProviderError) return error;
   return new ProviderError("generation_failed", redactSecrets(error instanceof Error ? error.message : "生成失败。"));
+}
+
+function isProviderBalanceMessage(message: string): boolean {
+  return /insufficient[_\s-]*(quota|balance|credit|funds)|billing|payment required|余额不足|额度不足|余额|欠费|quota exceeded/i.test(message);
+}
+
+function isProviderContentRejectedMessage(message: string): boolean {
+  return /content[_\s-]*policy|policy[_\s-]*violation|safety|moderation|unsafe|blocked by policy|内容审核|安全策略|审核|违规/i.test(message);
 }
 
 export function resolveGenerationTimeoutMs(value: string | undefined): number {
@@ -483,8 +696,8 @@ export function buildProviderImagePrompt(job: Pick<GenerationJobRecord, "prompt"
   return [prompt, MASKED_IMAGE_EDIT_PROMPT_SUFFIX].filter(Boolean).join("\n\n");
 }
 
-export function imageGenerationEndpointPath(job: Pick<GenerationJobRecord, "reference_image_storage_key">): "/images/edits" | "/images/generations" {
-  return job.reference_image_storage_key ? "/images/edits" : "/images/generations";
+export function imageGenerationEndpointPath(job: Pick<GenerationJobRecord, "reference_image_storage_key" | "reference_images_json">): "/images/edits" | "/images/generations" {
+  return hasReferenceImages(job) ? "/images/edits" : "/images/generations";
 }
 
 export function resolveImageBackground(prompt: string, outputFormat: string, configuredBackground = "auto"): "auto" | "opaque" | "transparent" {
@@ -543,12 +756,15 @@ export interface ProviderImageFilePart {
 
 export function buildImageGenerationFormData(
   payload: ImageGenerationPayload,
-  referenceImage: ProviderImageFilePart,
+  referenceImages: ProviderImageFilePart | ProviderImageFilePart[],
   maskImage?: ProviderImageFilePart,
 ): FormData {
   const formData = new FormData();
   appendImageGenerationFormFields(formData, payload);
-  formData.append("image[]", referenceImage.blob, referenceImage.filename);
+  const images = Array.isArray(referenceImages) ? referenceImages : [referenceImages];
+  for (const referenceImage of images) {
+    formData.append("image[]", referenceImage.blob, referenceImage.filename);
+  }
   if (maskImage) {
     formData.append("mask", maskImage.blob, maskImage.filename);
   }
@@ -561,22 +777,101 @@ function appendImageGenerationFormFields(formData: FormData, payload: ImageGener
   }
 }
 
-async function loadReferenceImageBlob(job: GenerationJobRecord, env: Env): Promise<{ blob: Blob; filename: string }> {
-  if (!job.reference_image_storage_key) {
+async function loadReferenceImageBlobs(job: GenerationJobRecord, env: Env): Promise<ProviderImageFilePart[]> {
+  const snapshots = referenceImageSnapshots(job);
+  if (snapshots.length === 0) {
     throw new ProviderError("reference_image_missing", "参考图文件不存在，请重新上传后再试。");
   }
-  const referenceObject = await env.IMAGES.get(job.reference_image_storage_key);
+  return Promise.all(snapshots.map((snapshot) => loadReferenceSnapshotBlob(snapshot, env)));
+}
+
+async function loadReferenceSnapshotBlob(snapshot: GenerationReferenceImageSnapshot, env: Env): Promise<ProviderImageFilePart> {
+  const referenceObject = await env.IMAGES.get(snapshot.storageKey);
   if (!referenceObject) {
     throw new ProviderError("reference_image_missing", "参考图文件不存在，请重新上传后再试。");
   }
 
   const referenceBytes = await referenceObject.arrayBuffer();
-  const referenceMimeType = job.reference_image_mime_type ?? referenceObject.httpMetadata?.contentType ?? "image/png";
+  const referenceMimeType = snapshot.mimeType || referenceObject.httpMetadata?.contentType || "image/png";
   const extension = referenceMimeType === "image/jpeg" ? "jpg" : referenceMimeType === "image/webp" ? "webp" : "png";
   return {
     blob: new Blob([referenceBytes], { type: referenceMimeType }),
-    filename: job.reference_image_name ?? `reference.${extension}`,
+    filename: snapshot.name || `reference.${extension}`,
   };
+}
+
+function referenceImageSnapshots(
+  job: Pick<
+    GenerationJobRecord,
+    "reference_images_json" | "reference_image_storage_key" | "reference_image_mime_type" | "reference_image_name" | "reference_image_byte_size"
+  >,
+): GenerationReferenceImageSnapshot[] {
+  const parsed = parseReferenceImagesJson(job.reference_images_json);
+  if (parsed.length > 0) return parsed;
+  if (!job.reference_image_storage_key) return [];
+  return [
+    {
+      storageKey: job.reference_image_storage_key,
+      mimeType: job.reference_image_mime_type ?? "image/png",
+      name: job.reference_image_name ?? "reference.png",
+      byteSize: job.reference_image_byte_size ?? 0,
+    },
+  ];
+}
+
+function parseReferenceImagesJson(value: string | null | undefined): GenerationReferenceImageSnapshot[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((item) => {
+        if (!item || typeof item !== "object") return null;
+        const record = item as Record<string, unknown>;
+        const storageKey = typeof record.storageKey === "string" ? record.storageKey : "";
+        if (!storageKey) return null;
+        return {
+          storageKey,
+          mimeType: typeof record.mimeType === "string" ? record.mimeType : "image/png",
+          name: typeof record.name === "string" ? record.name : "reference.png",
+          byteSize: typeof record.byteSize === "number" ? record.byteSize : 0,
+        };
+      })
+      .filter((item): item is GenerationReferenceImageSnapshot => Boolean(item));
+  } catch {
+    return [];
+  }
+}
+
+function hasReferenceImages(job: Pick<GenerationJobRecord, "reference_image_storage_key" | "reference_images_json">): boolean {
+  return Boolean(job.reference_image_storage_key || parseReferenceImagesJson(job.reference_images_json).length > 0);
+}
+
+function availableResultIndexes(quantity: number, existingResults: Array<{ result_index: number; status: string }>, existingImageCount: number): number[] {
+  const succeeded = new Set(existingResults.filter((result) => result.status === "succeeded").map((result) => result.result_index));
+  const indexes: number[] = [];
+  for (let index = 0; index < quantity; index += 1) {
+    if (!succeeded.has(index)) indexes.push(index);
+  }
+  if (indexes.length > 0) return indexes;
+  return Array.from({ length: Math.max(0, quantity - existingImageCount) }, (_, index) => existingImageCount + index);
+}
+
+async function completedSlotCount(env: Env, job: GenerationJobRecord): Promise<number> {
+  const images = await listImagesForJob(env.DB, job.space_id, job.id);
+  return images.length;
+}
+
+function generationResultId(jobId: string, resultIndex: number): string {
+  return `res_${jobId}_${resultIndex}`;
+}
+
+function imageIdForResult(jobId: string, resultIndex: number): string {
+  return `img_${jobId}_${resultIndex}`;
+}
+
+function storageKeyForResult(job: Pick<GenerationJobRecord, "space_id" | "id">, imageId: string, format: string): string {
+  return `${job.space_id}/${job.id}/${imageId}.${format}`;
 }
 
 async function loadMaskImageBlob(job: GenerationJobRecord, env: Env): Promise<{ blob: Blob; filename: string }> {
@@ -612,6 +907,44 @@ function mimeFromFormat(format: string): string {
   if (format === "webp") return "image/webp";
   if (format === "jpeg") return "image/jpeg";
   return "image/png";
+}
+
+function normalizeProviderContentType(value: string | null): string | null {
+  const normalized = value?.split(";")[0]?.trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === "image/jpg") return "image/jpeg";
+  return normalized;
+}
+
+function providerImageFormatFromResponse(contentType: string | null, rawUrl: string, fallbackFormat: string): string {
+  const fromMime = formatFromMimeType(contentType);
+  if (fromMime) return fromMime;
+  const fromUrl = formatFromImageUrl(rawUrl);
+  if (fromUrl) return fromUrl;
+  return normalizeProviderImageFormat(fallbackFormat);
+}
+
+function formatFromMimeType(contentType: string | null): string | null {
+  if (contentType === "image/png") return "png";
+  if (contentType === "image/webp") return "webp";
+  if (contentType === "image/jpeg") return "jpeg";
+  return null;
+}
+
+function formatFromImageUrl(rawUrl: string): string | null {
+  try {
+    const pathname = new URL(rawUrl).pathname.toLowerCase();
+    if (pathname.endsWith(".png")) return "png";
+    if (pathname.endsWith(".webp")) return "webp";
+    if (pathname.endsWith(".jpg") || pathname.endsWith(".jpeg")) return "jpeg";
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function normalizeProviderImageFormat(format: string): string {
+  return format === "jpeg" || format === "webp" ? format : "png";
 }
 
 const PROMPT_OPTIMIZER_INSTRUCTIONS = [

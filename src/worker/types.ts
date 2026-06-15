@@ -140,10 +140,15 @@ export interface GenerationJobRecord {
   reference_image_mime_type: string | null;
   reference_image_name: string | null;
   reference_image_byte_size: number | null;
+  reference_images_json: string | null;
   mask_image_storage_key: string | null;
   mask_image_mime_type: string | null;
   mask_image_name: string | null;
   mask_image_byte_size: number | null;
+  stage: JobStage | null;
+  progress_current: number;
+  progress_total: number | null;
+  error_reason: string | null;
   revised_prompt: string | null;
   usage_json: string | null;
   error_code: string | null;
@@ -151,6 +156,27 @@ export interface GenerationJobRecord {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+}
+
+export interface GenerationReferenceImageSnapshot {
+  storageKey: string;
+  mimeType: string;
+  name: string;
+  byteSize: number;
+}
+
+export interface GenerationJobResultRecord {
+  id: string;
+  space_id: string;
+  job_id: string;
+  result_index: number;
+  status: JobResultStatus;
+  image_asset_id: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at?: string;
 }
 
 export interface ImageAssetRecord {
@@ -225,6 +251,8 @@ export interface InspirationImportRunRecord {
 }
 
 export type JobStatus = "queued" | "running" | "succeeded" | "partial_succeeded" | "failed" | "cancelled";
+export type JobStage = "queued" | "submitting" | "waiting_provider" | "saving" | "completed" | "failed" | "cancelled";
+export type JobResultStatus = "queued" | "running" | "succeeded" | "failed";
 
 export type AppBindings = {
   Bindings: Env;

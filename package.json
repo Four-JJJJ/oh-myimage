@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "npm run build && wrangler dev --local",
+    "dev:preview": "vite --host 127.0.0.1 --port 5173",
     "dev:node": "npm run build && tsx src/node/server.ts",
     "build": "vite build",
     "deploy": "npm run build && wrangler deploy",
@@ -21,6 +22,8 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1046.0",
     "@aws-sdk/s3-request-presigner": "^3.1046.0",
+    "@base-ui/react": "^1.5.0",
+    "@central-icons-react/round-filled-radius-2-stroke-1.5": "^1.1.265",
     "@fontsource-variable/inter": "^5.2.8",
     "@hono/node-server": "^2.0.2",
     "@radix-ui/react-label": "^2.1.8",

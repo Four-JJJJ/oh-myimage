@@ -101,7 +101,7 @@ describe("generation creation", () => {
     expect(json.status).toBe("queued");
     expect(generationQueue.messages).toEqual([{ jobId: json.jobId, spaceId: "space_1" }]);
     expect(images.putCalls.map((call) => call.key)).toEqual([
-      `space_1/${json.jobId}/reference.png`,
+      `space_1/${json.jobId}/reference-1.png`,
       `space_1/${json.jobId}/mask.png`,
     ]);
     expect(images.putCalls.map((call) => call.options?.customMetadata?.kind)).toEqual(["reference", "mask"]);
@@ -112,10 +112,59 @@ describe("generation creation", () => {
         "space_1",
         "edit the selected area",
         "space_1",
-        `space_1/${json.jobId}/reference.png`,
+        `space_1/${json.jobId}/reference-1.png`,
         `space_1/${json.jobId}/mask.png`,
       ]),
     );
+  });
+
+  it("stores multiple reference image snapshots before enqueueing edit generation jobs", async () => {
+    const db = new FakeRouteDatabase();
+    const images = new FakeObjectStore();
+    const generationQueue = new RecordingQueue();
+    const formData = new FormData();
+    formData.set("prompt", "blend the references");
+    formData.set("aspectRatio", "1:1");
+    formData.set("width", "1024");
+    formData.set("height", "1024");
+    formData.set("quality", "auto");
+    formData.set("quantity", "1");
+    formData.set("outputFormat", "png");
+    formData.set("compression", "100");
+    formData.append("referenceImage", new File(["reference-one"], "source-one.png", { type: "image/png" }));
+    formData.append("referenceImage", new File(["reference-two"], "source-two.webp", { type: "image/webp" }));
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token" },
+        body: formData,
+      },
+      testEnv({ db, images, generationQueue }),
+    );
+    const json = (await response.json()) as { ok: true; jobId: string; status: "queued" };
+
+    expect(response.status).toBe(200);
+    expect(generationQueue.messages).toEqual([{ jobId: json.jobId, spaceId: "space_1" }]);
+    expect(images.putCalls.map((call) => call.key)).toEqual([
+      `space_1/${json.jobId}/reference-1.png`,
+      `space_1/${json.jobId}/reference-2.webp`,
+    ]);
+    expect(images.putCalls.map((call) => call.options?.customMetadata?.referenceIndex)).toEqual(["1", "2"]);
+    expect(db.generationJobInserts[0]).toEqual(
+      expect.arrayContaining([
+        json.jobId,
+        "space_1",
+        "blend the references",
+        "space_1",
+        `space_1/${json.jobId}/reference-1.png`,
+      ]),
+    );
+    expect(JSON.parse(String(db.generationJobInserts[0]?.at(-1)))).toEqual([
+      expect.objectContaining({ storageKey: `space_1/${json.jobId}/reference-1.png`, name: "source-one.png", mimeType: "image/png" }),
+      expect.objectContaining({ storageKey: `space_1/${json.jobId}/reference-2.webp`, name: "source-two.webp", mimeType: "image/webp" }),
+    ]);
   });
 
   it("copies source images before enqueueing edit generation jobs", async () => {
@@ -147,7 +196,7 @@ describe("generation creation", () => {
     expect(response.status).toBe(200);
     expect(json.status).toBe("queued");
     expect(generationQueue.messages).toEqual([{ jobId: json.jobId, spaceId: "space_1" }]);
-    expect(images.copyCalls.map((call) => [call.sourceKey, call.destinationKey])).toEqual([["space_1/img_1.png", `space_1/${json.jobId}/reference.png`]]);
+    expect(images.copyCalls.map((call) => [call.sourceKey, call.destinationKey])).toEqual([["space_1/img_1.png", `space_1/${json.jobId}/reference-1.png`]]);
     expect(images.putCalls).toEqual([]);
     expect(db.generationJobInserts[0]).toEqual(
       expect.arrayContaining([
@@ -155,7 +204,7 @@ describe("generation creation", () => {
         "space_1",
         "edit from existing image",
         "space_1",
-        `space_1/${json.jobId}/reference.png`,
+        `space_1/${json.jobId}/reference-1.png`,
       ]),
     );
   });
@@ -189,7 +238,7 @@ describe("generation creation", () => {
 
     expect(response.status).toBe(200);
     expect(generationQueue.messages).toEqual([{ jobId: json.jobId, spaceId: "space_1" }]);
-    expect(images.copyCalls.map((call) => call.destinationKey)).toEqual([`space_1/${json.jobId}/reference.png`]);
+    expect(images.copyCalls.map((call) => call.destinationKey)).toEqual([`space_1/${json.jobId}/reference-1.png`]);
     expect(images.putCalls.map((call) => call.key)).toEqual([`space_1/${json.jobId}/mask.png`]);
     expect(db.generationJobInserts[0]).toEqual(
       expect.arrayContaining([
@@ -197,7 +246,7 @@ describe("generation creation", () => {
         "space_1",
         "edit selected area from existing image",
         "space_1",
-        `space_1/${json.jobId}/reference.png`,
+        `space_1/${json.jobId}/reference-1.png`,
         `space_1/${json.jobId}/mask.png`,
       ]),
     );
@@ -229,6 +278,35 @@ describe("generation creation", () => {
 
     expect(response.status).toBe(400);
     expect(json.error.code).toBe("reference_source_conflict");
+  });
+
+  it("rejects more than eight uploaded reference images", async () => {
+    const formData = new FormData();
+    formData.set("prompt", "too many references");
+    formData.set("aspectRatio", "1:1");
+    formData.set("width", "1024");
+    formData.set("height", "1024");
+    formData.set("quality", "auto");
+    formData.set("quantity", "1");
+    formData.set("outputFormat", "png");
+    formData.set("compression", "100");
+    for (let index = 0; index < 9; index += 1) {
+      formData.append("referenceImage", new File(["reference-bytes"], `reference-${index + 1}.png`, { type: "image/png" }));
+    }
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token" },
+        body: formData,
+      },
+      testEnv({ images: new FakeObjectStore(), generationQueue: new RecordingQueue() }),
+    );
+    const json = (await response.json()) as { error: { code: string } };
+
+    expect(response.status).toBe(400);
+    expect(json.error.code).toBe("too_many_reference_images");
   });
 
   it("rejects source image ids outside the current space", async () => {

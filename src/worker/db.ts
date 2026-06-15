@@ -2,8 +2,11 @@ import { randomId, todayStartTimestamp } from "./http";
 import {
   AppDatabase,
   CredentialRecord,
+  GenerationJobResultRecord,
   GenerationJobRecord,
+  GenerationReferenceImageSnapshot,
   ImageAssetRecord,
+  JobStage,
   JobStatus,
   SessionRecord,
   SpaceRecord,
@@ -17,6 +20,13 @@ export interface StoredReferenceImage {
   mimeType: string;
   name: string;
   byteSize: number;
+}
+
+export interface JobStatusUpdate {
+  stage?: JobStage | null;
+  progressCurrent?: number | null;
+  progressTotal?: number | null;
+  errorReason?: string | null;
 }
 
 export interface DailyImageUsage {
@@ -135,18 +145,21 @@ export async function createGenerationJob(
   input: GenerationInput,
   model: string,
   baseUrlHash: string,
-  referenceImage?: StoredReferenceImage,
+  referenceImages: StoredReferenceImage[] = [],
   maskImage?: StoredReferenceImage,
   jobId = randomId("job"),
 ): Promise<string> {
+  const primaryReference = referenceImages[0];
+  const referenceImagesJson = referenceImages.length > 0 ? JSON.stringify(referenceImages.map(referenceImageSnapshot)) : null;
   await db
     .prepare(
       `INSERT INTO generation_jobs (
         id, space_id, status, prompt, aspect_ratio, width, height, quality, quantity,
         output_format, background, compression, moderation, model, base_url_hash,
         reference_image_storage_key, reference_image_mime_type, reference_image_name, reference_image_byte_size,
-        mask_image_storage_key, mask_image_mime_type, mask_image_name, mask_image_byte_size
-      ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        mask_image_storage_key, mask_image_mime_type, mask_image_name, mask_image_byte_size,
+        stage, progress_current, progress_total, reference_images_json
+      ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`,
     )
     .bind(
       jobId,
@@ -163,14 +176,16 @@ export async function createGenerationJob(
       input.moderation,
       model,
       baseUrlHash,
-      referenceImage?.storageKey ?? null,
-      referenceImage?.mimeType ?? null,
-      referenceImage?.name ?? null,
-      referenceImage?.byteSize ?? null,
+      primaryReference?.storageKey ?? null,
+      primaryReference?.mimeType ?? null,
+      primaryReference?.name ?? null,
+      primaryReference?.byteSize ?? null,
       maskImage?.storageKey ?? null,
       maskImage?.mimeType ?? null,
       maskImage?.name ?? null,
       maskImage?.byteSize ?? null,
+      input.quantity,
+      referenceImagesJson,
     )
     .run();
   return jobId;
@@ -229,6 +244,40 @@ export async function listImagesForJobs(db: AppDatabase, spaceId: string, jobIds
     )
     .bind(spaceId, ...jobIds)
     .all<ImageAssetRecord>();
+  return result.results ?? [];
+}
+
+export async function listGenerationResultsForJob(
+  db: AppDatabase,
+  spaceId: string,
+  jobId: string,
+): Promise<GenerationJobResultRecord[]> {
+  const result = await db
+    .prepare(
+      `SELECT * FROM generation_job_results
+       WHERE space_id = ? AND job_id = ?
+       ORDER BY result_index ASC`,
+    )
+    .bind(spaceId, jobId)
+    .all<GenerationJobResultRecord>();
+  return result.results ?? [];
+}
+
+export async function listGenerationResultsForJobs(
+  db: AppDatabase,
+  spaceId: string,
+  jobIds: string[],
+): Promise<GenerationJobResultRecord[]> {
+  if (jobIds.length === 0) return [];
+  const placeholders = jobIds.map(() => "?").join(", ");
+  const result = await db
+    .prepare(
+      `SELECT * FROM generation_job_results
+       WHERE space_id = ? AND job_id IN (${placeholders})
+       ORDER BY job_id ASC, result_index ASC`,
+    )
+    .bind(spaceId, ...jobIds)
+    .all<GenerationJobResultRecord>();
   return result.results ?? [];
 }
 
@@ -349,19 +398,36 @@ export async function updateJobStatus(
   status: JobStatus,
   errorCode?: string,
   errorMessage?: string,
+  update: JobStatusUpdate = {},
 ): Promise<void> {
   const completed = status === "succeeded" || status === "partial_succeeded" || status === "failed" || status === "cancelled";
+  const nextStage = update.stage ?? stageForStatus(status);
   await db
     .prepare(
       `UPDATE generation_jobs
        SET status = ?,
            error_code = ?,
            error_message = ?,
+           error_reason = ?,
+           stage = ?,
+           progress_current = COALESCE(?, progress_current),
+           progress_total = COALESCE(?, progress_total),
            started_at = COALESCE(started_at, CASE WHEN ? = 'running' THEN CURRENT_TIMESTAMP ELSE started_at END),
            completed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE completed_at END
        WHERE id = ?`,
     )
-    .bind(status, errorCode ?? null, errorMessage ?? null, status, completed, jobId)
+    .bind(
+      status,
+      errorCode ?? null,
+      errorMessage ?? null,
+      update.errorReason ?? errorMessage ?? null,
+      nextStage,
+      update.progressCurrent ?? null,
+      update.progressTotal ?? null,
+      status,
+      completed,
+      jobId,
+    )
     .run();
 }
 
@@ -377,10 +443,43 @@ export async function completeJob(
   await db
     .prepare(
       `UPDATE generation_jobs
-       SET status = ?, revised_prompt = ?, usage_json = ?, error_code = ?, error_message = ?, completed_at = CURRENT_TIMESTAMP
+       SET status = ?, stage = 'completed', progress_current = quantity, progress_total = quantity,
+           revised_prompt = ?, usage_json = ?, error_code = ?, error_message = ?, error_reason = ?, completed_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
     )
-    .bind(status, revisedPrompt, usageJson, errorCode, errorMessage, jobId)
+    .bind(status, revisedPrompt, usageJson, errorCode, errorMessage, errorMessage, jobId)
+    .run();
+}
+
+export async function upsertGenerationJobResult(
+  db: AppDatabase,
+  row: Omit<GenerationJobResultRecord, "created_at">,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO generation_job_results (
+        id, space_id, job_id, result_index, status, image_asset_id, error_code, error_message, started_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (job_id, result_index) DO UPDATE SET
+        status = excluded.status,
+        image_asset_id = excluded.image_asset_id,
+        error_code = excluded.error_code,
+        error_message = excluded.error_message,
+        started_at = COALESCE(generation_job_results.started_at, excluded.started_at),
+        completed_at = excluded.completed_at`,
+    )
+    .bind(
+      row.id,
+      row.space_id,
+      row.job_id,
+      row.result_index,
+      row.status,
+      row.image_asset_id,
+      row.error_code,
+      row.error_message,
+      row.started_at,
+      row.completed_at,
+    )
     .run();
 }
 
@@ -416,4 +515,21 @@ function imageUsageEventId(imageId: string): string {
 function dbNumber(value: number | string | null | undefined): number {
   const parsed = typeof value === "number" ? value : Number(value ?? 0);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function referenceImageSnapshot(image: StoredReferenceImage): GenerationReferenceImageSnapshot {
+  return {
+    storageKey: image.storageKey,
+    mimeType: image.mimeType,
+    name: image.name,
+    byteSize: image.byteSize,
+  };
+}
+
+function stageForStatus(status: JobStatus): JobStage {
+  if (status === "queued") return "queued";
+  if (status === "running") return "waiting_provider";
+  if (status === "cancelled") return "cancelled";
+  if (status === "failed") return "failed";
+  return "completed";
 }

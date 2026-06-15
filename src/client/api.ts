@@ -1,5 +1,7 @@
 export interface AppConfig {
   model: string;
+  modelOptions?: string[];
+  models?: string[];
   promptOptimizerModel: string;
   maxImagesPerRequest: number;
   maxDailyImagesPerSpace: number;
@@ -61,6 +63,9 @@ export interface InspirationItem {
 export interface GenerationJob {
   id: string;
   status: "queued" | "running" | "succeeded" | "partial_succeeded" | "failed" | "cancelled";
+  stage?: "queued" | "submitting" | "waiting_provider" | "saving" | "completed" | "failed" | "cancelled" | null;
+  progress_current?: number;
+  progress_total?: number | null;
   prompt: string;
   aspect_ratio: string;
   width: number;
@@ -72,9 +77,29 @@ export interface GenerationJob {
   compression: number | null;
   error_code: string | null;
   error_message: string | null;
+  error_reason?: string | null;
+  results?: GenerationJobResult[];
+  referenceImages?: GenerationReferenceImage[];
   created_at: string;
   started_at?: string | null;
   completed_at?: string | null;
+}
+
+export interface GenerationJobResult {
+  index: number;
+  status: "queued" | "running" | "succeeded" | "failed";
+  imageId: string | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+export interface GenerationReferenceImage {
+  name: string;
+  mimeType: string;
+  byteSize: number;
+  url: string;
 }
 
 export interface GenerationRecord {

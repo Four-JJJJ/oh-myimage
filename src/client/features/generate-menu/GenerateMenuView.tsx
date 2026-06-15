@@ -1,0 +1,1452 @@
+import { ClipboardEvent, ChangeEvent, Dispatch, FormEvent, ReactNode, RefObject, SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  IconArrowRotateClockwise,
+  IconChevronDownSmall,
+  IconClipboard,
+  IconCloudDownload,
+  IconCrossSmall,
+  IconMagicWand2,
+  IconSparkle,
+} from "@central-icons-react/round-filled-radius-2-stroke-1.5";
+import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem } from "../../api";
+import referenceDeleteIcon from "../../assets/figma/reference-delete.svg";
+import referenceIcon from "../../assets/figma/reference-icon.svg";
+import sidebarAdd from "../../assets/figma/sidebar-add.svg";
+import { cn } from "../../lib/utils";
+import { Input } from "../../components/ui/input";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../components/ui/tabs";
+import { AppShell } from "../generate-shell/AppShell";
+import { CossButton, CossTextarea } from "../shared/coss";
+import {
+  collapsedPromptMaxHeightPx,
+  conversationCanvasBottomPadding,
+  conversationFlowGapPx,
+  conversationHorizontalPaddingPx,
+  conversationTopPaddingPx,
+  generationModuleGapPx,
+  isScrollNearBottom,
+} from "./layout";
+import { buildConversationRecords, buildGenerationFlowItem, buildSidebarConversations, composerDraftFromRecord, createDraftConversation, mergeJobReferenceImages, submittedReferenceImages, updateDraftConversationTitle, type ConversationListItem } from "./mappers";
+import { formatGenerationSettingsSummary, formatLabels, formatOptions, generationSettingsSummaryParts, qualityLabels, qualityOptions, ratioLabels, ratioOptions, resolutionOptions } from "./options";
+
+const generationStageMaxWidthPx = 840;
+const generationStageMaxHeightPx = 360;
+
+interface GenerateMenuViewProps {
+  config: AppConfig;
+  providerConfigured: boolean;
+  records: GenerationRecord[];
+  setRecords: Dispatch<SetStateAction<GenerationRecord[]>>;
+  recordsError: string;
+  nextCursor: string | null;
+  loadRecords: (cursor?: string, options?: { background?: boolean }) => Promise<void>;
+  onProviderNeeded: () => void;
+  onNavigate: (view: "generate" | "gallery" | "settings") => void;
+  onLogout: () => void;
+  onUsageChanged: () => Promise<void>;
+}
+
+interface GenerateForm {
+  prompt: string;
+  model: string;
+  aspectRatio: string;
+  resolution: string;
+  width: number;
+  height: number;
+  quality: string;
+  quantity: number;
+  outputFormat: string;
+  compression: number;
+}
+
+interface ReferenceImagePreview {
+  file: File;
+  url: string;
+  name: string;
+}
+
+interface SourceImagePreview {
+  id: string;
+  url: string;
+  name: string;
+}
+
+interface PreviewImage {
+  url: string;
+  prompt?: string;
+}
+
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (
+        element: HTMLElement,
+        options: {
+          sitekey: string;
+          callback: (token: string) => void;
+          "expired-callback": () => void;
+          theme: "light" | "dark";
+        },
+      ) => string;
+      remove?: (widgetId: string) => void;
+    };
+  }
+}
+
+const defaultForm: GenerateForm = {
+  prompt: "",
+  model: "gpt-image-2",
+  aspectRatio: "16:9",
+  resolution: "1K",
+  width: 1536,
+  height: 864,
+  quality: "auto",
+  quantity: 1,
+  outputFormat: "png",
+  compression: 100,
+};
+
+const ratioSizes: Record<string, [number, number]> = {
+  "16:9": [1536, 864],
+  "9:16": [864, 1536],
+  "4:3": [1536, 1152],
+  "3:4": [1152, 1536],
+  "3:2": [1536, 1024],
+  "2:3": [1024, 1536],
+  "1:1": [1024, 1024],
+};
+
+const resolutionLongEdge: Record<string, number> = {
+  "1K": 1536,
+  "2K": 2048,
+  "4K": 3840,
+};
+
+function ComposerReferenceIcon({ className }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 16 16" fill="none">
+      <path
+        fillRule="evenodd"
+        clipRule="evenodd"
+        d="M8 2C8.27613 2 8.5 2.22386 8.5 2.5V7.5H13.5C13.7761 7.5 14 7.72387 14 8C14 8.27613 13.7761 8.5 13.5 8.5H8.5V13.5C8.5 13.7761 8.27613 14 8 14C7.72387 14 7.5 13.7761 7.5 13.5V8.5H2.5C2.22386 8.5 2 8.27613 2 8C2 7.72387 2.22386 7.5 2.5 7.5H7.5V2.5C7.5 2.22386 7.72387 2 8 2Z"
+        fill="currentColor"
+        fillOpacity="0.9"
+      />
+    </svg>
+  );
+}
+
+function SentReferenceIcon({ className }: { className?: string }) {
+  return <img aria-hidden="true" src={referenceIcon} alt="" className={className} draggable={false} />;
+}
+
+function ComposerOptimizeIcon({ className }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 16 16" fill="none">
+      <path
+        d="M3.14227 4.75207L2.97788 5.12919C2.85758 5.40528 2.47571 5.40528 2.35541 5.12919L2.19104 4.75207C1.89804 4.07965 1.3703 3.54427 0.71178 3.25139L0.205365 3.02615C-0.0684548 2.90435 -0.0684548 2.50587 0.205365 2.38408L0.683467 2.17143C1.35892 1.87101 1.89611 1.31582 2.18408 0.620552L2.35288 0.213023C2.47052 -0.0710075 2.86278 -0.0710075 2.98042 0.213023L3.14921 0.620552C3.43718 1.31582 3.97439 1.87101 4.64987 2.17143L5.12792 2.38408C5.40181 2.50587 5.40181 2.90435 5.12792 3.02615L4.62152 3.25139C3.96301 3.54427 3.43525 4.07965 3.14227 4.75207ZM2.04241 14.4088C2.72569 10.2813 4.20737 1.33105 14 1.33105C13.0028 3.33105 12.3333 4.33105 11.6667 4.99772L11 5.66439L12 6.33105C11.3333 8.33107 9.33333 10.6644 6.66667 10.9977C4.88764 11.2201 3.77614 12.4423 3.33216 14.6644H2C2.01383 14.5815 2.02793 14.4962 2.04241 14.4088Z"
+        fill="currentColor"
+      />
+    </svg>
+  );
+}
+
+function ComposerModelIcon({ className }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 16 16" fill="none">
+      <path
+        d="M7.50633 1.45345C7.22727 1.37517 6.93313 1.33333 6.62963 1.33333C5.23029 1.33333 4.03907 2.21984 3.58513 3.46133C2.29548 3.75523 1.33333 4.90849 1.33333 6.28704C1.33333 6.92773 1.54163 7.52027 1.89357 8C1.54163 8.47973 1.33333 9.07227 1.33333 9.71293C1.33333 10.8398 1.97629 11.8154 2.91382 12.2948C3.41047 13.6773 4.73263 14.6667 6.28704 14.6667C6.71933 14.6667 7.13427 14.5899 7.51847 14.4493C7.50647 14.4063 7.5 14.3609 7.5 14.3141V11.335V11.3333C7.5 10.4129 6.7538 9.66667 5.83333 9.66667C5.55719 9.66667 5.33333 9.4428 5.33333 9.16667C5.33333 8.89053 5.55719 8.66667 5.83333 8.66667C6.46397 8.66667 7.04347 8.8856 7.5 9.25153V4.66666V4.66533V1.53333C7.5 1.50614 7.5022 1.47946 7.50633 1.45345Z"
+        fill="currentColor"
+        fillOpacity="0.9"
+      />
+      <path
+        d="M8.48161 14.4493C8.86581 14.5899 9.28074 14.6667 9.71301 14.6667C11.2675 14.6667 12.5896 13.6773 13.0863 12.2948C14.0238 11.8154 14.6667 10.8398 14.6667 9.71293C14.6667 9.07227 14.4585 8.47973 14.1065 8C14.4585 7.52027 14.6667 6.92773 14.6667 6.28704C14.6667 4.90849 13.7046 3.75523 12.4149 3.46133C11.961 2.21984 10.7698 1.33333 9.37048 1.33333C9.06694 1.33333 8.77281 1.37517 8.49374 1.45345C8.49788 1.47946 8.50008 1.50614 8.50008 1.53333V4.66909C8.50141 5.58845 9.24708 6.33333 10.1667 6.33333C10.4429 6.33333 10.6667 6.55719 10.6667 6.83333C10.6667 7.10947 10.4429 7.33333 10.1667 7.33333C9.53614 7.33333 8.95661 7.1144 8.50008 6.74847V14.3141C8.50008 14.3609 8.49361 14.4063 8.48161 14.4493Z"
+        fill="currentColor"
+        fillOpacity="0.9"
+      />
+    </svg>
+  );
+}
+
+function ComposerQualityIcon({ className }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 16 16" fill="none">
+      <path
+        d="M6 8.5C7.30227 8.5 8.3852 9.43267 8.61913 10.6667H13.5C13.7761 10.6667 14 10.8905 14 11.1667C14 11.4428 13.7761 11.6667 13.5 11.6667H8.61913C8.3852 12.9007 7.30227 13.8333 6 13.8333C4.69773 13.8333 3.61482 12.9007 3.38086 11.6667H2.5C2.22386 11.6667 2 11.4428 2 11.1667C2 10.8905 2.22386 10.6667 2.5 10.6667H3.38086C3.61482 9.43267 4.69773 8.5 6 8.5Z"
+        fill="currentColor"
+        fillOpacity="0.9"
+      />
+      <path
+        d="M10 2.16667C11.3023 2.16667 12.3852 3.09934 12.6191 4.33333H13.5C13.7761 4.33333 14 4.55719 14 4.83333C14 5.10947 13.7761 5.33333 13.5 5.33333H12.6191C12.3852 6.56733 11.3023 7.5 10 7.5C8.69773 7.5 7.6148 6.56733 7.38087 5.33333H2.5C2.22386 5.33333 2 5.10947 2 4.83333C2 4.55719 2.22386 4.33333 2.5 4.33333H7.38087C7.6148 3.09934 8.69773 2.16667 10 2.16667Z"
+        fill="currentColor"
+        fillOpacity="0.9"
+      />
+    </svg>
+  );
+}
+
+const pollIntervalMs = 2000;
+const maxReferenceImages = 8;
+const referenceImageMaxBytes = 10 * 1024 * 1024;
+const referenceImageMimeTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
+const composerTextareaLineHeight = 21;
+const composerTextareaMinRows = 2;
+const composerTextareaMaxRows = 12;
+const imageModelOptions = ["gpt-image-2"] as const;
+
+export function GenerateMenuView({
+  config,
+  providerConfigured,
+  records,
+  setRecords,
+  recordsError,
+  nextCursor,
+  loadRecords,
+  onProviderNeeded,
+  onNavigate,
+  onLogout,
+  onUsageChanged,
+}: GenerateMenuViewProps) {
+  const [form, setForm] = useState<GenerateForm>(defaultForm);
+  const [referenceImages, setReferenceImages] = useState<ReferenceImagePreview[]>([]);
+  const [sourceImagePreview, setSourceImagePreview] = useState<SourceImagePreview | null>(null);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(records[0]?.job.id ?? null);
+  const [draftConversation, setDraftConversation] = useState<ReturnType<typeof createDraftConversation> | null>(null);
+  const [activeJob, setActiveJob] = useState<GenerationJob | null>(null);
+  const [activeImages, setActiveImages] = useState<ImageItem[]>([]);
+  const [conversationIdsByRecordId, setConversationIdsByRecordId] = useState<Record<string, string>>({});
+  const [sourceImageId, setSourceImageId] = useState<string | undefined>();
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [optimizing, setOptimizing] = useState(false);
+  const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
+  const [turnstileToken, setTurnstileToken] = useState("");
+  const referenceInputRef = useRef<HTMLInputElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const objectUrlsRef = useRef<string[]>([]);
+  const canvasScrollRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLFormElement | null>(null);
+  const shouldStickToBottomRef = useRef(true);
+  const [composerHeight, setComposerHeight] = useState(170);
+
+  const conversations = useMemo(
+    () => buildSidebarConversations(records, draftConversation, conversationIdsByRecordId),
+    [conversationIdsByRecordId, draftConversation, records],
+  );
+  const activeConversation = useMemo(() => {
+    if (activeConversationId) return conversations.find((conversation) => conversation.id === activeConversationId) ?? null;
+    if (draftConversation) return null;
+    return conversations[0] ?? null;
+  }, [activeConversationId, conversations, draftConversation]);
+  const activeConversationRecords = useMemo(() => {
+    if (draftConversation || !activeConversation?.id) return [];
+    return buildConversationRecords(records, conversationIdsByRecordId, activeConversation.id);
+  }, [activeConversation?.id, conversationIdsByRecordId, draftConversation, records]);
+  const activeFlows = useMemo(
+    () =>
+      activeConversationRecords.map((record) =>
+        buildGenerationFlowItem(record.job.id === activeJob?.id ? { ...record, job: activeJob, images: activeImages } : record),
+      ),
+    [activeConversationRecords, activeImages, activeJob],
+  );
+
+  useEffect(() => {
+    setConversationIdsByRecordId((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const record of records) {
+        if (next[record.job.id]) continue;
+        next[record.job.id] = record.job.id;
+        changed = true;
+      }
+      return changed ? next : current;
+    });
+  }, [records]);
+
+  useEffect(() => {
+    if (!draftConversation && !activeConversationId && records[0]) setActiveConversationId(conversationIdsByRecordId[records[0].job.id] ?? records[0].job.id);
+  }, [activeConversationId, conversationIdsByRecordId, draftConversation, records]);
+
+  useEffect(() => {
+    if (!draftConversation) return;
+    setDraftConversation((current) => (current ? updateDraftConversationTitle(current, form.prompt) : current));
+  }, [draftConversation?.id, form.prompt]);
+
+  useEffect(() => {
+    if (!activeJob || isTerminalJobStatus(activeJob.status)) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const result = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${activeJob.id}`);
+        const nextJob = mergeJobReferenceImages(result.job, activeJob);
+        setActiveJob(nextJob);
+        setActiveImages(result.images);
+        upsertRecord(setRecords, nextJob, result.images);
+        if (isTerminalJobStatus(nextJob.status)) {
+          window.clearInterval(timer);
+          void onUsageChanged();
+          void loadRecords(undefined, { background: true });
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "刷新任务状态失败。");
+      }
+    }, pollIntervalMs);
+    return () => window.clearInterval(timer);
+  }, [activeJob?.id, activeJob?.status, loadRecords, onUsageChanged, setRecords]);
+
+  useEffect(() => {
+    if (!textareaRef.current) return;
+    const textarea = textareaRef.current;
+    const minHeight = composerTextareaLineHeight * composerTextareaMinRows;
+    const maxHeight = composerTextareaLineHeight * composerTextareaMaxRows;
+    textarea.style.height = `${minHeight}px`;
+    const nextHeight = Math.min(Math.max(textarea.scrollHeight, minHeight), maxHeight);
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+  }, [form.prompt]);
+
+  useEffect(() => () => revokeObjectUrls(objectUrlsRef.current), []);
+
+  useEffect(() => {
+    if (!composerRef.current) return;
+    const composer = composerRef.current;
+    const syncComposerHeight = () => setComposerHeight(composer.getBoundingClientRect().height);
+    syncComposerHeight();
+    const observer = new ResizeObserver(syncComposerHeight);
+    observer.observe(composer);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasScrollRef.current;
+    if (!canvas || !shouldStickToBottomRef.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      canvas.scrollTo({ top: canvas.scrollHeight, behavior: "smooth" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeFlows, error]);
+
+  const updateForm = useCallback(<K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) => {
+    setForm((current) => updateGenerateForm(current, key, value));
+  }, []);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!providerConfigured) {
+      onProviderNeeded();
+      return;
+    }
+    if (!form.prompt.trim()) {
+      textareaRef.current?.focus();
+      return;
+    }
+    if (config.turnstileRequired && config.turnstileSiteKey && !turnstileToken) {
+      setError("请先完成人机验证。");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    const submittedReferences = submittedReferenceImages(referenceImages, sourceImagePreview);
+    try {
+      const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
+        method: "POST",
+        body: generationRequestBody(form, referenceImages, sourceImageId, turnstileToken),
+      });
+      void onUsageChanged();
+      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+      const firstPollJob = mergeJobReferenceImages(firstPoll.job, submittedReferences.length > 0 ? { ...firstPoll.job, referenceImages: submittedReferences } : null);
+      const conversationId = draftConversation?.id ?? activeConversationId ?? firstPoll.job.id;
+      shouldStickToBottomRef.current = true;
+      setActiveJob(firstPollJob);
+      setActiveImages(firstPoll.images);
+      setConversationIdsByRecordId((current) => ({ ...current, [firstPollJob.id]: conversationId }));
+      setActiveConversationId(conversationId);
+      setDraftConversation(null);
+      upsertRecord(setRecords, firstPollJob, firstPoll.images);
+      setForm((current) => ({ ...current, prompt: "" }));
+      setReferenceImages([]);
+      setSourceImageId(undefined);
+      setSourceImagePreview(null);
+      void loadRecords(undefined, { background: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "创建任务失败。");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function optimizePrompt() {
+    if (!providerConfigured) {
+      onProviderNeeded();
+      return;
+    }
+    if (!form.prompt.trim()) {
+      textareaRef.current?.focus();
+      return;
+    }
+    setOptimizing(true);
+    setError("");
+    try {
+      const result = await api<{ ok: true; optimizedPrompt: string }>("/api/prompts/optimize", {
+        method: "POST",
+        body: JSON.stringify({
+          prompt: form.prompt,
+          aspectRatio: form.aspectRatio,
+          width: form.width,
+          height: form.height,
+          quality: form.quality,
+          outputFormat: form.outputFormat,
+        }),
+      });
+      updateForm("prompt", result.optimizedPrompt.trim());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "提示词优化失败。");
+    } finally {
+      setOptimizing(false);
+    }
+  }
+
+  function addReferenceFiles(event: ChangeEvent<HTMLInputElement>) {
+    addReferenceFilesFromList(Array.from(event.target.files ?? []));
+    event.target.value = "";
+  }
+
+  function handlePaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const files = Array.from(event.clipboardData.files).filter((item) => item.type.startsWith("image/"));
+    if (files.length === 0) return;
+    event.preventDefault();
+    addReferenceFilesFromList(files);
+  }
+
+  function addReferenceFilesFromList(files: File[]) {
+    if (files.length === 0) return;
+    const remaining = maxReferenceImages - referenceImages.length;
+    if (remaining <= 0) {
+      setError(`参考图最多 ${maxReferenceImages} 张。`);
+      return;
+    }
+
+    const accepted: ReferenceImagePreview[] = [];
+    for (const file of files.slice(0, remaining)) {
+      const mimeType = normalizeImageMime(file.type);
+      if (!referenceImageMimeTypes.has(mimeType)) {
+        setError("参考图仅支持 PNG、JPEG 或 WebP 格式。");
+        return;
+      }
+      if (file.size > referenceImageMaxBytes) {
+        setError("参考图不能超过 10MB。");
+        return;
+      }
+      const url = URL.createObjectURL(file);
+      objectUrlsRef.current.push(url);
+      accepted.push({ file, name: file.name || "参考图", url });
+    }
+
+    if (files.length > remaining) setError(`参考图最多 ${maxReferenceImages} 张。`);
+    else setError("");
+    setSourceImageId(undefined);
+    setSourceImagePreview(null);
+    setReferenceImages((current) => [...current, ...accepted]);
+  }
+
+  function clearAllReferences() {
+    revokeObjectUrls(objectUrlsRef.current);
+    objectUrlsRef.current = [];
+    setReferenceImages([]);
+    setSourceImageId(undefined);
+    setSourceImagePreview(null);
+    if (referenceInputRef.current) referenceInputRef.current.value = "";
+  }
+
+  function continueFromRecord(record: GenerationRecord, image?: ImageItem) {
+    const draft = composerDraftFromRecord(record, image?.id);
+    shouldStickToBottomRef.current = true;
+    setForm((current) => ({ ...current, prompt: draft.prompt, quality: draft.selectedQuality }));
+    setSourceImageId(draft.sourceImageId);
+    setSourceImagePreview(image ? { id: image.id, url: image.url, name: "参考图 1" } : null);
+    revokeObjectUrls(objectUrlsRef.current);
+    objectUrlsRef.current = [];
+    setReferenceImages([]);
+    setDraftConversation(null);
+    setActiveConversationId(conversationIdsByRecordId[record.job.id] ?? record.job.id);
+    window.requestAnimationFrame(() => textareaRef.current?.focus());
+  }
+
+  async function regenerate(record: GenerationRecord) {
+    if (!providerConfigured) {
+      onProviderNeeded();
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const result = await api<{ ok: true; jobId: string; status: "queued" }>(`/api/generations/${record.job.id}/regenerate`, { method: "POST" });
+      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+      const conversationId = conversationIdsByRecordId[record.job.id] ?? record.job.id;
+      shouldStickToBottomRef.current = true;
+      setActiveJob(firstPoll.job);
+      setActiveImages(firstPoll.images);
+      setConversationIdsByRecordId((current) => ({ ...current, [firstPoll.job.id]: conversationId }));
+      setActiveConversationId(conversationId);
+      setDraftConversation(null);
+      upsertRecord(setRecords, firstPoll.job, firstPoll.images);
+      void onUsageChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重新生成失败。");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const sidebar = (
+    <ConversationSidebar
+      conversations={conversations}
+      activeId={draftConversation?.id ?? activeConversationId}
+      error={recordsError}
+      nextCursor={nextCursor}
+      onNew={() => {
+        shouldStickToBottomRef.current = true;
+        const draft = createDraftConversation();
+        setDraftConversation(draft);
+        setActiveConversationId(draft.id);
+        setActiveJob(null);
+        setActiveImages([]);
+        setSourceImageId(undefined);
+        setForm(defaultForm);
+        clearAllReferences();
+        window.requestAnimationFrame(() => textareaRef.current?.focus());
+      }}
+      onSelect={(id) => {
+        shouldStickToBottomRef.current = true;
+        setDraftConversation(null);
+        setActiveConversationId(id);
+      }}
+      onLoadMore={() => void loadRecords(nextCursor ?? undefined)}
+    />
+  );
+
+  return (
+    <AppShell activeView="generate" sidebar={sidebar} onNavigate={onNavigate} onLogout={onLogout}>
+      <GenerationCanvas
+        scrollRef={canvasScrollRef}
+        composerHeight={composerHeight}
+        flows={activeFlows}
+        error={error}
+        onPreview={setPreviewImage}
+        onContinue={continueFromRecord}
+        onRegenerate={regenerate}
+        onCopyPrompt={(prompt) => void navigator.clipboard?.writeText(prompt)}
+        onScrollStickyChange={(isSticky) => {
+          shouldStickToBottomRef.current = isSticky;
+        }}
+      />
+      <ComposerPanel
+        formRef={composerRef}
+        form={form}
+        config={config}
+        loading={loading}
+        optimizing={optimizing}
+        providerConfigured={providerConfigured}
+        referenceImages={referenceImages}
+        sourceImagePreview={sourceImagePreview}
+        textareaRef={textareaRef}
+        referenceInputRef={referenceInputRef}
+        onSubmit={submit}
+        onPromptPaste={handlePaste}
+        onReferenceInput={addReferenceFiles}
+        onPickReference={() => referenceInputRef.current?.click()}
+        onRemoveSourceReference={() => {
+          setSourceImageId(undefined);
+          setSourceImagePreview(null);
+        }}
+        onRemoveReference={(index) =>
+          setReferenceImages((current) => {
+            const removed = current[index];
+            if (removed) {
+              URL.revokeObjectURL(removed.url);
+              objectUrlsRef.current = objectUrlsRef.current.filter((url) => url !== removed.url);
+            }
+            return current.filter((_, itemIndex) => itemIndex !== index);
+          })
+        }
+        onOptimize={() => void optimizePrompt()}
+        onUpdate={updateForm}
+        turnstileToken={turnstileToken}
+        onTurnstileToken={setTurnstileToken}
+      />
+      {previewImage && <ImagePreview image={previewImage} onClose={() => setPreviewImage(null)} />}
+    </AppShell>
+  );
+}
+
+function ConversationSidebar({
+  conversations,
+  activeId,
+  error,
+  nextCursor,
+  onNew,
+  onSelect,
+  onLoadMore,
+}: {
+  conversations: ConversationListItem[];
+  activeId: string | null;
+  error: string;
+  nextCursor: string | null;
+  onNew: () => void;
+  onSelect: (id: string) => void;
+  onLoadMore: () => void;
+}) {
+  let lastGroup = "";
+  let groupIndex = 0;
+  return (
+    <div className="flex h-full flex-col px-4 pt-[13px]">
+      <div className="flex h-[22px] items-center">
+        <span className="text-sm font-semibold leading-[22px] text-white/90">开启创作</span>
+      </div>
+      <CossButton variant="secondary" className="mt-4 h-8 justify-start gap-4 rounded-[8px] border-transparent bg-white/20 pl-2 pr-3 text-sm font-normal leading-[22px] text-white/90 hover:bg-white/20" onClick={onNew}>
+        <img src={sidebarAdd} alt="" className="size-4 shrink-0" draggable={false} />
+        新对话
+      </CossButton>
+      <div className="thin-scrollbar mt-4 min-h-0 flex-1 overflow-y-auto pb-4">
+        {error && <p className="mb-3 rounded-[8px] border border-red-400/20 bg-red-500/10 px-3 py-2 text-xs text-red-200">{error}</p>}
+        {conversations.map((conversation) => {
+          const showGroup = conversation.groupLabel !== lastGroup;
+          const groupClassName = groupIndex === 0 ? "mt-0" : "mt-6";
+          if (showGroup) groupIndex += 1;
+          lastGroup = conversation.groupLabel;
+          return (
+            <div key={conversation.id}>
+              {showGroup && <p className={cn("mb-2 text-xs font-semibold leading-5 text-white/30", groupClassName)}>{conversation.groupLabel}</p>}
+              <button
+                type="button"
+                className={cn(
+                  "mb-2 flex h-8 w-full items-center gap-2 overflow-hidden rounded-[8px] bg-transparent text-left text-sm font-normal leading-[22px] text-white/90 transition-colors hover:bg-white/10",
+                  activeId === conversation.id && "bg-white/10",
+                )}
+                onClick={() => onSelect(conversation.id)}
+              >
+                <span className="grid size-8 shrink-0 place-items-center overflow-hidden rounded-[8px] bg-white/10">
+                  {conversation.previewImage ? <img src={conversation.previewImage} alt="" className="size-full object-cover" /> : <IconSparkle ariaHidden size={16} className="text-white/45" />}
+                </span>
+                <span className="block min-w-0 flex-1 truncate pr-3">{conversation.title}</span>
+              </button>
+            </div>
+          );
+        })}
+        {nextCursor && (
+          <CossButton variant="ghost" size="sm" className="mt-2 w-full" onClick={onLoadMore}>
+            加载更多
+          </CossButton>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function GenerationCanvas({
+  scrollRef,
+  composerHeight,
+  flows,
+  error,
+  onPreview,
+  onContinue,
+  onRegenerate,
+  onCopyPrompt,
+  onScrollStickyChange,
+}: {
+  scrollRef: RefObject<HTMLDivElement>;
+  composerHeight: number;
+  flows: Array<ReturnType<typeof buildGenerationFlowItem>>;
+  error: string;
+  onPreview: (image: PreviewImage) => void;
+  onContinue: (record: GenerationRecord, image?: ImageItem) => void;
+  onRegenerate: (record: GenerationRecord) => void;
+  onCopyPrompt: (prompt: string) => void;
+  onScrollStickyChange: (isSticky: boolean) => void;
+}) {
+  return (
+    <div
+      ref={scrollRef}
+      className="thin-scrollbar absolute inset-0 overflow-y-auto"
+      style={{
+        paddingTop: conversationTopPaddingPx,
+        paddingRight: conversationHorizontalPaddingPx,
+        paddingBottom: conversationCanvasBottomPadding(composerHeight),
+        paddingLeft: conversationHorizontalPaddingPx,
+      }}
+      onScroll={(event) => {
+        const target = event.currentTarget;
+        onScrollStickyChange(isScrollNearBottom(target.scrollTop, target.clientHeight, target.scrollHeight));
+      }}
+    >
+      <div className="mx-auto flex max-w-[840px] flex-col" style={{ gap: conversationFlowGapPx }}>
+        {error && <div className="ohm-smooth-card border border-red-400/20 bg-red-500/10 px-3 py-2 text-sm text-red-100">{error}</div>}
+        {flows.map((flow) => (
+          <GenerationCard
+            key={flow.id}
+            flow={flow}
+            onPreview={onPreview}
+            onContinue={onContinue}
+            onRegenerate={onRegenerate}
+            onCopyPrompt={onCopyPrompt}
+          />
+        ))}
+        {flows.length === 0 && <EmptyConversationState />}
+      </div>
+    </div>
+  );
+}
+
+function EmptyConversationState() {
+  return (
+    <div className="grid min-h-[538px] place-items-center px-10 text-center">
+      <p className="text-[28px] font-medium leading-none tracking-[-0.04em] text-white/26">让我们一起创造点什么······</p>
+    </div>
+  );
+}
+
+function GenerationCard({
+  flow,
+  onPreview,
+  onContinue,
+  onRegenerate,
+  onCopyPrompt,
+}: {
+  flow: ReturnType<typeof buildGenerationFlowItem>;
+  onPreview: (image: PreviewImage) => void;
+  onContinue: (record: GenerationRecord, image?: ImageItem) => void;
+  onRegenerate: (record: GenerationRecord) => void;
+  onCopyPrompt: (prompt: string) => void;
+}) {
+  const record: GenerationRecord = { job: flow.job, images: flow.images, elapsedSeconds: flow.elapsedSeconds };
+  const [expandedPrompt, setExpandedPrompt] = useState(false);
+  const [promptOverflowing, setPromptOverflowing] = useState(false);
+  const promptRef = useRef<HTMLParagraphElement | null>(null);
+  const referenceImages = flow.job.referenceImages ?? [];
+  const chips = buildFlowChips(flow);
+  const failureLabel = flow.job.error_message ?? flow.job.error_reason ?? "生成失败";
+  const showStatusRow = flow.status === "pending" || flow.status === "failed";
+  const stageImages = flow.images.slice(0, Math.max(1, flow.job.quantity));
+  const stageLayout = generationStageLayout(flow.job, stageImages);
+
+  useEffect(() => {
+    if (!promptRef.current) return;
+    const promptElement = promptRef.current;
+    const measure = () => setPromptOverflowing(promptElement.scrollHeight > collapsedPromptMaxHeightPx() + 1);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(promptElement);
+    return () => observer.disconnect();
+  }, [flow.job.prompt]);
+
+  return (
+    <article className="relative text-white/90">
+      {referenceImages.length > 0 && (
+        <div className="mb-2 flex min-h-8 w-full items-start gap-2">
+          <span className="mt-2 grid size-4 shrink-0 place-items-center text-white/90">
+            <SentReferenceIcon className="size-4 text-white/90" />
+          </span>
+          <div className="flex min-h-8 min-w-0 flex-1 flex-wrap items-center gap-2">
+            {referenceImages.map((image, index) => (
+              <button
+                key={`${image.url}-${index}`}
+                type="button"
+                className="inline-flex h-8 shrink-0 items-center gap-1 overflow-hidden rounded-[8px] border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white transition hover:bg-white/12"
+                onClick={() => onPreview({ url: image.url, prompt: image.name || `参考图 ${index + 1}` })}
+              >
+                <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[5px] border border-transparent bg-white/10">
+                  <img src={image.url} alt={`参考图 ${index + 1}`} className="size-full object-cover" />
+                </span>
+                <span className="whitespace-nowrap">参考图 {index + 1}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="max-w-[840px]">
+        <p
+          ref={promptRef}
+          className={cn(
+            "whitespace-pre-wrap text-sm leading-[21px] text-white/90",
+          )}
+          style={!expandedPrompt && promptOverflowing ? { maxHeight: collapsedPromptMaxHeightPx(), overflow: "hidden" } : undefined}
+        >
+          {flow.job.prompt}
+        </p>
+      </div>
+
+      <div className="mt-2 flex max-w-[840px] items-center gap-2">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+          {chips.map((chip) => (
+            <span key={chip} className="rounded-[6px] bg-white/10 px-2 py-1 text-xs leading-none text-white/60">
+              {chip}
+            </span>
+          ))}
+        </div>
+        {promptOverflowing && (
+          <button
+            type="button"
+            className="shrink-0 rounded-[6px] bg-[#494949] px-3 py-1 text-xs leading-none text-white/90 transition hover:bg-[#5a5a5a]"
+            onClick={() => setExpandedPrompt((current) => !current)}
+          >
+            {expandedPrompt ? "收起" : "展示全部"}
+          </button>
+        )}
+      </div>
+
+      {showStatusRow && (
+        <div className="flex items-center gap-2 text-sm leading-[22px] text-white" style={{ marginTop: generationModuleGapPx }}>
+          <span className="inline-flex size-[14px] items-center justify-center">
+            {flow.status === "pending" ? <LoadersWtfStatusIcon /> : <IconMagicWand2 ariaHidden size={14} />}
+          </span>
+          {flow.status === "pending" ? <LoadingStatusText /> : <span>{failureLabel}</span>}
+        </div>
+      )}
+
+      <div className={cn("relative overflow-hidden rounded-[24px] border-[1.2px] border-white/20 bg-white/[0.06]", showStatusRow ? "mt-2" : "mt-6")} style={{ width: stageLayout.width, height: stageLayout.height }}>
+        {flow.status === "pending" && <PendingStage />}
+        {flow.status !== "pending" && stageImages.length > 0 && (
+          <div className="flex h-full w-full">
+            {stageImages.map((image, index) => (
+              <div key={image.id} className={cn("group/image relative h-full min-w-0 flex-1 overflow-hidden bg-[#222]", index > 0 && "border-l border-white/20")}>
+                <button type="button" className="block h-full w-full" onClick={() => onPreview(image)}>
+                  <img src={image.url} alt={image.prompt ?? "生成图片"} className="h-full w-full object-cover" />
+                </button>
+                <div className="pointer-events-none absolute bottom-3 right-3 flex items-center gap-1.5 opacity-0 transition-opacity group-hover/image:pointer-events-auto group-hover/image:opacity-100">
+                  <CossButton aria-label="基于这张图片继续创作" size="icon" variant="ghost" className="bg-black/30 backdrop-blur-sm" onClick={() => onContinue(record, image)}>
+                    <IconMagicWand2 ariaHidden size={16} />
+                  </CossButton>
+                  <CossButton aria-label="重新生成" size="icon" variant="ghost" className="bg-black/30 backdrop-blur-sm" onClick={() => void onRegenerate(record)}>
+                    <IconArrowRotateClockwise ariaHidden size={16} />
+                  </CossButton>
+                  <CossButton aria-label="复制提示词" size="icon" variant="ghost" className="bg-black/30 backdrop-blur-sm" onClick={() => onCopyPrompt(flow.job.prompt)}>
+                    <IconClipboard ariaHidden size={16} />
+                  </CossButton>
+                  <a
+                    aria-label="下载这张图片"
+                    className="ohm-smooth-control inline-flex size-8 items-center justify-center bg-black/30 text-white/72 backdrop-blur-sm hover:bg-black/40 hover:text-white"
+                    href={`/api/images/${image.id}/download?raw=1&download=1`}
+                  >
+                    <IconCloudDownload ariaHidden size={16} />
+                  </a>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        {flow.status === "failed" && (
+          <div className="flex h-full items-center justify-center px-8 text-center text-sm leading-6 text-white/40">
+            {flow.job.error_message ?? "生成失败"}
+          </div>
+        )}
+      </div>
+    </article>
+  );
+}
+
+function LoadersWtfStatusIcon() {
+  const opacityFrames = [
+    "1;0.7667;0.5333;0;0;0;0;0",
+    "0;1;0.7667;0.5333;0;0;0;0",
+    "0;0;1;0.7667;0.5333;0;0;0",
+    "0.7667;0.5333;0;0;0;0;0;1",
+    "0;0;0;0;0;0;0;0",
+    "0;0;0;1;0.7667;0.5333;0;0",
+    "0.5333;0;0;0;0;0;1;0.7667",
+    "0;0;0;0;0;1;0.7667;0.5333",
+    "0;0;0;0;1;0.7667;0.5333;0",
+  ];
+  const cells = Array.from({ length: 9 }, (_, index) => index);
+  return (
+    <svg aria-hidden="true" className="ohm-loaders-wtf-status size-[14px] shrink-0" viewBox="0 0 91 91" fill="none">
+      <g>
+        {cells.map((index) => {
+          const row = Math.floor(index / 3);
+          const column = index % 3;
+          return <circle key={`off-${index}`} cx={column * 32 + 13.5} cy={row * 32 + 13.5} r="13.5" fill="#383737" />;
+        })}
+      </g>
+      <g>
+        {cells.map((index) => {
+          const row = Math.floor(index / 3);
+          const column = index % 3;
+          return (
+            <circle key={`on-${index}`} cx={column * 32 + 13.5} cy={row * 32 + 13.5} r="13.5" fill="#FFFFFFE6">
+              <animate attributeName="opacity" values={opacityFrames[index]} dur="1s" calcMode="discrete" repeatCount="indefinite" />
+            </circle>
+          );
+        })}
+      </g>
+    </svg>
+  );
+}
+
+function LoadingStatusText() {
+  return (
+    <span className="ohm-loading-status" aria-label="正在生成图片">
+      <span className="sr-only">正在生成图片</span>
+      <span className="ohm-loading-status-track" aria-hidden="true">
+        <span className="ohm-loading-status-line">正在生成图片</span>
+        <span className="ohm-loading-status-line">正在排队处理</span>
+        <span className="ohm-loading-status-line">正在渲染细节</span>
+      </span>
+    </span>
+  );
+}
+
+export function generationStageLayout(job: Pick<GenerationJob, "width" | "height" | "quantity">, images: ImageItem[]): { width: number; height: number; columns: number } {
+  const count = Math.max(1, images.length || job.quantity || 1);
+  const firstImage = images[0];
+  const aspect = safeAspectRatio(firstImage?.width ?? job.width, firstImage?.height ?? job.height);
+
+  if (count === 1) {
+    const height = Math.min(generationStageMaxHeightPx, generationStageMaxWidthPx / aspect);
+    return { width: Math.round(height * aspect), height: Math.round(height), columns: 1 };
+  }
+
+  const totalAspect = aspect * count;
+  const height = Math.min(generationStageMaxHeightPx, generationStageMaxWidthPx / totalAspect);
+  return { width: Math.round(height * totalAspect), height: Math.round(height), columns: count };
+}
+
+function safeAspectRatio(width: number, height: number): number {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return 4 / 3;
+  return width / height;
+}
+
+function PendingStage() {
+  return (
+    <div className="h-full w-full bg-white/[0.06]" />
+  );
+}
+
+function ComposerChoiceMenu({
+  label,
+  icon,
+  value,
+  options,
+  disabled = false,
+  onChange,
+}: {
+  label: string;
+  icon?: ReactNode;
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpen(false);
+    }
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+
+  const selected = options.find((option) => option.value === value) ?? options[0];
+
+  return (
+    <div ref={rootRef} className="relative shrink-0">
+      <button
+        type="button"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label={label}
+        disabled={disabled}
+        className={cn(
+          "ohm-smooth-control inline-flex h-8 max-w-full items-center gap-1 border border-transparent bg-white/10 pl-3 pr-2 text-sm leading-[22px] text-white",
+          disabled ? "cursor-default opacity-100" : "hover:bg-white/12",
+        )}
+        onClick={() => {
+          if (!disabled) setOpen((current) => !current);
+        }}
+      >
+        {icon && <span className="grid size-4 shrink-0 place-items-center text-white/90">{icon}</span>}
+        <span className="whitespace-nowrap">{selected.label}</span>
+        <IconChevronDownSmall ariaHidden size={20} className={cn("shrink-0 text-white/60 transition-transform", open && "rotate-180")} />
+      </button>
+      {open && (
+        <div className="absolute left-0 top-[calc(100%+8px)] z-30 w-max min-w-full overflow-hidden rounded-[10px] border border-white/15 bg-[#232323] p-1 shadow-[0_12px_32px_rgb(0_0_0/0.32)]">
+          <div role="listbox" aria-label={label} className="flex w-max min-w-full flex-col gap-1">
+            {options.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                role="option"
+                aria-selected={option.value === selected.value}
+                className={cn(
+                  "rounded-[8px] px-3 py-1.5 text-left text-sm leading-[22px] text-white/78 transition hover:bg-white/10 hover:text-white",
+                  option.value === selected.value && "bg-white/10 text-white",
+                )}
+                onClick={() => {
+                  onChange(option.value);
+                  setOpen(false);
+                }}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ComposerGenerationSettingsMenu({
+  form,
+  maxImagesPerRequest,
+  onUpdate,
+}: {
+  form: GenerateForm;
+  maxImagesPerRequest: number;
+  onUpdate: <K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const quantities = Array.from({ length: Math.min(maxImagesPerRequest, 4) }, (_, index) => index + 1);
+  const summary = formatGenerationSettingsSummary(form);
+  const summaryParts = generationSettingsSummaryParts(form);
+
+  useEffect(() => {
+    if (!open) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpen(false);
+    }
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div ref={rootRef} className="relative min-w-0 shrink">
+      <button
+        type="button"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-label={`生成参数：${summary}`}
+        className="ohm-smooth-control inline-flex h-8 max-w-[360px] items-center gap-1 border border-transparent bg-white/10 pl-3 pr-2 text-sm font-normal leading-[22px] text-white hover:bg-white/12"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <ComposerQualityIcon className="size-4 shrink-0 text-white/90" />
+        <span className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap" aria-hidden="true">
+          {summaryParts.map((part, index) => (
+            <span key={`${part}-${index}`} className="inline-flex min-w-0 items-center gap-2">
+              {index > 0 && <span className="shrink-0 text-white/30">｜</span>}
+              <span className="min-w-0 truncate">{part}</span>
+            </span>
+          ))}
+        </span>
+        <IconChevronDownSmall ariaHidden size={20} className={cn("shrink-0 text-white/60 transition-transform", open && "rotate-180")} />
+      </button>
+      {open && (
+        <div className="absolute bottom-[calc(100%+8px)] left-0 z-40 w-[480px] rounded-[18px] border border-white/15 bg-[#232323] p-4 shadow-[0_18px_48px_rgb(0_0_0/0.38)]">
+          <div className="flex flex-col gap-6">
+            <div>
+              <SettingsOptionTabs
+                label="生成比例"
+                value={form.aspectRatio}
+                options={ratioOptions.map((ratio) => ({ value: ratio, label: ratioLabels[ratio] ?? ratio }))}
+                onValueChange={(value) => onUpdate("aspectRatio", value)}
+              />
+              {form.aspectRatio === "custom" && (
+                <div className="mt-2">
+                  <CustomSizeInputs
+                    width={form.width}
+                    height={form.height}
+                    onWidthChange={(width) => onUpdate("width", width)}
+                    onHeightChange={(height) => onUpdate("height", height)}
+                  />
+                </div>
+              )}
+            </div>
+            <SettingsOptionTabs
+              label="生成张数"
+              value={String(form.quantity)}
+              options={quantities.map((quantity) => ({ value: String(quantity), label: `${quantity}张` }))}
+              onValueChange={(value) => onUpdate("quantity", Number(value))}
+            />
+            <SettingsOptionTabs
+              label="生成质量"
+              value={form.quality}
+              options={qualityOptions.map((quality) => ({ value: quality, label: qualityLabels[quality] ?? quality }))}
+              onValueChange={(value) => onUpdate("quality", value)}
+            />
+            <SettingsOptionTabs
+              label="分辨率"
+              value={form.resolution}
+              options={resolutionOptions.map((resolution) => ({ value: resolution, label: resolution }))}
+              onValueChange={(value) => onUpdate("resolution", value)}
+            />
+            <SettingsOptionTabs
+              label="文件格式"
+              value={form.outputFormat}
+              options={formatOptions.map((format) => ({ value: format, label: formatLabels[format] ?? format.toUpperCase() }))}
+              onValueChange={(value) => onUpdate("outputFormat", value)}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SettingsOptionTabs({
+  label,
+  value,
+  options,
+  onValueChange,
+}: {
+  label: string;
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  onValueChange: (value: string) => void;
+}) {
+  return (
+    <div>
+      <div className="mb-2 text-xs font-normal leading-5 text-white/42">{label}</div>
+      <Tabs value={value} onValueChange={onValueChange} className="w-full">
+        <TabsList className="[--radius:8px] [--tabs-indicator-bg:rgb(255_255_255/0.16)] [--tabs-indicator-border:0] [--tabs-indicator-radius:6px] [--tabs-indicator-shadow:0_1px_8px_rgb(255_255_255/0.08),0_6px_16px_rgb(0_0_0/0.18)] flex h-8 w-full rounded-[8px] !bg-white/[0.06] p-1 !text-white/52">
+          {options.map((option) => (
+            <TabsTrigger
+              key={option.value}
+              value={option.value}
+              className="!h-6 !min-w-0 !flex-1 !basis-0 !shrink !grow px-2 text-sm font-normal !text-white/52 hover:!text-white/80 data-active:!text-white"
+            >
+              {option.label}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+      </Tabs>
+    </div>
+  );
+}
+
+function CustomSizeInputs({
+  width,
+  height,
+  onWidthChange,
+  onHeightChange,
+}: {
+  width: number;
+  height: number;
+  onWidthChange: (value: number) => void;
+  onHeightChange: (value: number) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <SizeInput ariaLabel="自定义长度" value={width} onChange={onWidthChange} />
+      <IconCrossSmall ariaHidden size={12} className="shrink-0 text-white/30" />
+      <SizeInput ariaLabel="自定义宽度" value={height} onChange={onHeightChange} />
+    </div>
+  );
+}
+
+function SizeInput({ ariaLabel, value, onChange }: { ariaLabel: string; value: number; onChange: (value: number) => void }) {
+  return (
+    <Input
+      aria-label={ariaLabel}
+      type="number"
+      min={16}
+      step={16}
+      value={value}
+      className="h-8 min-w-0 flex-1 rounded-[8px] border-transparent bg-white/[0.06] px-3 py-0 text-sm leading-[22px] text-white outline-none transition placeholder:text-white/28 focus:border-transparent focus:bg-white/[0.08] focus-visible:ring-0"
+      onChange={(event) => {
+        const next = Number(event.target.value);
+        if (Number.isFinite(next)) onChange(next);
+      }}
+    />
+  );
+}
+
+function ComposerPanel({
+  formRef,
+  form,
+  config,
+  loading,
+  optimizing,
+  providerConfigured,
+  referenceImages,
+  sourceImagePreview,
+  textareaRef,
+  referenceInputRef,
+  onSubmit,
+  onPromptPaste,
+  onReferenceInput,
+  onPickReference,
+  onRemoveSourceReference,
+  onRemoveReference,
+  onOptimize,
+  onUpdate,
+  turnstileToken,
+  onTurnstileToken,
+}: {
+  formRef: RefObject<HTMLFormElement>;
+  form: GenerateForm;
+  config: AppConfig;
+  loading: boolean;
+  optimizing: boolean;
+  providerConfigured: boolean;
+  referenceImages: ReferenceImagePreview[];
+  sourceImagePreview: SourceImagePreview | null;
+  textareaRef: RefObject<HTMLTextAreaElement>;
+  referenceInputRef: RefObject<HTMLInputElement>;
+  onSubmit: (event: FormEvent) => void;
+  onPromptPaste: (event: ClipboardEvent<HTMLTextAreaElement>) => void;
+  onReferenceInput: (event: ChangeEvent<HTMLInputElement>) => void;
+  onPickReference: () => void;
+  onRemoveSourceReference: () => void;
+  onRemoveReference: (index: number) => void;
+  onOptimize: () => void;
+  onUpdate: <K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) => void;
+  turnstileToken: string;
+  onTurnstileToken: (token: string) => void;
+}) {
+  const modelOptions = uniqueModelOptions(config.modelOptions ?? config.models, config.model);
+  const modelName = modelOptions.includes(form.model) ? form.model : modelOptions[0];
+  const submitDisabled = !providerConfigured || !form.prompt.trim() || (config.turnstileRequired && config.turnstileSiteKey ? !turnstileToken : false);
+  const referenceCount = referenceImages.length + (sourceImagePreview ? 1 : 0);
+
+  return (
+    <form
+      ref={formRef}
+      className="ohm-smooth-panel ohm-composer-panel absolute bottom-6 left-1/2 flex min-h-[170px] w-[840px] -translate-x-1/2 flex-col items-start gap-4 overflow-visible border p-[15px]"
+      onSubmit={onSubmit}
+    >
+      <input ref={referenceInputRef} type="file" accept="image/png,image/jpeg,image/webp" multiple className="hidden" onChange={onReferenceInput} />
+      <div className="flex min-h-8 w-full flex-wrap items-center gap-x-2 gap-y-2">
+        {sourceImagePreview && (
+          <span className="ohm-smooth-control inline-flex h-8 shrink-0 items-center gap-2 overflow-hidden border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white">
+            <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[5px] border border-transparent bg-white/10">
+              <img src={sourceImagePreview.url} alt={sourceImagePreview.name} className="size-full object-cover" />
+            </span>
+            <span className="whitespace-nowrap">{sourceImagePreview.name}</span>
+            <button type="button" aria-label="移除继续创作参考图" className="grid size-4 shrink-0 place-items-center text-white/72 hover:text-white" onClick={onRemoveSourceReference}>
+              <img aria-hidden="true" src={referenceDeleteIcon} alt="" className="size-4" draggable={false} />
+            </button>
+          </span>
+        )}
+        {referenceImages.map((image, index) => (
+          <span key={image.url} className="ohm-smooth-control inline-flex h-8 shrink-0 items-center gap-2 overflow-hidden border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white">
+            <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[5px] border border-transparent bg-white/10">
+              <img src={image.url} alt={image.name} className="size-full object-cover" />
+            </span>
+            <span className="whitespace-nowrap">参考图 {index + 1}</span>
+            <button type="button" aria-label={`移除参考图 ${index + 1}`} className="grid size-4 shrink-0 place-items-center text-white/72 hover:text-white" onClick={() => onRemoveReference(index)}>
+              <img aria-hidden="true" src={referenceDeleteIcon} alt="" className="size-4" draggable={false} />
+            </button>
+          </span>
+        ))}
+        {referenceCount < maxReferenceImages && (
+          <CossButton type="button" variant="outline" size="sm" className="h-8 gap-1 border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white hover:bg-white/12" onClick={onPickReference}>
+            <ComposerReferenceIcon className="size-4 shrink-0 text-white/90" />
+            参考图
+          </CossButton>
+        )}
+        {referenceCount >= maxReferenceImages && (
+          <span className="text-xs leading-5 text-white/30">最多 {maxReferenceImages} 张</span>
+        )}
+      </div>
+      <CossTextarea
+        ref={textareaRef}
+        value={form.prompt}
+        required
+        rows={composerTextareaMinRows}
+        placeholder="可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等"
+        className="ohm-textarea-scrollbar h-[42px] max-h-[252px] min-h-[42px] overflow-y-auto p-0 leading-[21px] text-white/90 placeholder:text-white/30"
+        onChange={(event) => onUpdate("prompt", event.target.value)}
+        onPaste={onPromptPaste}
+      />
+      <div className="flex w-full items-center justify-between gap-20">
+        <div className="flex min-w-0 items-center gap-2">
+          <CossButton type="button" variant="outline" size="sm" loading={optimizing} className="h-8 w-[114px] gap-1 border-transparent bg-white/10 px-3 py-1 text-sm font-normal leading-[22px] text-white hover:bg-white/12" onClick={onOptimize}>
+            <ComposerOptimizeIcon className="size-4 shrink-0 text-white" />
+            {optimizing ? "优化中" : "优化提示词"}
+          </CossButton>
+          <ComposerChoiceMenu
+            label="模型"
+            value={modelName}
+            disabled={modelOptions.length <= 1}
+            icon={<ComposerModelIcon className="size-4 text-white/90" />}
+            options={modelOptions.map((model) => ({ value: model, label: model.replace(/^gpt-/, "") }))}
+            onChange={(next) => onUpdate("model", next)}
+          />
+          <ComposerGenerationSettingsMenu form={form} maxImagesPerRequest={config.maxImagesPerRequest} onUpdate={onUpdate} />
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {config.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={onTurnstileToken} />}
+          {config.turnstileRequired && !config.turnstileSiteKey && (
+            <span className="text-xs text-red-200/80">缺少验证配置</span>
+          )}
+          <CossButton
+            type="submit"
+            loading={loading}
+            disabled={submitDisabled}
+            className="h-8 min-w-16 border-transparent bg-white/90 text-black hover:bg-white disabled:opacity-100 disabled:bg-white/20 disabled:text-white/40 disabled:hover:bg-white/20"
+          >
+            生图
+          </CossButton>
+        </div>
+      </div>
+    </form>
+  );
+}
+
+function uniqueModelOptions(options: string[] | undefined, configuredModel: string) {
+  const candidates = [...(options ?? []), configuredModel, ...imageModelOptions].map((model) => model.trim()).filter(Boolean);
+  return Array.from(new Set(candidates));
+}
+
+function ImagePreview({ image, onClose }: { image: PreviewImage; onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/72 p-8" role="dialog" aria-modal="true" aria-label="图片预览">
+      <button type="button" aria-label="关闭预览" className="absolute right-6 top-6 grid size-9 place-items-center rounded-full bg-white/10 text-white/80" onClick={onClose}>
+        <IconCrossSmall ariaHidden size={20} />
+      </button>
+      <img src={image.url} alt={image.prompt ?? "生成图片"} className="ohm-smooth-card max-h-[calc(100dvh-64px)] max-w-[calc(100vw-64px)] object-contain" />
+    </div>
+  );
+}
+
+export function updateGenerateForm<K extends keyof GenerateForm>(current: GenerateForm, key: K, value: GenerateForm[K]): GenerateForm {
+  const next = { ...current, [key]: value };
+  if (key === "width" || key === "height") {
+    next[key] = normalizeCustomSize(value as number) as GenerateForm[K];
+  }
+  if (key === "aspectRatio" || key === "resolution") {
+    if (next.aspectRatio === "custom") return next;
+    const [width, height] = sizeForRatioResolution(next.aspectRatio, next.resolution);
+    next.width = width;
+    next.height = height;
+  }
+  return next;
+}
+
+function normalizeCustomSize(value: number): number {
+  if (!Number.isFinite(value)) return 1024;
+  return Math.max(16, Math.round(value / 16) * 16);
+}
+
+function sizeForRatioResolution(ratio: string, resolution: string): [number, number] {
+  const [baseWidth, baseHeight] = ratioSizes[ratio] ?? ratioSizes["16:9"];
+  const longEdge = resolutionLongEdge[resolution] ?? resolutionLongEdge["1K"];
+  const scale = longEdge / Math.max(baseWidth, baseHeight);
+  return [Math.round((baseWidth * scale) / 16) * 16, Math.round((baseHeight * scale) / 16) * 16];
+}
+
+function generationRequestBody(form: GenerateForm, referenceImages: ReferenceImagePreview[], sourceImageId?: string, turnstileToken = ""): BodyInit {
+  if (referenceImages.length === 0) return JSON.stringify({ ...form, turnstileToken, ...(sourceImageId ? { sourceImageId } : {}) });
+  const body = new FormData();
+  Object.entries(form).forEach(([key, value]) => body.set(key, String(value)));
+  if (turnstileToken) body.set("turnstileToken", turnstileToken);
+  if (sourceImageId) body.set("sourceImageId", sourceImageId);
+  referenceImages.slice(0, maxReferenceImages).forEach((image) => body.append("referenceImage", image.file, image.name));
+  return body;
+}
+
+function buildFlowChips(flow: ReturnType<typeof buildGenerationFlowItem>): string[] {
+  const longEdge = Math.max(flow.job.width, flow.job.height);
+  const resolution = longEdge >= 3840 ? "4K" : longEdge >= 2048 ? "2K" : "1K";
+  const chips = [
+    "image-2",
+    flow.job.aspect_ratio,
+    qualityLabels[flow.job.quality] ?? flow.job.quality,
+    resolution,
+    flow.job.output_format.toUpperCase(),
+  ];
+  if (flow.status !== "pending" && typeof flow.elapsedSeconds === "number") {
+    chips.push(`耗时：${flow.elapsedSeconds.toFixed(1)}s`);
+  }
+  return chips;
+}
+
+function Turnstile({ siteKey, onToken }: { siteKey: string; onToken: (token: string) => void }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!siteKey || !ref.current) return;
+    let cancelled = false;
+    let widgetId = "";
+
+    function render() {
+      if (cancelled || !ref.current || !window.turnstile) return;
+      widgetId = window.turnstile.render(ref.current, {
+        sitekey: siteKey,
+        callback: onToken,
+        "expired-callback": () => onToken(""),
+        theme: "dark",
+      });
+    }
+
+    if (!document.querySelector('script[src*="challenges.cloudflare.com/turnstile"]')) {
+      const script = document.createElement("script");
+      script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+      script.async = true;
+      script.defer = true;
+      script.onload = render;
+      document.head.appendChild(script);
+    } else {
+      render();
+    }
+
+    return () => {
+      cancelled = true;
+      if (widgetId && window.turnstile?.remove) window.turnstile.remove(widgetId);
+    };
+  }, [onToken, siteKey]);
+
+  return <div className="min-h-[30px] min-w-[120px]" ref={ref} />;
+}
+
+function normalizeImageMime(value: string): string {
+  const mime = value.toLowerCase().trim();
+  if (mime === "image/jpg") return "image/jpeg";
+  return mime;
+}
+
+function revokeObjectUrls(urls: string[]): void {
+  for (const url of urls) URL.revokeObjectURL(url);
+}
+
+function isTerminalJobStatus(status: GenerationJob["status"]): boolean {
+  return status === "succeeded" || status === "partial_succeeded" || status === "failed" || status === "cancelled";
+}
+
+function upsertRecord(
+  setRecords: Dispatch<SetStateAction<GenerationRecord[]>>,
+  job: GenerationJob,
+  images: ImageItem[],
+): void {
+  setRecords((current) => {
+    const next: GenerationRecord = { job, images, elapsedSeconds: estimateJobElapsed(job) };
+    return [next, ...current.filter((record) => record.job.id !== job.id)];
+  });
+}
+
+function estimateJobElapsed(job: GenerationJob): number | null {
+  const start = Date.parse(job.started_at ?? job.created_at);
+  const end = job.completed_at ? Date.parse(job.completed_at) : Date.now();
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return Math.max(0, Math.round((end - start) / 100) / 10);
+}

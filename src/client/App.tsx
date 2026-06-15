@@ -20,6 +20,7 @@ import {
   ClipboardEvent,
   CSSProperties,
   Dispatch,
+  Fragment,
   FormEvent,
   PointerEvent as ReactPointerEvent,
   ReactNode,
@@ -39,6 +40,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Separator } from "./components/ui/separator";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
 import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem, ProviderSettings } from "./api";
+import { GenerateMenuView } from "./features/generate-menu/GenerateMenuView";
 import addIcon from "./assets/figma/add.svg";
 import figmaLogo from "./assets/figma/logo.png";
 import navGalleryActiveIcon from "./assets/figma/nav-gallery-active.svg";
@@ -79,6 +81,8 @@ interface ReferenceImagePreview {
   file: File;
   url: string;
   name: string;
+  compressed: boolean;
+  originalByteSize?: number;
 }
 
 interface ImageSelectionMask {
@@ -105,7 +109,10 @@ const FORMAT_OPTIONS = ["png", "jpeg", "webp"] as const;
 const IMAGE_MODEL_OPTIONS = ["gpt-image-2"] as const;
 const PROMPT_OPTIMIZER_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4"] as const;
 const REFERENCE_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+const MAX_REFERENCE_IMAGES = 6;
 const REFERENCE_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const FAST_REFERENCE_IMAGE_EDGE = 2048;
+const PROMPT_TEXTAREA_MAX_HEIGHT = 400;
 const MAX_IMAGE_EDGE = 3840;
 const MAX_IMAGE_PIXELS = 8_294_400;
 
@@ -176,6 +183,15 @@ const fallbackConfig: AppConfig = {
   turnstileSiteKey: "",
   turnstileRequired: false,
 };
+
+export function currentSpaceId(me: MeState | null): string | undefined {
+  return me?.space?.id;
+}
+
+export function currentSpaceName(me: MeState | null): string | undefined {
+  const name = me?.space?.name?.trim();
+  return name || undefined;
+}
 
 const viewItems: Array<{ value: View; label: string; helper: string; asset: string; activeAsset: string }> = [
   { value: "generate", label: "生成", helper: "Prompt", asset: navGenerateIcon, activeAsset: navGenerateActiveIcon },
@@ -253,7 +269,9 @@ export function App() {
   useEffect(() => {
     let mounted = true;
     Promise.all([
-      api<{ ok: true; config: AppConfig }>("/api/config").then((result) => result.config),
+      api<{ ok: true; config: AppConfig }>("/api/config")
+        .then((result) => result.config)
+        .catch(() => fallbackConfig),
       api<{
         ok: true;
         space: MeState["space"];
@@ -296,7 +314,7 @@ export function App() {
     setGenerationRecords([]);
     setGenerationNextCursor(null);
     void loadGenerationRecords();
-  }, [loadGenerationRecords, me?.space.id]);
+  }, [loadGenerationRecords, currentSpaceId(me)]);
 
   if (booting) {
     return (
@@ -311,12 +329,33 @@ export function App() {
     );
   }
 
-  if (!me) {
+  if (!me || !currentSpaceId(me)) {
     return <LoginScreen config={effectiveConfig} onLogin={refreshMe} />;
   }
 
-  const spaceDisplayName = me.space.name.trim() || "Workspace";
+  const spaceDisplayName = currentSpaceName(me) ?? "Workspace";
   const studioDisplayName = `${spaceDisplayName} Studio`;
+
+  if (view === "generate") {
+    return (
+      <GenerateMenuView
+        config={effectiveConfig}
+        providerConfigured={me.providerConfigured}
+        records={generationRecords}
+        setRecords={setGenerationRecords}
+        recordsError={generationRecordsError}
+        nextCursor={generationNextCursor}
+        loadRecords={loadGenerationRecords}
+        onProviderNeeded={() => setView("settings")}
+        onNavigate={setView}
+        onLogout={async () => {
+          await api("/api/auth/logout", { method: "POST" });
+          setMe(null);
+        }}
+        onUsageChanged={refreshMe}
+      />
+    );
+  }
 
   return (
     <TooltipProvider delayDuration={140}>
@@ -403,25 +442,6 @@ export function App() {
               </div>
             </header>
 
-            {view === "generate" && (
-              <GenerateView
-                config={effectiveConfig}
-                providerConfigured={me.providerConfigured}
-                records={generationRecords}
-                setRecords={setGenerationRecords}
-                recordsError={generationRecordsError}
-                nextCursor={generationNextCursor}
-                loadRecords={loadGenerationRecords}
-                onProviderNeeded={() => setView("settings")}
-                pendingEditImage={imageToEdit}
-                pendingEditForm={imageEditDraft}
-                pendingEditMask={imageEditMask}
-                pendingGenerateForm={pendingGenerateForm}
-                onPendingEditImageConsumed={clearImageToEdit}
-                onPendingGenerateFormConsumed={clearPendingGenerateForm}
-                onUsageChanged={refreshMe}
-              />
-            )}
             {view === "gallery" && (
               <GalleryView
                 config={effectiveConfig}
@@ -576,11 +596,12 @@ function GenerateView({
   const [loading, setLoading] = useState(false);
   const [optimizingPrompt, setOptimizingPrompt] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [referenceImage, setReferenceImage] = useState<ReferenceImagePreview | null>(null);
+  const [referenceImages, setReferenceImages] = useState<ReferenceImagePreview[]>([]);
   const [referenceMask, setReferenceMask] = useState<ImageSelectionMask | null>(null);
+  const [fastReferenceUpload, setFastReferenceUpload] = useState(true);
   const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const referenceInputRef = useRef<HTMLInputElement | null>(null);
-  const referenceObjectUrlRef = useRef<string | null>(null);
+  const referenceObjectUrlsRef = useRef<string[]>([]);
 
   const availableRatios = useMemo(
     () => FIGMA_RATIOS.filter((ratio) => config.ratios.includes(ratio) || fallbackConfig.ratios.includes(ratio)),
@@ -597,36 +618,69 @@ function GenerateView({
   const refreshUsage = useCallback(() => {
     void onUsageChanged().catch(() => undefined);
   }, [onUsageChanged]);
-  const setReferenceFile = useCallback((file: File) => {
-    const mimeType = normalizeImageMime(file.type);
-    if (!REFERENCE_IMAGE_MIME_TYPES.has(mimeType)) {
-      setError("参考图仅支持 PNG、JPEG 或 WebP 格式。");
-      return;
+  useEffect(() => {
+    if (promptTextareaRef.current) resizePromptTextarea(promptTextareaRef.current);
+  }, [form.prompt]);
+  const addReferenceFiles = useCallback(async (files: File[], options?: { replace?: boolean }) => {
+    const accepted: ReferenceImagePreview[] = [];
+    for (const file of files) {
+      const mimeType = normalizeImageMime(file.type);
+      if (!REFERENCE_IMAGE_MIME_TYPES.has(mimeType)) {
+        setError("参考图仅支持 PNG、JPEG 或 WebP 格式。");
+        return;
+      }
+      if (file.size > REFERENCE_IMAGE_MAX_BYTES) {
+        setError("参考图不能超过 10MB。");
+        return;
+      }
+
+      let preparedFile: { file: File; compressed: boolean };
+      try {
+        preparedFile = fastReferenceUpload ? await compressReferenceImage(file) : { file, compressed: false };
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "参考图读取失败。");
+        return;
+      }
+      if (preparedFile.file.size > REFERENCE_IMAGE_MAX_BYTES) {
+        setError("参考图不能超过 10MB。");
+        return;
+      }
+
+      const nextUrl = URL.createObjectURL(preparedFile.file);
+      referenceObjectUrlsRef.current.push(nextUrl);
+      accepted.push({
+        file: preparedFile.file,
+        url: nextUrl,
+        name: preparedFile.file.name || file.name || "参考图",
+        compressed: preparedFile.compressed,
+        originalByteSize: preparedFile.compressed ? file.size : undefined,
+      });
     }
-    if (file.size > REFERENCE_IMAGE_MAX_BYTES) {
-      setError("参考图不能超过 10MB。");
-      return;
-    }
-    const nextUrl = URL.createObjectURL(file);
-    if (referenceObjectUrlRef.current) {
-      URL.revokeObjectURL(referenceObjectUrlRef.current);
-    }
-    referenceObjectUrlRef.current = nextUrl;
-    setReferenceImage({
-      file,
-      url: nextUrl,
-      name: file.name || "参考图",
+    setReferenceImages((current) => {
+      if (options?.replace) {
+        for (const item of current) URL.revokeObjectURL(item.url);
+        referenceObjectUrlsRef.current = referenceObjectUrlsRef.current.filter((url) => !current.some((item) => item.url === url));
+      }
+      const base = options?.replace ? [] : current;
+      const remaining = Math.max(0, MAX_REFERENCE_IMAGES - base.length);
+      for (const item of accepted.slice(remaining)) {
+        URL.revokeObjectURL(item.url);
+        referenceObjectUrlsRef.current = referenceObjectUrlsRef.current.filter((url) => url !== item.url);
+      }
+      const next = [...base, ...accepted.slice(0, remaining)];
+      if (accepted.length > remaining) setError(`参考图最多 ${MAX_REFERENCE_IMAGES} 张。`);
+      else setError("");
+      return next;
     });
     setReferenceMask(null);
-    setError("");
-  }, []);
+  }, [fastReferenceUpload]);
   const loadImageForEditing = useCallback(
     async (image: ImageItem, prompt?: string, mask?: ImageSelectionMask | null) => {
       setError("");
       try {
         const file = await imageItemToFile(image);
         const nextPrompt = prompt ?? image.prompt ?? "";
-        setReferenceFile(file);
+        await addReferenceFiles([file], { replace: true });
         setReferenceMask(mask ?? null);
         if (nextPrompt) {
           setForm((current) => ({ ...current, prompt: nextPrompt }));
@@ -639,15 +693,24 @@ function GenerateView({
         setError(err instanceof Error ? err.message : "载入图片编辑失败。");
       }
     },
-    [setReferenceFile],
+    [addReferenceFiles],
   );
 
-  const clearReferenceImage = useCallback(() => {
-    if (referenceObjectUrlRef.current) {
-      URL.revokeObjectURL(referenceObjectUrlRef.current);
-      referenceObjectUrlRef.current = null;
+  const clearReferenceImage = useCallback((index?: number) => {
+    if (typeof index === "number") {
+      setReferenceImages((current) => {
+        const item = current[index];
+        if (item) {
+          URL.revokeObjectURL(item.url);
+          referenceObjectUrlsRef.current = referenceObjectUrlsRef.current.filter((url) => url !== item.url);
+        }
+        return current.filter((_, itemIndex) => itemIndex !== index);
+      });
+    } else {
+      for (const url of referenceObjectUrlsRef.current) URL.revokeObjectURL(url);
+      referenceObjectUrlsRef.current = [];
+      setReferenceImages([]);
     }
-    setReferenceImage(null);
     if (referenceInputRef.current) {
       referenceInputRef.current.value = "";
     }
@@ -656,10 +719,8 @@ function GenerateView({
 
   useEffect(() => {
     return () => {
-      if (referenceObjectUrlRef.current) {
-        URL.revokeObjectURL(referenceObjectUrlRef.current);
-        referenceObjectUrlRef.current = null;
-      }
+      for (const url of referenceObjectUrlsRef.current) URL.revokeObjectURL(url);
+      referenceObjectUrlsRef.current = [];
     };
   }, []);
 
@@ -734,8 +795,8 @@ function GenerateView({
   }
 
   function handleReferenceInputChange(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (file) setReferenceFile(file);
+    const files = Array.from(event.target.files ?? []);
+    if (files.length) void addReferenceFiles(files);
     event.target.value = "";
   }
 
@@ -743,7 +804,7 @@ function GenerateView({
     const file = imageFileFromClipboard(event.clipboardData);
     if (!file) return;
     event.preventDefault();
-    setReferenceFile(file);
+    void addReferenceFiles([file]);
   }
 
   async function optimizeCurrentPrompt() {
@@ -791,7 +852,7 @@ function GenerateView({
       const submittedPrompt = form.prompt;
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
-        body: generationRequestBody(form, turnstileToken, referenceImage, referenceMask),
+        body: generationRequestBody(form, turnstileToken, referenceImages, referenceMask),
       });
       refreshUsage();
       setForm((current) => (current.prompt === submittedPrompt ? { ...current, prompt: "" } : current));
@@ -884,7 +945,7 @@ function GenerateView({
       const selectionMask = maskFactory ? await maskFactory() : undefined;
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
-        body: generationRequestBody(draft, editTurnstileToken, null, selectionMask ?? null, image.id),
+        body: generationRequestBody(draft, editTurnstileToken, [], selectionMask ?? null, image.id),
       });
       if (result.status !== "queued") {
         throw new Error("创建任务未进入队列，请稍后重试。");
@@ -943,7 +1004,7 @@ function GenerateView({
                 {optimizingPrompt ? "优化中" : "提示词优化"}
               </button>
             </div>
-            <div className="figma-prompt-box relative h-[200px] overflow-hidden rounded-[10px] border border-white/15 p-3">
+            <div className="figma-prompt-box flex min-h-[228px] flex-col gap-3 overflow-hidden rounded-[10px] border border-white/15 p-3">
               <textarea
                 ref={promptTextareaRef}
                 value={form.prompt}
@@ -951,37 +1012,41 @@ function GenerateView({
                 onPaste={handlePromptPaste}
                 placeholder="可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等"
                 required
-                className="figma-prompt-textarea block h-[100px] min-h-0 w-full resize-none rounded-none border-0 bg-transparent p-0 text-xs leading-[18px] text-white/80 outline-none placeholder:text-white/40"
+                className="figma-prompt-textarea block min-h-[100px] max-h-[400px] w-full resize-none overflow-hidden rounded-none border-0 bg-transparent p-0 text-xs leading-[18px] text-white/80 outline-none placeholder:text-white/40"
               />
-              <input ref={referenceInputRef} type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={handleReferenceInputChange} />
-              <div className="absolute bottom-3 left-3 h-16 w-12">
-                <button
-                  type="button"
-                  className="absolute inset-0 grid overflow-hidden rounded-[6px] border border-white/10 bg-white/10"
-                  aria-label={referenceImage ? "更换参考图" : "添加参考图"}
-                  title={referenceImage ? "更换参考图" : "添加参考图"}
-                  onClick={() => referenceInputRef.current?.click()}
-                >
-                  {referenceImage ? (
-                    <img src={referenceImage.url} alt={referenceImage.name} className="size-full object-cover" />
-                  ) : (
-                    <span className="grid size-full place-items-center">
+              <input ref={referenceInputRef} type="file" accept="image/png,image/jpeg,image/webp" multiple className="hidden" onChange={handleReferenceInputChange} />
+              <div className="flex flex-col gap-2">
+                <div className="flex h-16 gap-2 overflow-hidden">
+                  {referenceImages.length < MAX_REFERENCE_IMAGES && (
+                    <button
+                      type="button"
+                      className="grid h-16 w-12 shrink-0 place-items-center overflow-hidden rounded-[6px] border border-white/10 bg-white/10"
+                      aria-label="添加参考图"
+                      title="添加参考图"
+                      onClick={() => referenceInputRef.current?.click()}
+                    >
                       <img src={addIcon} alt="" className="size-4" />
-                    </span>
+                    </button>
                   )}
-                </button>
-                {referenceImage && (
-                  <button
-                    type="button"
-                    className="absolute left-[27px] top-[3px] z-10 grid size-4 place-items-center overflow-hidden rounded bg-black/80"
-                    aria-label="删除参考图"
-                    title="删除参考图"
-                    onClick={clearReferenceImage}
-                  >
-                    <img src={referenceDeleteIcon} alt="" className="size-3" />
-                  </button>
-                )}
-                {referenceImage && referenceMask && <span className="absolute bottom-1 right-1 size-2 rounded-full bg-[#6eff30]" aria-label="已应用选区遮罩" />}
+                  <div className="thin-scrollbar flex min-w-0 flex-1 gap-2 overflow-x-auto">
+                    {referenceImages.map((referenceImage, index) => (
+                      <div key={`${referenceImage.url}-${index}`} className="relative h-16 w-12 shrink-0 overflow-hidden rounded-[6px] border border-white/10 bg-white/10">
+                        <img src={referenceImage.url} alt={referenceImage.name} className="size-full object-cover" />
+                        <button
+                          type="button"
+                          className="absolute right-1 top-1 z-10 grid size-4 place-items-center overflow-hidden rounded bg-black/80"
+                          aria-label="删除参考图"
+                          title="删除参考图"
+                          onClick={() => clearReferenceImage(index)}
+                        >
+                          <img src={referenceDeleteIcon} alt="" className="size-3" />
+                        </button>
+                        {index === 0 && referenceMask && <span className="absolute bottom-1 right-1 size-2 rounded-full bg-[#6eff30]" aria-label="已应用选区遮罩" />}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <FastUploadToggle enabled={fastReferenceUpload} onChange={setFastReferenceUpload} />
               </div>
             </div>
           </section>
@@ -1148,6 +1213,7 @@ function GenerationRecordCard({
   const isGenerating = record.job.status === "queued" || record.job.status === "running";
   const slotCount = Math.max(record.job.quantity, record.images.length);
   const showEmptyPlaceholder = slotCount === 0;
+  const resultSlots = record.job.results ?? [];
   const recordError =
     record.job.status === "failed" || record.job.status === "partial_succeeded"
       ? generationJobErrorMessage(
@@ -1163,7 +1229,6 @@ function GenerationRecordCard({
     formatLabels[record.job.output_format] ?? record.job.output_format.toUpperCase(),
     formatRecordElapsed(record.elapsedSeconds),
   ];
-
   return (
     <article
       className={cn(
@@ -1172,23 +1237,35 @@ function GenerationRecordCard({
       )}
     >
       <div className="flex flex-wrap items-start gap-3">
-        {Array.from({ length: slotCount }, (_, index) => (
-          <GenerationImageSlot
-            key={`${record.job.id}-${index}`}
-            job={record.job}
-            image={record.images[index]}
-            loading={isGenerating && !record.images[index]}
-            index={index}
-            onOpen={(image) => setPreviewImage(image)}
-          />
-        ))}
+        {Array.from({ length: slotCount }, (_, index) => {
+          const result = resultSlots.find((item) => item.index === index);
+          const image =
+            resultSlots.length > 0
+              ? result?.imageId
+                ? record.images.find((item) => item.id === result.imageId)
+                : undefined
+              : record.images[index];
+          return (
+            <GenerationImageSlot
+              key={`${record.job.id}-${index}`}
+              job={record.job}
+              image={image}
+              result={result}
+              loading={isGenerating && !image}
+              index={index}
+              onOpen={(nextImage) => setPreviewImage(nextImage)}
+            />
+          );
+        })}
         {showEmptyPlaceholder && <GenerationPlaceholderThumbnail job={record.job} />}
       </div>
 
+      <GenerationReferenceSnapshots job={record.job} />
       <p className="record-prompt min-w-full text-xs leading-[18px] text-white/40">
         {record.job.prompt || statusLabel(record.job.status)}
       </p>
       {recordError && <p className="text-xs leading-[18px] text-destructive">{recordError}</p>}
+      <GenerationTaskTimeline job={record.job} />
 
       <div className="flex min-h-5 items-center gap-10">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
@@ -1240,33 +1317,65 @@ function GenerationRecordCard({
 function GenerationImageSlot({
   job,
   image,
+  result,
   loading,
   index,
   onOpen,
 }: {
   job: GenerationJob;
   image?: ImageItem;
+  result?: NonNullable<GenerationJob["results"]>[number];
   loading: boolean;
   index: number;
   onOpen: (image: ImageItem) => void;
 }) {
   if (image) {
-    return <GenerationThumbnail image={image} onOpen={() => onOpen(image)} />;
+    return (
+      <div className="relative shrink-0">
+        <GenerationThumbnail image={image} onOpen={() => onOpen(image)} />
+        <GenerationSlotStatusBadge status="succeeded" />
+      </div>
+    );
   }
 
-  return <GenerationPlaceholderThumbnail job={job} loading={loading} loadingIndex={index} />;
+  return (
+    <div className="relative shrink-0">
+      <GenerationPlaceholderThumbnail job={job} loading={loading} loadingIndex={index} failed={result?.status === "failed"} />
+      {result?.status === "failed" && <GenerationSlotStatusBadge status="failed" title={result.errorMessage ?? "生成失败"} />}
+    </div>
+  );
 }
 
 function GenerationPlaceholderThumbnail({
   job,
   loading = false,
   loadingIndex = 0,
+  failed = false,
 }: {
   job: GenerationJob;
   loading?: boolean;
   loadingIndex?: number;
+  failed?: boolean;
 }) {
   const size = thumbnailSize(job.width, job.height);
+  const idleClassName = cn(
+    "grid shrink-0 place-items-center overflow-hidden rounded-md border border-white/10 bg-white/10 text-white/40",
+    failed && "border-destructive/30 bg-destructive/10 text-destructive/80",
+  );
+  const idleThumbnail = (
+    <div
+      className={idleClassName}
+      style={{ width: size.width, height: size.height }}
+      aria-label={loading ? "图片生成中" : "暂无生成图片"}
+    >
+      <FileText className="size-5" />
+    </div>
+  );
+
+  if (!loading) {
+    return idleThumbnail;
+  }
+
   const dotSize = Math.min(3, Math.max(2, Math.min(size.width / 32, size.height / 24)));
   const dotGap = Math.min(
     5,
@@ -1278,6 +1387,7 @@ function GenerationPlaceholderThumbnail({
       ),
     ),
   );
+
   return (
     <div
       className={cn(
@@ -1292,9 +1402,9 @@ function GenerationPlaceholderThumbnail({
           "--dot-gap": `${dotGap}px`,
         } as CSSProperties
       }
-      aria-label={loading ? "图片生成中" : "暂无生成图片"}
+      aria-label="图片生成中"
     >
-      {loading ? <GenerationDotMatrixLoader delayIndex={loadingIndex} /> : <FileText className="size-5" />}
+      <GenerationDotMatrixLoader delayIndex={loadingIndex} />
     </div>
   );
 }
@@ -1314,6 +1424,85 @@ function GenerationDotMatrixLoader({ delayIndex }: { delayIndex: number }) {
         />
       ))}
     </div>
+  );
+}
+
+function GenerationSlotStatusBadge({ status, title }: { status: "succeeded" | "failed"; title?: string }) {
+  return (
+    <span
+      className={cn(
+        "pointer-events-none absolute bottom-1 right-1 rounded bg-black/70 px-1.5 py-0.5 text-[10px] leading-none",
+        status === "failed" ? "text-destructive" : "text-white/60",
+      )}
+      title={title}
+    >
+      {status === "failed" ? "失败" : "完成"}
+    </span>
+  );
+}
+
+function GenerationReferenceSnapshots({ job }: { job: GenerationJob }) {
+  const references = job.referenceImages ?? [];
+  if (references.length === 0) return null;
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      <span className="shrink-0 rounded-md bg-white/10 px-2 py-1 text-xs leading-none text-white/45">参考图</span>
+      <div className="thin-scrollbar flex min-w-0 gap-2 overflow-x-auto">
+        {references.map((reference, index) => (
+          <img
+            key={`${reference.url}-${index}`}
+            src={reference.url}
+            alt={reference.name || `参考图 ${index + 1}`}
+            loading="lazy"
+            className="h-12 w-9 shrink-0 rounded-[6px] border border-white/10 bg-white/10 object-cover"
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function GenerationTaskTimeline({ job }: { job: GenerationJob }) {
+  const progressCurrent = job.progress_current ?? completedResultCount(job);
+  const progressTotal = job.progress_total ?? job.quantity;
+  const stage = job.stage ?? stageFromJobStatus(job.status);
+  const items = [
+    { id: "queued", label: "已提交", active: true },
+    { id: "running", label: stageLabel(stage), active: job.status !== "queued" },
+    { id: "done", label: terminalTimelineLabel(job), active: isTerminalJobStatus(job.status) },
+  ];
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs leading-[18px] text-white/40">
+      {items.map((item, index) => (
+        <Fragment key={item.id}>
+          <span className="flex items-center gap-1.5">
+            <span className={cn("size-1.5 rounded-full", item.active ? "bg-[#6eff30]/80" : "bg-white/25")} />
+            <span>{item.label}</span>
+          </span>
+          {index < items.length - 1 && <span className="text-white/20">/</span>}
+        </Fragment>
+      ))}
+      <span className="rounded-md bg-white/10 px-2 py-1 leading-none text-white/45">
+        {Math.min(progressCurrent, progressTotal)}/{progressTotal}
+      </span>
+    </div>
+  );
+}
+
+function FastUploadToggle({ enabled, onChange }: { enabled: boolean; onChange: Dispatch<SetStateAction<boolean>> }) {
+  return (
+    <label className="flex min-h-7 cursor-pointer items-center gap-2 rounded-[6px] border border-white/10 bg-black/10 px-2 py-1">
+      <input
+        type="checkbox"
+        className="size-3.5 shrink-0 accent-white"
+        checked={enabled}
+        aria-label="快速上传"
+        onChange={(event) => onChange(event.target.checked)}
+      />
+      <span className="min-w-0 text-xs leading-[18px] text-white/60">
+        快速上传 <span className="text-white/40">压缩文件大小提升上传速度</span>
+      </span>
+    </label>
   );
 }
 
@@ -1712,6 +1901,12 @@ function ImagePreviewEditPanel({
   onOptimize: () => void;
   onSubmit: (event: FormEvent) => void;
 }) {
+  const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    if (promptTextareaRef.current) resizePromptTextarea(promptTextareaRef.current);
+  }, [draft.prompt]);
+
   return (
     <form className="image-preview-editor" onSubmit={onSubmit}>
       <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-4 pt-4">
@@ -1728,15 +1923,16 @@ function ImagePreviewEditPanel({
               {optimizing ? "优化中" : "提示词优化"}
             </button>
           </div>
-          <div className="figma-prompt-box relative h-[200px] overflow-hidden rounded-[10px] border border-white/15 p-3">
+          <div className="figma-prompt-box flex min-h-[200px] flex-col gap-3 overflow-hidden rounded-[10px] border border-white/15 p-3">
             <textarea
+              ref={promptTextareaRef}
               value={draft.prompt}
               onChange={(event) => onDraftChange("prompt", event.target.value)}
               placeholder="可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等"
               required
-              className="figma-prompt-textarea block h-[100px] min-h-0 w-full resize-none rounded-none border-0 bg-transparent p-0 text-xs leading-[18px] text-white/80 outline-none placeholder:text-white/40"
+              className="figma-prompt-textarea block min-h-[100px] max-h-[400px] w-full resize-none overflow-hidden rounded-none border-0 bg-transparent p-0 text-xs leading-[18px] text-white/80 outline-none placeholder:text-white/40"
             />
-            <div className="absolute bottom-3 left-3 grid h-16 w-12 place-items-center overflow-hidden rounded-[6px] bg-white/10">
+            <div className="grid h-16 w-12 place-items-center overflow-hidden rounded-[6px] bg-white/10">
               <img src={addIcon} alt="" className="size-4" />
             </div>
           </div>
@@ -1977,7 +2173,7 @@ function GalleryView({
       const selectionMask = maskFactory ? await maskFactory() : undefined;
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
-        body: generationRequestBody(draft, turnstileToken, null, selectionMask ?? null, image.id),
+        body: generationRequestBody(draft, turnstileToken, [], selectionMask ?? null, image.id),
       });
       if (result.status !== "queued") {
         throw new Error("创建任务未进入队列，请稍后重试。");
@@ -2365,11 +2561,11 @@ function roundToStep(value: number, step: number): number {
 function generationRequestBody(
   form: GenerateForm,
   turnstileToken: string,
-  referenceImage: ReferenceImagePreview | null,
+  referenceImages: ReferenceImagePreview[],
   maskImage?: ImageSelectionMask | null,
   sourceImageId?: string,
 ): BodyInit {
-  if (!referenceImage && !maskImage) {
+  if (referenceImages.length === 0 && !maskImage) {
     return JSON.stringify({ ...form, turnstileToken, ...(sourceImageId ? { sourceImageId } : {}) });
   }
 
@@ -2379,7 +2575,9 @@ function generationRequestBody(
   }
   if (turnstileToken) body.set("turnstileToken", turnstileToken);
   if (sourceImageId) body.set("sourceImageId", sourceImageId);
-  if (referenceImage) body.set("referenceImage", referenceImage.file, referenceImage.name);
+  for (const referenceImage of referenceImages.slice(0, MAX_REFERENCE_IMAGES)) {
+    body.append("referenceImage", referenceImage.file, referenceImage.name);
+  }
   if (maskImage) body.set("maskImage", maskImage.file, maskImage.name);
   return body;
 }
@@ -2569,12 +2767,57 @@ async function createSelectionMask(image: ImageItem, strokes: ImageSelectionStro
   };
 }
 
-function canvasToBlob(canvas: HTMLCanvasElement, type: string): Promise<Blob> {
+async function compressReferenceImage(file: File): Promise<{ file: File; compressed: boolean }> {
+  const image = await loadBrowserImage(file);
+  const scale = Math.min(1, FAST_REFERENCE_IMAGE_EDGE / Math.max(image.naturalWidth, image.naturalHeight));
+  const width = Math.max(1, Math.round(image.naturalWidth * scale));
+  const height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) return { file, compressed: false };
+  context.drawImage(image, 0, 0, width, height);
+
+  const preferred = await canvasToBlob(canvas, "image/webp", 0.86).catch(() => null);
+  const fallback = preferred ?? (await canvasToBlob(canvas, "image/jpeg", 0.88).catch(() => null));
+  if (!fallback || fallback.size >= file.size) return { file, compressed: false };
+
+  const type = normalizeImageMime(fallback.type) || "image/jpeg";
+  const extension = type === "image/webp" ? "webp" : "jpg";
+  return {
+    file: new File([fallback], replaceFileExtension(file.name || "reference", extension), { type }),
+    compressed: true,
+  };
+}
+
+function loadBrowserImage(file: File): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("参考图读取失败。"));
+    };
+    image.src = url;
+  });
+}
+
+function replaceFileExtension(name: string, extension: string): string {
+  const trimmed = name.trim() || "reference";
+  return `${trimmed.replace(/\.[^.]+$/, "")}.${extension}`;
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number): Promise<Blob> {
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (blob) resolve(blob);
       else reject(new Error("选区遮罩生成失败。"));
-    }, type);
+    }, type, quality);
   });
 }
 
@@ -2684,6 +2927,46 @@ function statusLabel(status: GenerationJob["status"]): string {
     failed: "生成失败",
     cancelled: "已取消",
   }[status];
+}
+
+function stageFromJobStatus(status: GenerationJob["status"]): NonNullable<GenerationJob["stage"]> {
+  if (status === "queued") return "queued";
+  if (status === "running") return "waiting_provider";
+  if (status === "cancelled") return "cancelled";
+  if (status === "failed") return "failed";
+  return "completed";
+}
+
+function stageLabel(stage: NonNullable<GenerationJob["stage"]>): string {
+  return {
+    queued: "排队",
+    submitting: "提交上游",
+    waiting_provider: "等待模型",
+    saving: "保存图片",
+    completed: "完成",
+    failed: "失败",
+    cancelled: "取消",
+  }[stage];
+}
+
+function terminalTimelineLabel(job: GenerationJob): string {
+  if (!isTerminalJobStatus(job.status)) return "待完成";
+  if (job.status === "partial_succeeded") return "部分完成";
+  return statusText(job.status).replace("任务", "");
+}
+
+function completedResultCount(job: GenerationJob): number {
+  const results = job.results ?? [];
+  if (results.length > 0) return results.filter((result) => result.status === "succeeded" || result.status === "failed").length;
+  if (isTerminalJobStatus(job.status)) return job.quantity;
+  return 0;
+}
+
+function resizePromptTextarea(textarea: HTMLTextAreaElement): void {
+  textarea.style.height = "auto";
+  const nextHeight = Math.min(textarea.scrollHeight, PROMPT_TEXTAREA_MAX_HEIGHT);
+  textarea.style.height = `${nextHeight}px`;
+  textarea.style.overflowY = textarea.scrollHeight > PROMPT_TEXTAREA_MAX_HEIGHT ? "auto" : "hidden";
 }
 
 function generationJobErrorMessage(job: Pick<GenerationJob, "error_code" | "error_message">, fallback: string): string {

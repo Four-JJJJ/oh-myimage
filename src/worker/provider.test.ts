@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildImageGenerationFormData,
   buildImageGenerationPayload,
@@ -6,14 +6,21 @@ import {
   extractResponsesOutputText,
   imageGenerationEndpointPath,
   providerErrorCode,
+  resolveProviderImageBinary,
   providerStatusMessage,
+  providerErrorRetryable,
   resolvePromptOptimizerModel,
   resolveProviderImageBatchSize,
   resolveProviderImageConcurrency,
   resolveImageBackground,
   resolveResponsesModel,
+  recoverStoredImageForResult,
 } from "./provider";
-import { GenerationJobRecord } from "./types";
+import { AppDatabase, AppObjectStore, GenerationJobRecord } from "./types";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("provider generation batching", () => {
   it("defaults to single-image provider requests", () => {
@@ -48,6 +55,60 @@ describe("provider error normalization", () => {
     expect(providerStatusMessage(524, "error code: 524", 600_000)).toBe(
       "模型服务返回 524，上游网关等待模型服务超时。当前 Worker 已允许最长等待 10 分钟；如果单次生图经常超过 120 秒，请将 baseURL 指向 DNS-only/直连源站域名，或把上游接口改成异步任务/轮询模式。",
     );
+  });
+
+  it("classifies auth, balance, content, timeout, and upstream errors separately", () => {
+    expect(providerErrorCode(401, "invalid api key")).toBe("provider_auth_failed");
+    expect(providerErrorCode(402, "insufficient balance")).toBe("provider_balance_insufficient");
+    expect(providerErrorCode(400, "content_policy_violation")).toBe("provider_content_rejected");
+    expect(providerErrorCode(504, "gateway timeout")).toBe("provider_timeout");
+    expect(providerErrorCode(503, "upstream overloaded")).toBe("provider_upstream_error");
+
+    expect(providerErrorRetryable("provider_auth_failed", 401)).toBe(false);
+    expect(providerErrorRetryable("provider_balance_insufficient", 402)).toBe(false);
+    expect(providerErrorRetryable("provider_content_rejected", 400)).toBe(false);
+    expect(providerErrorRetryable("provider_timeout", 504)).toBe(true);
+    expect(providerErrorRetryable("provider_upstream_error", 503)).toBe(true);
+  });
+});
+
+describe("provider save recovery", () => {
+  it("recovers an already stored image object without requesting the provider again", async () => {
+    const db = new RecordingDatabase();
+    const images = new MemoryObjectStore({
+      "space_1/job_1/img_job_1_0.png": new Uint8Array([1, 2, 3]).buffer,
+    });
+
+    const recovered = await recoverStoredImageForResult(makeJob(), 0, { DB: db, IMAGES: images } as never);
+
+    expect(recovered?.imageId).toBe("img_job_1_0");
+    expect(db.queries.join("\n")).toContain("INSERT INTO image_assets");
+    expect(images.getCalls).toEqual(["space_1/job_1/img_job_1_0.png"]);
+  });
+});
+
+describe("provider image result compatibility", () => {
+  it("downloads URL-style image results and preserves the actual image format", async () => {
+    const bytes = new Uint8Array([137, 80, 78, 71]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(bytes, {
+          status: 200,
+          headers: { "Content-Type": "image/png" },
+        }),
+      ),
+    );
+
+    const result = await resolveProviderImageBinary(
+      { url: "https://img.sulmes.com/images/example.png" },
+      "jpeg",
+      10_000,
+    );
+
+    expect(result.bytes).toEqual(bytes);
+    expect(result.format).toBe("png");
+    expect(result.mimeType).toBe("image/png");
   });
 });
 
@@ -173,6 +234,19 @@ describe("Image API generation helpers", () => {
     expect(maskImage.name).toBe("source-mask.png");
   });
 
+  it("builds Image Edits multipart fields with multiple reference images", () => {
+    const payload = buildImageGenerationPayload(makeJob({ reference_images_json: JSON.stringify([{ storageKey: "space/job/reference-1.png" }]) }), 1);
+    const formData = buildImageGenerationFormData(payload, [
+      { blob: new Blob(["reference-1"], { type: "image/png" }), filename: "source-1.png" },
+      { blob: new Blob(["reference-2"], { type: "image/webp" }), filename: "source-2.webp" },
+    ]);
+    const referenceImages = formData.getAll("image[]") as File[];
+
+    expect(formData.get("image")).toBeNull();
+    expect(referenceImages).toHaveLength(2);
+    expect(referenceImages.map((image) => image.name)).toEqual(["source-1.png", "source-2.webp"]);
+  });
+
   it("includes compression for jpeg and webp Image API payloads", () => {
     const payload = buildImageGenerationPayload(
       makeJob({
@@ -222,10 +296,15 @@ function makeJob(overrides: Partial<GenerationJobRecord> = {}): GenerationJobRec
     reference_image_mime_type: null,
     reference_image_name: null,
     reference_image_byte_size: null,
+    reference_images_json: null,
     mask_image_storage_key: null,
     mask_image_mime_type: null,
     mask_image_name: null,
     mask_image_byte_size: null,
+    stage: null,
+    progress_current: 0,
+    progress_total: null,
+    error_reason: null,
     revised_prompt: null,
     usage_json: null,
     error_code: null,
@@ -235,4 +314,43 @@ function makeJob(overrides: Partial<GenerationJobRecord> = {}): GenerationJobRec
     completed_at: null,
     ...overrides,
   };
+}
+
+class RecordingDatabase implements AppDatabase {
+  readonly queries: string[] = [];
+
+  prepare(query: string) {
+    this.queries.push(query);
+    return {
+      bind: () => this.prepare(query),
+      first: async () => null,
+      all: async () => ({ results: [] }),
+      run: async () => ({}),
+    };
+  }
+}
+
+class MemoryObjectStore implements AppObjectStore {
+  readonly getCalls: string[] = [];
+
+  constructor(private readonly objects: Record<string, ArrayBuffer>) {}
+
+  async put(): Promise<unknown> {
+    throw new Error("put is not expected");
+  }
+
+  async get(key: string) {
+    this.getCalls.push(key);
+    const bytes = this.objects[key];
+    if (!bytes) return null;
+    return {
+      body: null,
+      httpMetadata: { contentType: "image/png" },
+      async arrayBuffer() {
+        return bytes;
+      },
+    };
+  }
+
+  async delete(): Promise<void> {}
 }

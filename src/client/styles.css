@@ -94,6 +94,64 @@
 }
 
 @layer components {
+  .ohm-smooth-panel {
+    border-radius: 24px;
+  }
+
+  .ohm-composer-panel {
+    border-color: rgb(255 255 255 / 0.1);
+    background: rgb(21 21 21 / 0.85);
+    box-shadow: none;
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+  }
+
+  .ohm-smooth-card {
+    border-radius: 10px;
+  }
+
+  .ohm-smooth-control {
+    border-radius: 10px;
+  }
+
+  .ohm-smooth-chip {
+    border-radius: 10px;
+  }
+
+  .ohm-smooth-nav {
+    border-radius: 12.5px;
+  }
+
+  .ohm-textarea-scrollbar {
+    scrollbar-width: none;
+  }
+
+  .ohm-textarea-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .ohm-loading-status {
+    display: inline-block;
+    height: 22px;
+    overflow: hidden;
+    vertical-align: top;
+  }
+
+  .ohm-loading-status-track {
+    display: flex;
+    flex-direction: column;
+    animation: ohm-loading-status-slot 5.4s cubic-bezier(0.7, 0, 0.2, 1) infinite;
+  }
+
+  .ohm-loading-status-line {
+    height: 22px;
+    white-space: nowrap;
+  }
+
+  .ohm-loaders-wtf-status {
+    overflow: visible;
+  }
+
   .app-shell {
     background:
       linear-gradient(180deg, hsl(0 0% 6%) 0%, hsl(0 0% 4%) 58%, hsl(0 0% 3%) 100%),
@@ -539,6 +597,27 @@
   }
 }
 
+@keyframes ohm-loading-status-slot {
+  0%,
+  23% {
+    transform: translateY(0);
+  }
+
+  33%,
+  56% {
+    transform: translateY(-22px);
+  }
+
+  66%,
+  89% {
+    transform: translateY(-44px);
+  }
+
+  100% {
+    transform: translateY(0);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -563,5 +642,9 @@
   .generation-dot-matrix-dot:nth-child(4n) {
     opacity: 0.56;
     transform: scale(0.92);
+  }
+
+  .ohm-loading-status-track {
+    animation: none !important;
   }
 }

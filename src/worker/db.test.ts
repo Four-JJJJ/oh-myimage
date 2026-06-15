@@ -5,6 +5,8 @@ import {
   countPendingGenerationImages,
   IMAGE_GENERATED_EVENT,
   insertImageUsageEvent,
+  listGenerationResultsForJob,
+  upsertGenerationJobResult,
 } from "./db";
 import type { AppDatabase, AppPreparedStatement } from "./types";
 
@@ -110,5 +112,51 @@ describe("daily image usage accounting", () => {
       method: "run",
       values: ["evt_usage_img_abc", "space_1", IMAGE_GENERATED_EVENT],
     });
+  });
+});
+
+describe("generation job result slots", () => {
+  it("upserts per-image generation results with stable slot identity", async () => {
+    const db = new FakeDatabase();
+
+    await upsertGenerationJobResult(db, {
+      id: "res_job_1_0",
+      space_id: "space_1",
+      job_id: "job_1",
+      result_index: 0,
+      status: "failed",
+      image_asset_id: null,
+      error_code: "provider_timeout",
+      error_message: "模型服务超时",
+      started_at: "2026-05-15T00:00:00.000Z",
+      completed_at: "2026-05-15T00:01:00.000Z",
+    });
+
+    expect(db.calls[0]?.method).toBe("run");
+    expect(db.calls[0]?.query).toContain("INSERT INTO generation_job_results");
+    expect(db.calls[0]?.query).toContain("ON CONFLICT");
+    expect(db.calls[0]?.values).toEqual([
+      "res_job_1_0",
+      "space_1",
+      "job_1",
+      0,
+      "failed",
+      null,
+      "provider_timeout",
+      "模型服务超时",
+      "2026-05-15T00:00:00.000Z",
+      "2026-05-15T00:01:00.000Z",
+    ]);
+  });
+
+  it("lists generation result slots in index order", async () => {
+    const db = new FakeDatabase();
+
+    await listGenerationResultsForJob(db, "space_1", "job_1");
+
+    expect(db.calls[0]?.method).toBe("all");
+    expect(db.calls[0]?.query).toContain("FROM generation_job_results");
+    expect(db.calls[0]?.query).toContain("ORDER BY result_index ASC");
+    expect(db.calls[0]?.values).toEqual(["space_1", "job_1"]);
   });
 });
