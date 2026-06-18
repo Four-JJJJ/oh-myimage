@@ -46,7 +46,8 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions = {}): NodeR
     REQUEST_TIMEOUT_MS: process.env.REQUEST_TIMEOUT_MS ?? "600000",
     PROVIDER_IMAGE_BATCH_SIZE: process.env.PROVIDER_IMAGE_BATCH_SIZE ?? "1",
     PROVIDER_IMAGE_CONCURRENCY: process.env.PROVIDER_IMAGE_CONCURRENCY ?? "2",
-    PROVIDER_RETRY_ATTEMPTS: process.env.PROVIDER_RETRY_ATTEMPTS ?? "2",
+    PROVIDER_TIMEOUT_RETRY_ATTEMPTS: process.env.PROVIDER_TIMEOUT_RETRY_ATTEMPTS ?? "0",
+    PROVIDER_RETRY_ATTEMPTS: process.env.PROVIDER_RETRY_ATTEMPTS ?? "0",
     PROVIDER_RETRY_DELAY_SECONDS: process.env.PROVIDER_RETRY_DELAY_SECONDS ?? "120",
     IMAGE_RETENTION_DAYS: process.env.IMAGE_RETENTION_DAYS ?? "90",
     X_BEARER_TOKEN: process.env.X_BEARER_TOKEN ?? "",
@@ -71,7 +72,7 @@ function requiredEnv(name: string): string {
 }
 
 function resolveGenerationAttempts(): number {
-  return Math.max(1, Math.trunc(envNumber(process.env.PROVIDER_RETRY_ATTEMPTS, 2)) + 1);
+  return Math.max(1, Math.trunc(envNumber(process.env.PROVIDER_RETRY_ATTEMPTS, 0)) + 1);
 }
 
 function disabledQueue<T>(name: string) {

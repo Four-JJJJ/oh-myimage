@@ -31,12 +31,15 @@ export interface ComposerDraft {
 interface SubmittedReferenceImagePreview {
   file: Pick<File, "type" | "size">;
   url: string;
+  name?: string;
 }
 
 interface SubmittedSourceImagePreview {
   url: string;
   name: string;
 }
+
+interface SubmittedMaskImagePreview extends SubmittedReferenceImagePreview {}
 
 const TITLE_MAX_LENGTH = 12;
 const draftConversationPrefix = "draft-conversation-";
@@ -89,7 +92,8 @@ export function buildSidebarConversations(
   const seenConversationIds = new Set<string>();
 
   for (const item of items) {
-    const conversationId = conversationIdsByRecordId[item.id] ?? item.id;
+    const record = records.find((candidate) => candidate.job.id === item.id);
+    const conversationId = recordConversationId(record, conversationIdsByRecordId);
     if (seenConversationIds.has(conversationId)) continue;
     seenConversationIds.add(conversationId);
 
@@ -106,6 +110,18 @@ export function buildSidebarConversations(
   return draftConversation ? [draftConversation, ...grouped] : grouped;
 }
 
+export function resolveDefaultActiveConversationId(
+  records: GenerationRecord[],
+  conversationIdsByRecordId: Record<string, string> = {},
+): string | null {
+  const conversationId = conversationIdForRecord(records[0], conversationIdsByRecordId);
+  return conversationId || null;
+}
+
+export function resolveLatestVisibleConversationId(conversations: ConversationListItem[]): string | null {
+  return conversations.find((conversation) => !conversation.isDraft)?.id ?? null;
+}
+
 export function buildGenerationFlowItem(record: GenerationRecord): GenerationFlowItem {
   return {
     id: record.job.id,
@@ -117,9 +133,23 @@ export function buildGenerationFlowItem(record: GenerationRecord): GenerationFlo
 }
 
 export function mergeJobReferenceImages(job: GenerationJob, fallbackJob?: GenerationJob | null): GenerationJob {
-  if ((job.referenceImages?.length ?? 0) > 0) return job;
   if (!fallbackJob || fallbackJob.id !== job.id || (fallbackJob.referenceImages?.length ?? 0) === 0) return job;
-  return { ...job, referenceImages: fallbackJob.referenceImages };
+  if ((job.referenceImages?.length ?? 0) === 0) return { ...job, referenceImages: fallbackJob.referenceImages };
+
+  const mergedReferenceImages = fallbackJob.referenceImages!.map((fallbackImage, index) => {
+    const serverImage = job.referenceImages?.[index];
+    if (!serverImage) return fallbackImage;
+    const fallbackName = fallbackImage.name?.trim();
+    const shouldPreferFallbackPreview = Boolean(fallbackName?.startsWith("局部重绘"));
+    if (!fallbackName && !shouldPreferFallbackPreview) return serverImage;
+    return {
+      ...serverImage,
+      name: fallbackName || serverImage.name,
+      url: shouldPreferFallbackPreview ? (fallbackImage.url || serverImage.url) : serverImage.url,
+    };
+  });
+
+  return { ...job, referenceImages: mergedReferenceImages };
 }
 
 export function submittedReferenceImages(
@@ -128,19 +158,21 @@ export function submittedReferenceImages(
 ): NonNullable<GenerationJob["referenceImages"]> {
   if (referenceImages.length > 0) {
     return referenceImages.map((image, index) => ({
-      name: `参考图 ${index + 1}`,
+      name: image.name || `参考图 ${index + 1}`,
       mimeType: image.file.type || "image/png",
       byteSize: image.file.size,
       url: image.url,
     }));
   }
   if (!sourceImagePreview) return [];
-  return [{
-    name: sourceImagePreview.name || "参考图 1",
-    mimeType: "image/png",
-    byteSize: 0,
-    url: sourceImagePreview.url,
-  }];
+  return [
+    {
+      name: sourceImagePreview.name || "参考图 1",
+      mimeType: "image/png",
+      byteSize: 0,
+      url: sourceImagePreview.url,
+    },
+  ];
 }
 
 export function buildConversationRecords(
@@ -149,8 +181,20 @@ export function buildConversationRecords(
   conversationId: string,
 ): GenerationRecord[] {
   return records
-    .filter((record) => (conversationIdsByRecordId[record.job.id] ?? record.job.id) === conversationId)
+    .filter((record) => recordConversationId(record, conversationIdsByRecordId) === conversationId)
     .sort((left, right) => Date.parse(left.job.created_at) - Date.parse(right.job.created_at));
+}
+
+function recordConversationId(record: GenerationRecord | undefined, conversationIdsByRecordId: Record<string, string>): string {
+  if (!record) return "";
+  const mappedConversationId = conversationIdsByRecordId[record.job.id];
+  if (mappedConversationId) return mappedConversationId;
+  const persistedConversationId = record.job.conversation_id?.trim();
+  return persistedConversationId || record.job.id;
+}
+
+export function conversationIdForRecord(record: GenerationRecord | undefined, conversationIdsByRecordId: Record<string, string> = {}): string {
+  return recordConversationId(record, conversationIdsByRecordId);
 }
 
 export function composerDraftFromRecord(record: GenerationRecord, sourceImageId?: string): ComposerDraft {

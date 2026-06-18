@@ -68,6 +68,7 @@ export interface Env {
   REQUEST_TIMEOUT_MS?: string;
   PROVIDER_IMAGE_BATCH_SIZE?: string;
   PROVIDER_IMAGE_CONCURRENCY?: string;
+  PROVIDER_TIMEOUT_RETRY_ATTEMPTS?: string;
   PROVIDER_RETRY_ATTEMPTS?: string;
   PROVIDER_RETRY_DELAY_SECONDS?: string;
   IMAGE_RETENTION_DAYS?: string;
@@ -116,6 +117,11 @@ export interface CredentialRecord {
   api_key_hint: string;
   last_test_ok: number;
   last_tested_at: string | null;
+  prompt_base_url: string | null;
+  prompt_encrypted_api_key: string | null;
+  prompt_api_key_hint: string | null;
+  prompt_last_test_ok: number;
+  prompt_last_tested_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -123,6 +129,7 @@ export interface CredentialRecord {
 export interface GenerationJobRecord {
   id: string;
   space_id: string;
+  conversation_id: string | null;
   status: JobStatus;
   prompt: string;
   aspect_ratio: string;

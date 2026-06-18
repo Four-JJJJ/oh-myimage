@@ -6,8 +6,11 @@ import {
   buildGenerationFlowItem,
   mergeJobReferenceImages,
   buildSidebarConversations,
+  conversationIdForRecord,
   composerDraftFromRecord,
   createDraftConversation,
+  resolveDefaultActiveConversationId,
+  resolveLatestVisibleConversationId,
   submittedReferenceImages,
   truncateConversationTitle,
   updateDraftConversationTitle,
@@ -92,6 +95,52 @@ describe("generate menu mappers", () => {
     ]);
   });
 
+  it("uses persisted conversation ids when rebuilding the sidebar from reloaded records", () => {
+    const items = buildSidebarConversations(
+      [
+        record({ id: "job_child", conversation_id: "job_root", created_at: "2026-06-14T09:12:00.000Z", prompt: "第二次创作" }, [
+          { id: "img_child", jobId: "job_child", url: "/child.png", width: 100, height: 100, format: "png", createdAt: "2026-06-14T09:13:00.000Z" },
+        ]),
+        record({ id: "job_root", conversation_id: "job_root", created_at: "2026-06-14T08:12:00.000Z", prompt: "第一次创作" }),
+      ],
+      null,
+      {},
+      new Date("2026-06-14T12:00:00.000Z"),
+    );
+
+    expect(items).toMatchObject([
+      {
+        id: "job_root",
+        title: "第一次创作",
+        previewImage: "/child.png",
+        latestRecordId: "job_child",
+        groupLabel: "今天",
+      },
+    ]);
+  });
+
+  it("resolves the default active conversation to the root conversation id", () => {
+    const records = [
+      record({ id: "job_child", conversation_id: "job_root", created_at: "2026-06-14T09:12:00.000Z", prompt: "第二次创作" }),
+      record({ id: "job_root", conversation_id: "job_root", created_at: "2026-06-14T08:12:00.000Z", prompt: "第一次创作" }),
+    ];
+
+    expect(resolveDefaultActiveConversationId(records)).toBe("job_root");
+    expect(conversationIdForRecord(records[0])).toBe("job_root");
+  });
+
+  it("falls back to the latest visible conversation when a draft is present", () => {
+    const draft = createDraftConversation(new Date("2026-06-14T12:00:00.000Z"));
+    const conversations = buildSidebarConversations(
+      [record({ id: "job_root", conversation_id: "job_root", created_at: "2026-06-14T08:12:00.000Z", prompt: "第一次创作" })],
+      draft,
+      {},
+      new Date("2026-06-14T12:00:00.000Z"),
+    );
+
+    expect(resolveLatestVisibleConversationId(conversations)).toBe("job_root");
+  });
+
   it("uses the first user prompt as the draft conversation title", () => {
     const draft = createDraftConversation(new Date("2026-06-14T12:00:00.000Z"));
 
@@ -129,7 +178,25 @@ describe("generate menu mappers", () => {
       referenceImages: [{ name: "source.png", mimeType: "image/png", byteSize: 256, url: "/api/generations/job_with_reference/references/0" }],
     }).job;
 
-    expect(mergeJobReferenceImages(refreshedJob, submittedJob).referenceImages).toEqual(refreshedJob.referenceImages);
+    expect(mergeJobReferenceImages(refreshedJob, submittedJob).referenceImages).toEqual([
+      { name: "参考图 1", mimeType: "image/png", byteSize: 256, url: "/api/generations/job_with_reference/references/0" },
+    ]);
+  });
+
+  it("preserves semantic submitted reference labels after refresh", () => {
+    const submittedJob = record({
+      id: "job_with_reference",
+      referenceImages: [{ name: "参考图 1", mimeType: "image/png", byteSize: 128, url: "blob:reference-1" }],
+    }).job;
+    const refreshedJob = record({
+      id: "job_with_reference",
+      status: "running",
+      referenceImages: [{ name: "Codex Pro 分组价格.jpg", mimeType: "image/png", byteSize: 256, url: "/api/generations/job_with_reference/references/0" }],
+    }).job;
+
+    expect(mergeJobReferenceImages(refreshedJob, submittedJob).referenceImages).toEqual([
+      { name: "参考图 1", mimeType: "image/png", byteSize: 256, url: "/api/generations/job_with_reference/references/0" },
+    ]);
   });
 
   it("falls back to the continue-from-image preview when no uploaded reference image exists", () => {
@@ -137,6 +204,51 @@ describe("generate menu mappers", () => {
       submittedReferenceImages([], { name: "参考图 1", url: "blob:continue-source" }),
     ).toEqual([
       { name: "参考图 1", mimeType: "image/png", byteSize: 0, url: "blob:continue-source" },
+    ]);
+  });
+
+  it("preserves custom submitted reference names such as local edit previews", () => {
+    expect(
+      submittedReferenceImages([
+        {
+          name: "局部重绘",
+          file: { type: "image/webp", size: 2048 },
+          url: "blob:local-edit-reference",
+        },
+      ]),
+    ).toEqual([
+      { name: "局部重绘", mimeType: "image/webp", byteSize: 2048, url: "blob:local-edit-reference" },
+    ]);
+  });
+
+  it("uses a single local edit preview for source edits", () => {
+    expect(
+      submittedReferenceImages(
+        [],
+        { name: "局部重绘", url: "blob:local-edit-source" },
+      ),
+    ).toEqual([
+      { name: "局部重绘", mimeType: "image/png", byteSize: 0, url: "blob:local-edit-source" },
+    ]);
+  });
+
+  it("preserves the local edit preview after server refresh", () => {
+    const submittedJob = record({
+      id: "job_local_edit",
+      referenceImages: [
+        { name: "局部重绘", mimeType: "image/png", byteSize: 0, url: "blob:local-edit-source" },
+      ],
+    }).job;
+    const refreshedJob = record({
+      id: "job_local_edit",
+      status: "running",
+      referenceImages: [
+        { name: "img_job_1.png", mimeType: "image/png", byteSize: 256, url: "/api/generations/job_local_edit/references/0" },
+      ],
+    }).job;
+
+    expect(mergeJobReferenceImages(refreshedJob, submittedJob).referenceImages).toEqual([
+      { name: "局部重绘", mimeType: "image/png", byteSize: 256, url: "blob:local-edit-source" },
     ]);
   });
 

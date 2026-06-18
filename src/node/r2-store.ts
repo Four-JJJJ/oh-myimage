@@ -12,7 +12,7 @@ export interface R2StoreConfig {
 }
 
 export function createR2Store(config: R2StoreConfig): AppObjectStore {
-  const endpoint = config.endpoint ?? `https://${config.accountId}.r2.cloudflarestorage.com`;
+  const endpoint = resolveR2Endpoint(config);
   const client = new S3Client({
     region: "auto",
     endpoint,
@@ -23,6 +23,18 @@ export function createR2Store(config: R2StoreConfig): AppObjectStore {
     },
   });
   return new S3ObjectStore(client, config.bucket);
+}
+
+function resolveR2Endpoint(config: Pick<R2StoreConfig, "accountId" | "endpoint">): string {
+  const explicitEndpoint = config.endpoint?.trim();
+  if (explicitEndpoint) return explicitEndpoint;
+
+  const accountId = config.accountId?.trim();
+  if (!accountId) {
+    throw new Error("R2 account ID is required when R2_ENDPOINT is not set.");
+  }
+
+  return `https://${accountId}.r2.cloudflarestorage.com`;
 }
 
 class S3ObjectStore implements AppObjectStore {

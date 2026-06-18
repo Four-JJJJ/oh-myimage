@@ -17,11 +17,14 @@ export interface AppConfig {
 export interface ProviderSettings {
   baseURL: string;
   model: string;
-  promptOptimizerModel: string;
   apiKeyHint: string;
   lastTestOk: boolean;
   lastTestedAt: string | null;
-  usesTokenFourjProvider: boolean;
+}
+
+export interface SettingsProviders {
+  imageProvider: ProviderSettings | null;
+  promptProvider: ProviderSettings | null;
 }
 
 export interface ImageItem {
@@ -62,6 +65,7 @@ export interface InspirationItem {
 
 export interface GenerationJob {
   id: string;
+  conversation_id?: string | null;
   status: "queued" | "running" | "succeeded" | "partial_succeeded" | "failed" | "cancelled";
   stage?: "queued" | "submitting" | "waiting_provider" | "saving" | "completed" | "failed" | "cancelled" | null;
   progress_current?: number;

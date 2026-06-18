@@ -5,6 +5,7 @@ import {
   buildProviderImagePrompt,
   extractResponsesOutputText,
   imageGenerationEndpointPath,
+  requestGenerationBatchWithRecovery,
   providerErrorCode,
   resolveProviderImageBinary,
   providerStatusMessage,
@@ -12,9 +13,12 @@ import {
   resolvePromptOptimizerModel,
   resolveProviderImageBatchSize,
   resolveProviderImageConcurrency,
+  resolveProviderTimeoutRetryAttempts,
   resolveImageBackground,
   resolveResponsesModel,
   recoverStoredImageForResult,
+  shouldPersistFailedResult,
+  ProviderError,
 } from "./provider";
 import { AppDatabase, AppObjectStore, GenerationJobRecord } from "./types";
 
@@ -42,6 +46,12 @@ describe("provider generation batching", () => {
     expect(resolveProviderImageConcurrency("2")).toBe(2);
     expect(resolveProviderImageConcurrency("2.8")).toBe(2);
     expect(resolveProviderImageConcurrency("10")).toBe(4);
+  });
+
+  it("defaults to no immediate provider timeout retries", () => {
+    expect(resolveProviderTimeoutRetryAttempts(undefined)).toBe(0);
+    expect(resolveProviderTimeoutRetryAttempts("1")).toBe(1);
+    expect(resolveProviderTimeoutRetryAttempts("99")).toBe(3);
   });
 });
 
@@ -109,6 +119,134 @@ describe("provider image result compatibility", () => {
     expect(result.bytes).toEqual(bytes);
     expect(result.format).toBe("png");
     expect(result.mimeType).toBe("image/png");
+  });
+
+  it("does not retry timed out generation requests by default", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response("<html><head><title>504 Gateway Time-out</title></head></html>", {
+            status: 504,
+            headers: { "Content-Type": "text/html" },
+          }),
+        ),
+    );
+    vi.spyOn(globalThis, "setTimeout").mockImplementation((((fn: (...args: never[]) => void) => {
+      fn();
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as unknown) as typeof setTimeout);
+
+    await expect(
+      requestGenerationBatchWithRecovery(
+        makeJob(),
+        {
+          id: "cred_1",
+          space_id: "space_1",
+          base_url: "https://image.example.com/v1",
+          model: "gpt-image-2",
+          prompt_optimizer_model: "gpt-5.5",
+          encrypted_api_key: "encrypted",
+          api_key_hint: "sk-...test",
+          last_test_ok: 1,
+          last_tested_at: "2026-05-15T00:00:00.000Z",
+          prompt_base_url: null,
+          prompt_encrypted_api_key: null,
+          prompt_api_key_hint: null,
+          prompt_last_test_ok: 0,
+          prompt_last_tested_at: null,
+          created_at: "2026-05-15T00:00:00.000Z",
+          updated_at: "2026-05-15T00:00:00.000Z",
+        },
+        "test-key",
+        600_000,
+        {
+          DB: new RecordingDatabase(),
+          IMAGES: new MemoryObjectStore({}),
+        } as never,
+        "idem-1",
+      ),
+    ).rejects.toMatchObject({ code: "provider_timeout" });
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const firstHeaders = vi.mocked(fetch).mock.calls[0]?.[1] ? new Headers((vi.mocked(fetch).mock.calls[0]?.[1] as RequestInit).headers) : null;
+    expect(firstHeaders?.get("Idempotency-Key")).toBe("idem-1");
+  });
+
+  it("retries timed out generation requests when explicitly enabled", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response("<html><head><title>504 Gateway Time-out</title></head></html>", {
+            status: 504,
+            headers: { "Content-Type": "text/html" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              data: [{ url: "https://img.example.com/final.png" }],
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          ),
+        ),
+    );
+    vi.spyOn(globalThis, "setTimeout").mockImplementation((((fn: (...args: never[]) => void) => {
+      fn();
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as unknown) as typeof setTimeout);
+
+    const response = await requestGenerationBatchWithRecovery(
+      makeJob(),
+      {
+        id: "cred_1",
+        space_id: "space_1",
+        base_url: "https://image.example.com/v1",
+        model: "gpt-image-2",
+        prompt_optimizer_model: "gpt-5.5",
+        encrypted_api_key: "encrypted",
+        api_key_hint: "sk-...test",
+        last_test_ok: 1,
+        last_tested_at: "2026-05-15T00:00:00.000Z",
+        prompt_base_url: null,
+        prompt_encrypted_api_key: null,
+        prompt_api_key_hint: null,
+        prompt_last_test_ok: 0,
+        prompt_last_tested_at: null,
+        created_at: "2026-05-15T00:00:00.000Z",
+        updated_at: "2026-05-15T00:00:00.000Z",
+      },
+      "test-key",
+      600_000,
+      {
+        DB: new RecordingDatabase(),
+        IMAGES: new MemoryObjectStore({}),
+        PROVIDER_TIMEOUT_RETRY_ATTEMPTS: "1",
+      } as never,
+      "idem-1",
+    );
+
+    expect(response.data?.[0]?.url).toBe("https://img.example.com/final.png");
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const calls = vi.mocked(fetch).mock.calls;
+    expect(calls[0]?.[0]).toBe("https://image.example.com/v1/images/generations");
+    expect(calls[1]?.[0]).toBe("https://image.example.com/v1/images/generations");
+    const firstHeaders = calls[0]?.[1] ? new Headers((calls[0][1] as RequestInit).headers) : null;
+    const secondHeaders = calls[1]?.[1] ? new Headers((calls[1][1] as RequestInit).headers) : null;
+    expect(firstHeaders?.get("Idempotency-Key")).toBe("idem-1");
+    expect(secondHeaders?.get("Idempotency-Key")).toBe("idem-1");
+  });
+
+  it("keeps retryable provider timeouts out of the failed slot state", () => {
+    expect(shouldPersistFailedResult(new ProviderError("provider_timeout", "timeout", true))).toBe(false);
+    expect(shouldPersistFailedResult(new ProviderError("provider_upstream_error", "bad gateway", true))).toBe(false);
+    expect(shouldPersistFailedResult(new ProviderError("provider_content_rejected", "blocked", false))).toBe(true);
   });
 });
 
@@ -193,6 +331,8 @@ describe("Image API generation helpers", () => {
     );
 
     expect(payload.prompt).toContain("把选区改成玻璃舷窗");
+    expect(payload.prompt).toContain("Treat the user's prompt as the replacement content for that selected area");
+    expect(payload.prompt).toContain("Replace the masked content so the selected area matches the user's prompt exactly");
     expect(payload.prompt).toContain("Only edit the area selected by the alpha mask's transparent pixels.");
     expect(payload.prompt).toContain("Preserve every unmasked area");
   });
@@ -279,6 +419,7 @@ function makeJob(overrides: Partial<GenerationJobRecord> = {}): GenerationJobRec
   return {
     id: "job_1",
     space_id: "space_1",
+    conversation_id: "job_1",
     status: "queued",
     prompt: "product shot",
     aspect_ratio: "1:1",

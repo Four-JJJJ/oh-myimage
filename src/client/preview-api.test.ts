@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { previewGenerationDelayMs, previewGenerationInputFromBody, previewGenerationInputFromRequest } from "./preview-api";
+import { createPreviewRecord, previewGenerationDelayMs, previewGenerationInputFromBody, previewGenerationInputFromRequest, previewModeFromInputs } from "./preview-api";
 
 describe("preview API generation input", () => {
   it("preserves selected ratio and quantity for acceptance previews", () => {
@@ -36,6 +36,44 @@ describe("preview API generation input", () => {
     ]);
   });
 
+  it("treats local edit preview requests as having both source and mask previews", async () => {
+    const form = new FormData();
+    form.set("prompt", "把莲改成荷");
+    form.set("sourceImageId", "img_1");
+    form.set("maskImage", new File(["mask"], "local-edit-mask.png", { type: "image/png" }));
+    const request = new Request("https://dev-gen.fourj.space/api/generations", { method: "POST", body: form });
+
+    await expect(previewGenerationInputFromRequest(request)).resolves.toMatchObject({
+      prompt: "把莲改成荷",
+      sourceImageId: "img_1",
+      referenceImages: [
+        { name: "局部重绘", mimeType: "image/png", byteSize: 0, url: "/demo-preview.png" },
+        { name: "局部重绘遮罩", mimeType: "image/png", byteSize: 4, url: "/demo-preview.png" },
+      ],
+    });
+  });
+
+  it("stores a root conversation id for a brand new preview generation", () => {
+    const record = createPreviewRecord("首次创作", "running");
+
+    expect(record.job.conversation_id).toBe(record.job.id);
+  });
+
+  it("reuses the selected conversation id for continued preview prompts", () => {
+    const root = createPreviewRecord("第一次创作", "succeeded", { conversationId: "job_root" });
+    const continued = createPreviewRecord("继续补充细节", "running", previewGenerationInputFromBody({ prompt: "继续补充细节", conversationId: "job_root" }));
+
+    expect(root.job.conversation_id).toBe("job_root");
+    expect(continued.job.conversation_id).toBe("job_root");
+  });
+
+  it("inherits the original conversation id when regenerating a preview job", () => {
+    const source = createPreviewRecord("第一次创作", "succeeded", { conversationId: "job_root" });
+    const regenerated = createPreviewRecord("重新生成", "running", {}, source.job);
+
+    expect(regenerated.job.conversation_id).toBe("job_root");
+  });
+
   it("keeps uploaded reference images in multipart preview requests", async () => {
     const form = new FormData();
     form.set("prompt", "带参考图");
@@ -60,5 +98,11 @@ describe("preview API generation input", () => {
   it("allows acceptance checks to override preview loading duration", () => {
     expect(previewGenerationDelayMs(1, "?previewDelayMs=25000")).toBe(25000);
     expect(previewGenerationDelayMs(1, "?previewDelayMs=999999")).toBe(120000);
+  });
+
+  it("does not auto-enable preview mode on dev acceptance domains", () => {
+    expect(previewModeFromInputs("", null, "dev-gen.fourj.space")).toBeNull();
+    expect(previewModeFromInputs("", "history", "dev-gen.fourj.space")).toBe("history");
+    expect(previewModeFromInputs("?preview=generating", null, "dev-gen.fourj.space")).toBe("generating");
   });
 });

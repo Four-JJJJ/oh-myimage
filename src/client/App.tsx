@@ -1,13 +1,12 @@
 import {
   AlertCircle,
-  CloudDownload,
   CheckCircle2,
+  CloudDownload,
   Copy,
   Download,
   Edit3,
   FileText,
   Images,
-  Loader2,
   LogOut,
   Redo2,
   RotateCcw,
@@ -32,37 +31,42 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import { BorderBeam } from "border-beam";
 import { Alert, AlertDescription } from "./components/ui/alert";
 import { Button } from "./components/ui/button";
 import { Input, type InputProps } from "./components/ui/input";
-import { Label } from "./components/ui/label";
-import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select";
-import { Separator } from "./components/ui/separator";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
-import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem, ProviderSettings } from "./api";
-import { GenerateMenuView } from "./features/generate-menu/GenerateMenuView";
+import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem, ProviderSettings, SettingsProviders } from "./api";
+import { EntryField, EntryFormSection, EntryNoticeStack, EntryShell, EntryStatusScreen } from "./features/auth/EntryScreens";
+import { GenerateMenuView, HoverImageActionBar, imagePreviewActionKeys, type HoverImageAction } from "./features/generate-menu/GenerateMenuView";
+import { AppShell } from "./features/generate-shell/AppShell";
+import { GenerationFormFooter, ParameterSection, PromptPlaceholderThumbnail, PromptSection } from "./features/shared/generation-form-sections";
+import { GenerationDotMatrixLoader, generationDotMatrixColumns, generationDotMatrixRows } from "./features/shared/generation-loading";
+import { CossBadge, CossButton, CossInput, CossSelect, CossSeparator } from "./features/shared/coss";
+import { isTerminalGenerationJobStatus, mergePolledJobState } from "./generation-state";
 import addIcon from "./assets/figma/add.svg";
 import figmaLogo from "./assets/figma/logo.png";
-import navGalleryActiveIcon from "./assets/figma/nav-gallery-active.svg";
-import navGalleryIcon from "./assets/figma/nav-gallery.svg";
-import navGenerateActiveIcon from "./assets/figma/nav-generate-active.svg";
-import navGenerateIcon from "./assets/figma/nav-generate.svg";
-import navSettingsActiveIcon from "./assets/figma/nav-settings-active.svg";
-import navSettingsIcon from "./assets/figma/nav-settings.svg";
+import generationContinueIcon from "./assets/figma/generation-continue.svg";
+import generationCopyIcon from "./assets/figma/generation-copy.svg";
+import generationDownloadIcon from "./assets/figma/generation-download.svg";
+import generationLocalEditIcon from "./assets/figma/generation-local-edit.svg";
+import generationRegenerateIcon from "./assets/figma/generation-regenerate.svg";
 import openaiIcon from "./assets/figma/openai.svg";
-import optimizeIcon from "./assets/figma/optimize.svg";
 import referenceDeleteIcon from "./assets/figma/reference-delete.svg";
 import { cn } from "./lib/utils";
 
-type View = "generate" | "gallery" | "settings";
+type View = "generate" | "gallery" | "settings" | "inspiration";
 
 interface MeState {
   space: { id: string; name: string };
   providerConfigured: boolean;
-  usesTokenFourjProvider?: boolean;
   dailyLimitExempt?: boolean;
   dailyRemaining?: number;
   dailyLimit?: number;
+}
+
+interface GalleryJumpTarget {
+  conversationId: string;
+  jobId: string;
 }
 
 interface GenerateForm {
@@ -116,6 +120,10 @@ const PROMPT_TEXTAREA_MAX_HEIGHT = 400;
 const MAX_IMAGE_EDGE = 3840;
 const MAX_IMAGE_PIXELS = 8_294_400;
 
+export function galleryImageActionKeys() {
+  return imagePreviewActionKeys();
+}
+
 const resolutionLongEdge: Record<string, number> = {
   "1K": 1536,
   "2K": 2048,
@@ -151,13 +159,6 @@ const IMAGE_PREVIEW_IMAGE_INSET = 61;
 const IMAGE_PREVIEW_EDITOR_WIDTH = 400;
 const IMAGE_PREVIEW_MIN_STAGE_SIZE = 120;
 const IMAGE_SELECTION_BRUSH_RATIO = 0.08;
-const DOT_MATRIX_COLUMNS = 13;
-const DOT_MATRIX_ROWS = 9;
-const DOT_MATRIX_DOTS = Array.from({ length: DOT_MATRIX_COLUMNS * DOT_MATRIX_ROWS }, (_, index) => ({
-  index,
-  column: index % DOT_MATRIX_COLUMNS,
-  row: Math.floor(index / DOT_MATRIX_COLUMNS),
-}));
 
 const defaultForm: GenerateForm = {
   prompt: "",
@@ -193,11 +194,9 @@ export function currentSpaceName(me: MeState | null): string | undefined {
   return name || undefined;
 }
 
-const viewItems: Array<{ value: View; label: string; helper: string; asset: string; activeAsset: string }> = [
-  { value: "generate", label: "生成", helper: "Prompt", asset: navGenerateIcon, activeAsset: navGenerateActiveIcon },
-  { value: "gallery", label: "图库", helper: "Assets", asset: navGalleryIcon, activeAsset: navGalleryActiveIcon },
-  { value: "settings", label: "设置", helper: "Provider", asset: navSettingsIcon, activeAsset: navSettingsActiveIcon },
-];
+export function shouldShowGenerateBooting(view: View, me: MeState | null, generationRecordsReady: boolean): boolean {
+  return view === "generate" && Boolean(me && currentSpaceId(me)) && !generationRecordsReady;
+}
 
 export function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -210,11 +209,15 @@ export function App() {
   const [generationRecords, setGenerationRecords] = useState<GenerationRecord[]>([]);
   const [generationRecordsError, setGenerationRecordsError] = useState("");
   const [generationNextCursor, setGenerationNextCursor] = useState<string | null>(null);
+  const [generationRecordsReady, setGenerationRecordsReady] = useState(false);
+  const [pendingGalleryJumpTarget, setPendingGalleryJumpTarget] = useState<GalleryJumpTarget | null>(null);
   const [booting, setBooting] = useState(true);
 
   const effectiveConfig = config ?? fallbackConfig;
-  const dailyRemainingLabel = me?.dailyRemaining ?? effectiveConfig.maxDailyImagesPerSpace;
-  const hideSmallTokenPromos = Boolean(me?.usesTokenFourjProvider);
+
+  useEffect(() => {
+    registerImageCacheServiceWorker();
+  }, []);
 
   const loadGenerationRecords = useCallback<LoadGenerationRecords>(async (cursor) => {
     setGenerationRecordsError("");
@@ -225,6 +228,8 @@ export function App() {
       setGenerationNextCursor(result.nextCursor);
     } catch (err) {
       setGenerationRecordsError(err instanceof Error ? err.message : "生成记录加载失败。");
+    } finally {
+      if (!cursor) setGenerationRecordsReady(true);
     }
   }, []);
 
@@ -233,16 +238,12 @@ export function App() {
       ok: true;
       space: MeState["space"];
       providerConfigured: boolean;
-      usesTokenFourjProvider?: boolean;
-      dailyLimitExempt?: boolean;
       dailyRemaining?: number;
       dailyLimit?: number;
     }>("/api/me");
     setMe({
       space: result.space,
       providerConfigured: result.providerConfigured,
-      usesTokenFourjProvider: result.usesTokenFourjProvider,
-      dailyLimitExempt: result.dailyLimitExempt,
       dailyRemaining: result.dailyRemaining,
       dailyLimit: result.dailyLimit,
     });
@@ -276,8 +277,6 @@ export function App() {
         ok: true;
         space: MeState["space"];
         providerConfigured: boolean;
-        usesTokenFourjProvider?: boolean;
-        dailyLimitExempt?: boolean;
         dailyRemaining?: number;
         dailyLimit?: number;
       }>("/api/me").catch(() => null),
@@ -289,8 +288,6 @@ export function App() {
           ? {
               space: user.space,
               providerConfigured: user.providerConfigured,
-              usesTokenFourjProvider: user.usesTokenFourjProvider,
-              dailyLimitExempt: user.dailyLimitExempt,
               dailyRemaining: user.dailyRemaining,
               dailyLimit: user.dailyLimit,
             }
@@ -308,34 +305,26 @@ export function App() {
       setGenerationRecords([]);
       setGenerationNextCursor(null);
       setGenerationRecordsError("");
+      setGenerationRecordsReady(false);
       return;
     }
 
     setGenerationRecords([]);
     setGenerationNextCursor(null);
+    setGenerationRecordsReady(false);
     void loadGenerationRecords();
   }, [loadGenerationRecords, currentSpaceId(me)]);
 
   if (booting) {
-    return (
-      <main className="app-shell grid min-h-screen place-items-center">
-        <div className="entry-fade flex items-center gap-3 rounded-lg border bg-card px-4 py-3">
-          <span className="grid size-9 place-items-center rounded-md bg-primary text-primary-foreground">
-            <Loader2 className="animate-spin" />
-          </span>
-          <span className="text-sm font-medium text-foreground">正在打开创作台</span>
-        </div>
-      </main>
-    );
+    return <EntryStatusScreen label="正在打开创作台" detail="正在同步空间信息与创作台配置。" />;
   }
 
   if (!me || !currentSpaceId(me)) {
     return <LoginScreen config={effectiveConfig} onLogin={refreshMe} />;
   }
-
-  const spaceDisplayName = currentSpaceName(me) ?? "Workspace";
-  const studioDisplayName = `${spaceDisplayName} Studio`;
-
+  if (shouldShowGenerateBooting(view, me, generationRecordsReady)) {
+    return <EntryStatusScreen label="正在加载会话消息" detail="会话记录与生成状态正在进入新的 coss 工作区。" />;
+  }
   if (view === "generate") {
     return (
       <GenerateMenuView
@@ -348,6 +337,8 @@ export function App() {
         loadRecords={loadGenerationRecords}
         onProviderNeeded={() => setView("settings")}
         onNavigate={setView}
+        pendingJumpTarget={pendingGalleryJumpTarget}
+        onJumpHandled={() => setPendingGalleryJumpTarget(null)}
         onLogout={async () => {
           await api("/api/auth/logout", { method: "POST" });
           setMe(null);
@@ -358,111 +349,56 @@ export function App() {
   }
 
   return (
-    <TooltipProvider delayDuration={140}>
-      <main className="figma-app h-dvh overflow-hidden text-foreground">
-        <div className="flex h-dvh overflow-hidden">
-          <aside className="figma-left-rail hidden h-dvh w-16 shrink-0 overflow-hidden lg:flex lg:flex-col lg:items-center">
-            <div className="grid h-16 w-full place-items-center">
-              <img src={figmaLogo} alt={studioDisplayName} className="size-10 object-contain" />
-            </div>
-            <nav className="mt-3 flex flex-1 flex-col items-center gap-3">
-              {viewItems.map((item) => {
-                const selected = view === item.value;
-                return (
-                  <Tooltip key={item.value}>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        className={cn("figma-nav-button", selected && "figma-nav-button-active")}
-                        aria-label={item.label}
-                        onClick={() => setView(item.value)}
-                      >
-                        <img src={selected ? item.activeAsset : item.asset} alt="" className="size-4" />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent side="right">{item.label}</TooltipContent>
-                  </Tooltip>
-                );
-              })}
-            </nav>
-            {view !== "settings" && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    className="figma-nav-button mb-4"
-                    aria-label="离开空间"
-                    onClick={async () => {
-                      await api("/api/auth/logout", { method: "POST" });
-                      setMe(null);
-                    }}
-                  >
-                    <LogOut className="size-4" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="right">离开空间</TooltipContent>
-              </Tooltip>
-            )}
-          </aside>
-
-          <section className="flex h-dvh min-w-0 flex-1 flex-col overflow-hidden">
-            <header className="figma-top-bar flex h-16 shrink-0 items-center justify-between overflow-hidden border-b px-4">
-              <div className="flex min-w-0 items-baseline gap-1.5">
-                <img src={figmaLogo} alt={studioDisplayName} className="mr-3 size-9 shrink-0 object-contain lg:hidden" />
-                <span className="truncate text-base font-semibold leading-6 text-white">{spaceDisplayName}</span>
-                <span className="shrink-0 text-base leading-6 text-white/60">Studio</span>
-              </div>
-              <div className="flex shrink-0 items-center gap-3 text-xs">
-                {!hideSmallTokenPromos && (
-                  <div className="hidden items-center gap-2 rounded-md border border-white/10 px-2 py-1 text-white/60 md:flex">
-                    <span>使用 Small Token 解除张数限制</span>
-                    <button type="button" className="font-medium text-[#6eff30]">
-                      去购买
-                    </button>
-                  </div>
-                )}
-                <div
-                  className={cn(
-                    "flex items-center gap-2 rounded-md px-2 py-1",
-                    me.dailyLimitExempt ? "border border-white/10 text-white/60" : "bg-[#373737]",
-                  )}
-                >
-                  {me.dailyLimitExempt ? (
-                    <>
-                      <CheckCircle2 className="size-3" aria-hidden="true" />
-                      <span className="text-white/60">已解锁数量限制</span>
-                    </>
-                  ) : (
-                    <>
-                      <span className="text-white/60">剩余张数</span>
-                      <span className="font-semibold text-[#6eff30]">{dailyRemainingLabel}</span>
-                    </>
-                  )}
-                </div>
-              </div>
-            </header>
-
-            {view === "gallery" && (
-              <GalleryView
-                config={effectiveConfig}
-                providerConfigured={me.providerConfigured}
-                records={generationRecords}
-                setRecords={setGenerationRecords}
-                recordsError={generationRecordsError}
-                nextCursor={generationNextCursor}
-                loadRecords={loadGenerationRecords}
-                onProviderNeeded={() => setView("settings")}
-                onEditImage={editImageFromGallery}
-                onEditPrompt={editPromptFromGallery}
-                onUsageChanged={refreshMe}
-              />
-            )}
-            {view === "settings" && <SettingsView config={effectiveConfig} onSaved={refreshMe} />}
-          </section>
-        </div>
-      </main>
-    </TooltipProvider>
+    <AppShell
+      activeView={view}
+      sidebar={shouldShowWorkspaceSidebar(view) ? <div /> : undefined}
+      onNavigate={setView}
+      onLogout={async () => {
+        await api("/api/auth/logout", { method: "POST" });
+        setMe(null);
+      }}
+    >
+      <section className="flex h-full min-w-0 flex-col overflow-hidden">
+        {view === "gallery" && (
+          <GalleryView
+            config={effectiveConfig}
+            providerConfigured={me.providerConfigured}
+            records={generationRecords}
+            setRecords={setGenerationRecords}
+            recordsError={generationRecordsError}
+            nextCursor={generationNextCursor}
+            loadRecords={loadGenerationRecords}
+            onProviderNeeded={() => setView("settings")}
+            onEditImage={editImageFromGallery}
+            onEditPrompt={editPromptFromGallery}
+            onJumpToConversation={(target) => {
+              setPendingGalleryJumpTarget(target);
+              setView("generate");
+            }}
+            onUsageChanged={refreshMe}
+          />
+        )}
+        {view === "settings" && <SettingsView config={effectiveConfig} onSaved={refreshMe} />}
+        {view === "inspiration" && <InspirationPlaceholderView />}
+      </section>
+    </AppShell>
   );
+}
+
+function registerImageCacheServiceWorker(): void {
+  if (typeof window === "undefined" || !("serviceWorker" in navigator)) return;
+  if (window.location.protocol !== "https:" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") return;
+  navigator.serviceWorker.register("/image-cache-sw.js").catch(() => {
+    // 图片缓存只是性能优化，注册失败不影响生图主流程。
+  });
+}
+
+export function usesAppShellFrame(view: View) {
+  return view === "generate" || view === "gallery" || view === "settings" || view === "inspiration";
+}
+
+export function shouldShowWorkspaceSidebar(view: View) {
+  return view === "generate";
 }
 
 function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Promise<void> }) {
@@ -490,68 +426,53 @@ function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Pr
   }
 
   return (
-    <main className="figma-login-home relative min-h-dvh overflow-hidden bg-[#191919] text-white">
-      <header className="h-16 overflow-hidden border-b border-white/10 px-4">
-        <div className="flex h-full items-center gap-1 leading-6">
-          <span className="text-base font-semibold text-white/90">oh-myimage</span>
-          <span className="text-base font-normal text-white/60">Studio</span>
-        </div>
-      </header>
+    <EntryShell eyebrow="Workspace Access" title="进入你的创作空间" description="使用空间名称和密码进入创作台。新空间会自动创建，旧的登录布局与按钮体系已统一替换为新的 coss surface。">
+      <EntryFormSection title="空间登录">
+        <form className="grid gap-5" onSubmit={submit}>
+          <EntryField label="空间名字" htmlFor="space-name">
+            <Input
+              id="space-name"
+              type="text"
+              value={spaceName}
+              onChange={(event) => setSpaceName(event.target.value)}
+              minLength={2}
+              autoComplete="username"
+              placeholder="请输入空间名称"
+              className="rounded-[10px] bg-[#1c1c1c]"
+              required
+            />
+          </EntryField>
 
-      <section className="absolute left-1/2 top-[104px] w-[calc(100vw-32px)] max-w-[368px] -translate-x-1/2">
-        <img src={figmaLogo} alt="" className="size-10 object-cover" />
-        <div className="mt-0.5 flex items-center gap-2 leading-6">
-          <span className="text-base font-normal text-white/60">欢迎使用</span>
-          <span className="text-base font-semibold text-white/90">oh-myimage</span>
-        </div>
-
-        <form className="mt-10" onSubmit={submit}>
-          <Label htmlFor="space-name" className="block text-xs font-normal leading-none text-white/90">
-            空间名字
-          </Label>
-          <Input
-            id="space-name"
-            value={spaceName}
-            onChange={(event) => setSpaceName(event.target.value)}
-            minLength={2}
-            autoComplete="username"
-            placeholder="请输入空间名称"
-            required
-            className="mt-2 h-[34px] rounded-[10px] border-white/15 bg-transparent px-2 py-0 text-xs leading-none text-white/90 placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0 focus-visible:ring-offset-0"
-          />
-
-          <Label htmlFor="space-password" className="mt-3.5 block text-xs font-normal leading-none text-white/90">
-            空间密码
-          </Label>
-          <Input
-            id="space-password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            type="password"
-            minLength={8}
-            autoComplete="current-password"
-            placeholder="请输入空间密码"
-            required
-            className="mt-2 h-[34px] rounded-[10px] border-white/15 bg-transparent px-2 py-0 text-xs leading-none text-white/90 placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0 focus-visible:ring-offset-0"
-          />
+          <EntryField label="空间密码" htmlFor="space-password" hint="忘记空间名或密码目前无法找回，请妥善保存。">
+            <Input
+              id="space-password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              type="password"
+              autoComplete="current-password"
+              placeholder="请输入空间密码"
+              className="rounded-[10px] bg-[#1c1c1c]"
+              required
+            />
+          </EntryField>
 
           <Button
-            className="mt-[22px] h-[34px] w-full rounded-[10px] border border-[#6eff30] bg-transparent px-2 py-0 text-xs font-semibold leading-none text-[#6eff30] hover:bg-transparent hover:text-[#6eff30] focus-visible:ring-[#6eff30]/40"
-            disabled={loading}
+            type="submit"
+            size="lg"
+            loading={loading}
+            className="mt-1 w-full justify-center rounded-[10px] border-white/10 bg-white/90 text-[#181818] shadow-none hover:bg-white/80"
           >
             {loading ? "进入中" : "进入空间"}
           </Button>
 
-          <p className="mt-1.5 text-xs font-normal leading-[18px] text-white/40">新空间会自动创建；忘记空间名或密码无法找回</p>
-
-          <div className="mt-3 flex flex-col gap-3">
+          <EntryNoticeStack className="pt-1">
             {config.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={setTurnstileToken} />}
             {config.turnstileRequired && !config.turnstileSiteKey && <Notice tone="warn" text="Turnstile 已启用，请配置站点 Key。" />}
             {error && <Notice tone="error" text={error} />}
-          </div>
+          </EntryNoticeStack>
         </form>
-      </section>
-    </main>
+      </EntryFormSection>
+    </EntryShell>
   );
 }
 
@@ -984,136 +905,96 @@ function GenerateView({
             {providerConfigured ? (
               <span className="shrink-0 text-xs leading-[18px] text-white/60">已配置</span>
             ) : (
-              <button type="button" className="flex shrink-0 items-center gap-2 text-xs leading-[18px]" onClick={onProviderNeeded}>
+              <CossButton type="button" variant="ghost" className="h-auto shrink-0 gap-2 rounded-none px-0 py-0 text-xs leading-[18px]" onClick={onProviderNeeded}>
                 <span className="text-white/60">暂无 Provider 配置</span>
-                <span className="text-[#6eff30]">去设置</span>
-              </button>
+                <span className="text-white/90">去设置</span>
+              </CossButton>
             )}
           </div>
 
           <section className="mt-4">
-            <div className="mb-2 flex h-[18px] items-center justify-between">
-              <Label className="text-xs font-semibold leading-[18px] text-white">提示词</Label>
-              <button
-                type="button"
-                className="flex h-[18px] items-center gap-1.5 text-xs leading-[18px] text-[#6eff30] disabled:cursor-not-allowed disabled:opacity-55"
-                disabled={optimizingPrompt || loading}
-                onClick={() => void optimizeCurrentPrompt()}
-              >
-                {optimizingPrompt ? <Loader2 className="size-3 animate-spin" /> : <img src={optimizeIcon} alt="" className="size-3" />}
-                {optimizingPrompt ? "优化中" : "提示词优化"}
-              </button>
-            </div>
-            <div className="figma-prompt-box flex min-h-[228px] flex-col gap-3 overflow-hidden rounded-[10px] border border-white/15 p-3">
-              <textarea
-                ref={promptTextareaRef}
-                value={form.prompt}
-                onChange={(event) => update("prompt", event.target.value)}
-                onPaste={handlePromptPaste}
-                placeholder="可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等"
-                required
-                className="figma-prompt-textarea block min-h-[100px] max-h-[400px] w-full resize-none overflow-hidden rounded-none border-0 bg-transparent p-0 text-xs leading-[18px] text-white/80 outline-none placeholder:text-white/40"
-              />
+            <PromptSection
+              textareaRef={promptTextareaRef}
+              value={form.prompt}
+              onChange={(value) => update("prompt", value)}
+              onPaste={handlePromptPaste}
+              placeholder="可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等"
+              required
+              optimizing={optimizingPrompt}
+              disabled={loading}
+              onOptimize={() => void optimizeCurrentPrompt()}
+              trailingContent={
+                <>
               <input ref={referenceInputRef} type="file" accept="image/png,image/jpeg,image/webp" multiple className="hidden" onChange={handleReferenceInputChange} />
               <div className="flex flex-col gap-2">
                 <div className="flex h-16 gap-2 overflow-hidden">
                   {referenceImages.length < MAX_REFERENCE_IMAGES && (
-                    <button
+                    <CossButton
                       type="button"
-                      className="grid h-16 w-12 shrink-0 place-items-center overflow-hidden rounded-[6px] border border-white/10 bg-white/10"
+                      variant="secondary"
+                      className="grid h-16 w-12 shrink-0 place-items-center overflow-hidden rounded-[6px] border border-white/10 bg-white/10 p-0 hover:bg-white/10"
                       aria-label="添加参考图"
                       title="添加参考图"
                       onClick={() => referenceInputRef.current?.click()}
                     >
                       <img src={addIcon} alt="" className="size-4" />
-                    </button>
+                    </CossButton>
                   )}
                   <div className="thin-scrollbar flex min-w-0 flex-1 gap-2 overflow-x-auto">
                     {referenceImages.map((referenceImage, index) => (
                       <div key={`${referenceImage.url}-${index}`} className="relative h-16 w-12 shrink-0 overflow-hidden rounded-[6px] border border-white/10 bg-white/10">
                         <img src={referenceImage.url} alt={referenceImage.name} className="size-full object-cover" />
-                        <button
+                        <CossButton
                           type="button"
-                          className="absolute right-1 top-1 z-10 grid size-4 place-items-center overflow-hidden rounded bg-black/80"
+                          variant="secondary"
+                          size="icon-xs"
+                          className="absolute right-1 top-1 z-10 grid size-4 place-items-center overflow-hidden rounded bg-black/80 p-0 hover:bg-black/80"
                           aria-label="删除参考图"
                           title="删除参考图"
                           onClick={() => clearReferenceImage(index)}
                         >
                           <img src={referenceDeleteIcon} alt="" className="size-3" />
-                        </button>
-                        {index === 0 && referenceMask && <span className="absolute bottom-1 right-1 size-2 rounded-full bg-[#6eff30]" aria-label="已应用选区遮罩" />}
+                        </CossButton>
+                        {index === 0 && referenceMask && <span className="absolute bottom-1 right-1 size-2 rounded-full bg-white/80" aria-label="已应用选区遮罩" />}
                       </div>
                     ))}
                   </div>
                 </div>
                 <FastUploadToggle enabled={fastReferenceUpload} onChange={setFastReferenceUpload} />
               </div>
-            </div>
+                </>
+              }
+            />
           </section>
 
-          <section className="mt-4 pb-4">
-            <Label className="mb-2 block text-xs font-semibold leading-[18px] text-white">参数</Label>
-            <div className="figma-param-panel flex flex-col gap-4 rounded-[10px] border border-white/15 p-3">
-              <OptionGroup label="比例">
-                {availableRatios.map((ratio) => (
-                  <SegmentButton key={ratio} active={form.aspectRatio === ratio} onClick={() => update("aspectRatio", ratio)}>
-                    {ratio}
-                  </SegmentButton>
-                ))}
-              </OptionGroup>
-
-              <OptionGroup label="质量">
-                {qualityOptions.map((quality) => (
-                  <SegmentButton key={quality} active={form.quality === quality} grow onClick={() => update("quality", quality)}>
-                    {qualityLabels[quality] ?? quality}
-                  </SegmentButton>
-                ))}
-              </OptionGroup>
-
-              <OptionGroup label="分辨率">
-                {RESOLUTIONS.map((resolution) => (
-                  <SegmentButton key={resolution} active={form.resolution === resolution} grow onClick={() => update("resolution", resolution)}>
-                    {resolution}
-                  </SegmentButton>
-                ))}
-              </OptionGroup>
-
-              <OptionGroup label="数量">
-                {Array.from({ length: Math.min(config.maxImagesPerRequest, 4) }, (_, index) => String(index + 1)).map((quantity) => (
-                  <SegmentButton key={quantity} active={form.quantity === Number(quantity)} grow onClick={() => update("quantity", Number(quantity))}>
-                    {quantity}
-                  </SegmentButton>
-                ))}
-              </OptionGroup>
-
-              <OptionGroup label="格式">
-                {formatOptions.map((format) => (
-                  <SegmentButton key={format} active={form.outputFormat === format} grow onClick={() => update("outputFormat", format)}>
-                    {formatLabels[format] ?? format.toUpperCase()}
-                  </SegmentButton>
-                ))}
-              </OptionGroup>
-            </div>
-
+          <div className="mt-4 pb-4">
+            <ParameterSection
+              aspectRatios={availableRatios}
+              selectedAspectRatio={form.aspectRatio}
+              onAspectRatioChange={(value) => update("aspectRatio", value)}
+              qualityOptions={qualityOptions}
+              selectedQuality={form.quality}
+              qualityLabels={qualityLabels}
+              onQualityChange={(value) => update("quality", value)}
+              resolutions={RESOLUTIONS}
+              selectedResolution={form.resolution}
+              onResolutionChange={(value) => update("resolution", value)}
+              quantities={Array.from({ length: Math.min(config.maxImagesPerRequest, 4) }, (_, index) => String(index + 1))}
+              selectedQuantity={form.quantity}
+              onQuantityChange={(value) => update("quantity", value)}
+              formatOptions={formatOptions}
+              selectedFormat={form.outputFormat}
+              formatLabels={formatLabels}
+              onFormatChange={(value) => update("outputFormat", value)}
+            />
             <div className="mt-4 flex flex-col gap-3">
               {error && <Notice tone="error" text={error} />}
               {config.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={setTurnstileToken} />}
             </div>
-          </section>
-        </div>
-
-        <div className="shrink-0 px-4 pb-4 pt-3">
-          <div className="flex items-center justify-between gap-4">
-            <p className="truncate text-xs leading-[18px] text-white/40">禁止利用功能从事违法活动</p>
-            <button
-              type="submit"
-              className="figma-generate-button flex h-[34px] w-[120px] shrink-0 items-center justify-center rounded-[10px] border border-[#6eff30] text-xs font-semibold leading-none text-[#6eff30] disabled:cursor-not-allowed disabled:opacity-55"
-              disabled={loading}
-            >
-              {loading ? "生成中" : "生成任务"}
-            </button>
           </div>
         </div>
+
+        <GenerationFormFooter loading={loading} idleLabel="生成任务" />
       </form>
 
       <section className="figma-records thin-scrollbar h-full min-w-0 flex-1 overflow-y-auto px-5 py-4">
@@ -1149,48 +1030,13 @@ function GenerateView({
             />
           ))}
           {nextCursor && (
-            <button type="button" className="mx-auto mb-2 h-8 rounded-md border border-white/15 px-4 text-xs text-white/60" onClick={() => void loadRecords(nextCursor)}>
+            <CossButton type="button" variant="outline" className="mx-auto mb-2 h-8 rounded-md border border-white/15 bg-transparent px-4 text-xs text-white/60 hover:bg-white/10 hover:text-white/80" onClick={() => void loadRecords(nextCursor)}>
               加载更多
-            </button>
+            </CossButton>
           )}
         </div>
       </section>
     </div>
-  );
-}
-
-function OptionGroup({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div className="flex flex-col gap-2">
-      <p className="text-xs leading-[18px] text-white/60">{label}</p>
-      <div className="flex w-full items-center gap-1">{children}</div>
-    </div>
-  );
-}
-
-function SegmentButton({
-  active,
-  grow = false,
-  children,
-  onClick,
-}: {
-  active: boolean;
-  grow?: boolean;
-  children: ReactNode;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      className={cn(
-        "figma-segment h-[28px] rounded-md border px-2 text-center text-xs font-semibold leading-[18px] text-white/90",
-        grow ? "min-w-0 flex-1" : "w-[44px] shrink-0",
-        active ? "border-white/90 bg-white/10" : "border-white/10 bg-transparent",
-      )}
-      onClick={onClick}
-    >
-      {children}
-    </button>
   );
 }
 
@@ -1276,27 +1122,29 @@ function GenerationRecordCard({
           ))}
         </div>
         <div className="flex shrink-0 items-center gap-4 text-white/90">
-          <button type="button" className="figma-icon-action" aria-label="删除记录" onClick={onDelete}>
+          <CossButton type="button" variant="ghost" size="icon-sm" className="figma-icon-action" aria-label="删除记录" onClick={onDelete}>
             <Trash2 className="size-[14px]" />
-          </button>
-          <button type="button" className="figma-icon-action" aria-label="重新生成" onClick={onRegenerate}>
+          </CossButton>
+          <CossButton type="button" variant="ghost" size="icon-sm" className="figma-icon-action" aria-label="重新生成" onClick={onRegenerate}>
             <RotateCcw className="size-[14px]" />
-          </button>
-          <button type="button" className="figma-icon-action" aria-label="编辑提示词" onClick={onEditPrompt}>
+          </CossButton>
+          <CossButton type="button" variant="ghost" size="icon-sm" className="figma-icon-action" aria-label="编辑提示词" onClick={onEditPrompt}>
             <Edit3 className="size-[14px]" />
-          </button>
-          <button type="button" className="figma-icon-action" aria-label="复制提示词" onClick={() => void copyPrompt(record.job.prompt)}>
+          </CossButton>
+          <CossButton type="button" variant="ghost" size="icon-sm" className="figma-icon-action" aria-label="复制提示词" onClick={() => void copyPrompt(record.job.prompt)}>
             <Copy className="size-[14px]" />
-          </button>
-          <button
+          </CossButton>
+          <CossButton
             type="button"
+            variant="ghost"
+            size="icon-sm"
             className="figma-icon-action disabled:cursor-not-allowed disabled:opacity-40"
             aria-label="下载全部图片"
             disabled={record.images.length === 0}
             onClick={() => downloadAllImages(record)}
           >
             <CloudDownload className="size-[14px]" />
-          </button>
+          </CossButton>
         </div>
       </div>
       {previewImage && (
@@ -1359,17 +1207,26 @@ function GenerationPlaceholderThumbnail({
 }) {
   const size = thumbnailSize(job.width, job.height);
   const idleClassName = cn(
-    "grid shrink-0 place-items-center overflow-hidden rounded-md border border-white/10 bg-white/10 text-white/40",
-    failed && "border-destructive/30 bg-destructive/10 text-destructive/80",
+    "grid size-full place-items-center overflow-hidden rounded-md border border-transparent bg-white/10 text-white/40",
+    failed && "bg-destructive/10 text-destructive/80",
   );
   const idleThumbnail = (
-    <div
-      className={idleClassName}
+    <BorderBeam
+      className="generation-preview-beam"
+      size="md"
+      colorVariant="colorful"
+      strength={0.8}
+      theme="dark"
+      borderRadius={6}
       style={{ width: size.width, height: size.height }}
-      aria-label={loading ? "图片生成中" : "暂无生成图片"}
     >
-      <FileText className="size-5" />
-    </div>
+      <div
+        className={idleClassName}
+        aria-label={loading ? "图片生成中" : "暂无生成图片"}
+      >
+        <FileText className="size-5" />
+      </div>
+    </BorderBeam>
   );
 
   if (!loading) {
@@ -1382,48 +1239,38 @@ function GenerationPlaceholderThumbnail({
     Math.max(
       2.6,
       Math.min(
-        (size.width - DOT_MATRIX_COLUMNS * dotSize) / Math.max(1, DOT_MATRIX_COLUMNS - 1),
-        (size.height - DOT_MATRIX_ROWS * dotSize) / Math.max(1, DOT_MATRIX_ROWS - 1),
+        (size.width - generationDotMatrixColumns * dotSize) / Math.max(1, generationDotMatrixColumns - 1),
+        (size.height - generationDotMatrixRows * dotSize) / Math.max(1, generationDotMatrixRows - 1),
       ),
     ),
   );
 
   return (
-    <div
-      className={cn(
-        "grid shrink-0 place-items-center overflow-hidden rounded-md border border-white/10 bg-white/10 text-white/40",
-        loading && "generation-loading-thumbnail",
-      )}
-      style={
-        {
-          width: size.width,
-          height: size.height,
-          "--dot-size": `${dotSize}px`,
-          "--dot-gap": `${dotGap}px`,
-        } as CSSProperties
-      }
-      aria-label="图片生成中"
+    <BorderBeam
+      className="generation-preview-beam"
+      size="md"
+      colorVariant="colorful"
+      strength={0.8}
+      theme="dark"
+      borderRadius={6}
+      style={{ width: size.width, height: size.height }}
     >
-      <GenerationDotMatrixLoader delayIndex={loadingIndex} />
-    </div>
-  );
-}
-
-function GenerationDotMatrixLoader({ delayIndex }: { delayIndex: number }) {
-  return (
-    <div className="generation-dot-matrix-loader" aria-hidden="true">
-      {DOT_MATRIX_DOTS.map((dot) => (
-        <span
-          key={dot.index}
-          className="generation-dot-matrix-dot"
-          style={
-            {
-              "--dot-delay": `${delayIndex * 120 + dot.column * 34 - dot.row * 16}ms`,
-            } as CSSProperties
-          }
-        />
-      ))}
-    </div>
+      <div
+        className={cn(
+          "grid size-full place-items-center overflow-hidden rounded-md border border-transparent bg-white/10 text-white/40",
+          loading && "generation-loading-thumbnail",
+        )}
+        style={
+          {
+            "--dot-size": `${dotSize}px`,
+            "--dot-gap": `${dotGap}px`,
+          } as CSSProperties
+        }
+        aria-label="图片生成中"
+      >
+        <GenerationDotMatrixLoader delayIndex={loadingIndex} />
+      </div>
+    </BorderBeam>
   );
 }
 
@@ -1476,7 +1323,7 @@ function GenerationTaskTimeline({ job }: { job: GenerationJob }) {
       {items.map((item, index) => (
         <Fragment key={item.id}>
           <span className="flex items-center gap-1.5">
-            <span className={cn("size-1.5 rounded-full", item.active ? "bg-[#6eff30]/80" : "bg-white/25")} />
+            <span className={cn("size-1.5 rounded-full", item.active ? "bg-white/80" : "bg-white/25")} />
             <span>{item.label}</span>
           </span>
           {index < items.length - 1 && <span className="text-white/20">/</span>}
@@ -1509,15 +1356,16 @@ function FastUploadToggle({ enabled, onChange }: { enabled: boolean; onChange: D
 function GenerationThumbnail({ image, onOpen }: { image: ImageItem; onOpen: () => void }) {
   const size = thumbnailSize(image.width, image.height);
   return (
-    <button
+    <CossButton
       type="button"
-      className="block shrink-0 overflow-hidden rounded-md border border-white/10 bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/70"
+      variant="ghost"
+      className="block shrink-0 overflow-hidden rounded-md border border-white/10 bg-white/10 p-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/70 hover:bg-white/10"
       style={{ width: size.width, height: size.height }}
       aria-label="查看大图"
       onClick={onOpen}
     >
       <img key={image.id} src={image.url} alt={image.prompt ?? "生成图片"} loading="lazy" className="size-full object-cover" />
-    </button>
+    </CossButton>
   );
 }
 
@@ -1812,34 +1660,34 @@ function ImagePreviewDialog({
         )}
         {selectionEditing ? (
           <div className="image-preview-selection-toolbar">
-            <button type="button" className="image-preview-action" onClick={cancelSelectionEdit}>
+            <CossButton type="button" variant="ghost" className="image-preview-action" onClick={cancelSelectionEdit}>
               <X />
               <span>取消选区编辑</span>
-            </button>
+            </CossButton>
             <div className="flex items-center gap-5">
-              <button type="button" className="image-preview-action" disabled={selectionStrokes.length === 0} onClick={undoSelectionStroke}>
+              <CossButton type="button" variant="ghost" className="image-preview-action" disabled={selectionStrokes.length === 0} onClick={undoSelectionStroke}>
                 <Undo2 />
                 <span>上一步</span>
-              </button>
-              <button type="button" className="image-preview-action" disabled={redoSelectionStrokes.length === 0} onClick={redoSelectionStroke}>
+              </CossButton>
+              <CossButton type="button" variant="ghost" className="image-preview-action" disabled={redoSelectionStrokes.length === 0} onClick={redoSelectionStroke}>
                 <span>下一步</span>
                 <Redo2 />
-              </button>
+              </CossButton>
             </div>
             <span aria-hidden="true" />
           </div>
         ) : (
           <div className="image-preview-actions">
             {editing ? (
-              <button type="button" className="image-preview-action" onClick={beginSelectionEdit}>
+              <CossButton type="button" variant="ghost" className="image-preview-action" onClick={beginSelectionEdit}>
                 <Edit3 />
                 <span>选区编辑</span>
-              </button>
+              </CossButton>
             ) : (
-              <button type="button" className="image-preview-action" onClick={() => setEditing(true)}>
+              <CossButton type="button" variant="ghost" className="image-preview-action" onClick={() => setEditing(true)}>
                 <Edit3 />
                 <span>编辑图片</span>
-              </button>
+              </CossButton>
             )}
             <a className="image-preview-action" href={imageDownloadUrl(image)} download={imageDownloadName(image)}>
               <Download />
@@ -1847,9 +1695,9 @@ function ImagePreviewDialog({
             </a>
           </div>
         )}
-        <button type="button" className="image-preview-close" aria-label="关闭预览" onClick={onClose}>
+        <CossButton type="button" variant="ghost" size="icon" className="image-preview-close" aria-label="关闭预览" onClick={onClose}>
           <X />
-        </button>
+        </CossButton>
         <div ref={stageRef} className={cn("image-preview-stage", selectionEditing && "image-preview-stage-selection")}>
           <img src={image.url} alt={image.prompt ?? "生成图片"} />
           {selectionEditing && (
@@ -1910,97 +1758,47 @@ function ImagePreviewEditPanel({
   return (
     <form className="image-preview-editor" onSubmit={onSubmit}>
       <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-4 pt-4">
-        <section>
-          <div className="mb-2 flex h-[18px] items-center justify-between">
-            <Label className="text-xs font-semibold leading-[18px] text-white">提示词</Label>
-            <button
-              type="button"
-              className="flex h-[18px] items-center gap-1.5 text-xs leading-[18px] text-[#6eff30] disabled:cursor-not-allowed disabled:opacity-55"
-              disabled={optimizing || submitting}
-              onClick={onOptimize}
-            >
-              {optimizing ? <Loader2 className="size-3 animate-spin" /> : <img src={optimizeIcon} alt="" className="size-3" />}
-              {optimizing ? "优化中" : "提示词优化"}
-            </button>
-          </div>
-          <div className="figma-prompt-box flex min-h-[200px] flex-col gap-3 overflow-hidden rounded-[10px] border border-white/15 p-3">
-            <textarea
-              ref={promptTextareaRef}
-              value={draft.prompt}
-              onChange={(event) => onDraftChange("prompt", event.target.value)}
-              placeholder="可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等"
-              required
-              className="figma-prompt-textarea block min-h-[100px] max-h-[400px] w-full resize-none overflow-hidden rounded-none border-0 bg-transparent p-0 text-xs leading-[18px] text-white/80 outline-none placeholder:text-white/40"
-            />
-            <div className="grid h-16 w-12 place-items-center overflow-hidden rounded-[6px] bg-white/10">
-              <img src={addIcon} alt="" className="size-4" />
-            </div>
-          </div>
-        </section>
+        <PromptSection
+          textareaRef={promptTextareaRef}
+          value={draft.prompt}
+          onChange={(value) => onDraftChange("prompt", value)}
+          placeholder="可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等"
+          required
+          optimizing={optimizing}
+          disabled={submitting}
+          onOptimize={onOptimize}
+          trailingContent={<PromptPlaceholderThumbnail />}
+        />
 
-        <section className="mt-4 pb-4">
-          <Label className="mb-2 block text-xs font-semibold leading-[18px] text-white">参数</Label>
-          <div className="figma-param-panel flex flex-col gap-4 rounded-[10px] border border-white/15 p-3">
-            <OptionGroup label="比例">
-              {availableRatios.map((ratio) => (
-                <SegmentButton key={ratio} active={draft.aspectRatio === ratio} onClick={() => onDraftChange("aspectRatio", ratio)}>
-                  {ratio}
-                </SegmentButton>
-              ))}
-            </OptionGroup>
-
-            <OptionGroup label="质量">
-              {qualityOptions.map((quality) => (
-                <SegmentButton key={quality} active={draft.quality === quality} grow onClick={() => onDraftChange("quality", quality)}>
-                  {qualityLabels[quality] ?? quality}
-                </SegmentButton>
-              ))}
-            </OptionGroup>
-
-            <OptionGroup label="分辨率">
-              {RESOLUTIONS.map((resolution) => (
-                <SegmentButton key={resolution} active={draft.resolution === resolution} grow onClick={() => onDraftChange("resolution", resolution)}>
-                  {resolution}
-                </SegmentButton>
-              ))}
-            </OptionGroup>
-
-            <OptionGroup label="数量">
-              {Array.from({ length: Math.min(maxImagesPerRequest, 4) }, (_, index) => String(index + 1)).map((quantity) => (
-                <SegmentButton key={quantity} active={draft.quantity === Number(quantity)} grow onClick={() => onDraftChange("quantity", Number(quantity))}>
-                  {quantity}
-                </SegmentButton>
-              ))}
-            </OptionGroup>
-
-            <OptionGroup label="格式">
-              {formatOptions.map((format) => (
-                <SegmentButton key={format} active={draft.outputFormat === format} grow onClick={() => onDraftChange("outputFormat", format)}>
-                  {formatLabels[format] ?? format.toUpperCase()}
-                </SegmentButton>
-              ))}
-            </OptionGroup>
-          </div>
+        <div className="mt-4 pb-4">
+          <ParameterSection
+            aspectRatios={availableRatios}
+            selectedAspectRatio={draft.aspectRatio}
+            onAspectRatioChange={(value) => onDraftChange("aspectRatio", value)}
+            qualityOptions={qualityOptions}
+            selectedQuality={draft.quality}
+            qualityLabels={qualityLabels}
+            onQualityChange={(value) => onDraftChange("quality", value)}
+            resolutions={RESOLUTIONS}
+            selectedResolution={draft.resolution}
+            onResolutionChange={(value) => onDraftChange("resolution", value)}
+            quantities={Array.from({ length: Math.min(maxImagesPerRequest, 4) }, (_, index) => String(index + 1))}
+            selectedQuantity={draft.quantity}
+            onQuantityChange={(value) => onDraftChange("quantity", value)}
+            formatOptions={formatOptions}
+            selectedFormat={draft.outputFormat}
+            formatLabels={formatLabels}
+            onFormatChange={(value) => onDraftChange("outputFormat", value)}
+          />
           <div className="mt-4 flex flex-col gap-3">
             {turnstileSiteKey && <Turnstile siteKey={turnstileSiteKey} onToken={onTurnstileToken} />}
             {turnstileRequired && !turnstileSiteKey && <Notice tone="warn" text="Turnstile 已启用，请配置站点 Key。" />}
           </div>
-          {error && <p className="mt-3 text-xs leading-[18px] text-destructive">{error}</p>}
-        </section>
-      </div>
-
-      <div className="shrink-0 px-4 pb-4 pt-3">
-        <div className="flex items-center justify-between gap-4">
-          <p className="truncate text-xs leading-[18px] text-white/40">禁止利用功能从事违法活动</p>
-          <button
-            type="submit"
-            className="figma-generate-button flex h-[34px] w-[120px] shrink-0 items-center justify-center rounded-[10px] border border-[#6eff30] text-xs font-semibold leading-none text-[#6eff30] disabled:cursor-not-allowed disabled:opacity-55"
-            disabled={submitting}
-          >
-            {submitting ? "生成中" : "生成任务"}
-          </button>
+          {error && <div className="mt-3"><Notice tone="error" text={error} /></div>}
         </div>
       </div>
+
+      <GenerationFormFooter loading={submitting} idleLabel="生成任务" />
     </form>
   );
 }
@@ -2016,6 +1814,7 @@ function GalleryView({
   onProviderNeeded,
   onEditImage,
   onEditPrompt,
+  onJumpToConversation,
   onUsageChanged,
 }: {
   config: AppConfig;
@@ -2028,12 +1827,14 @@ function GalleryView({
   onProviderNeeded: () => void;
   onEditImage: (image: ImageItem, draft?: GenerateForm, mask?: ImageSelectionMask) => void;
   onEditPrompt: (draft: GenerateForm) => void;
+  onJumpToConversation: (target: GalleryJumpTarget) => void;
   onUsageChanged: () => Promise<void>;
 }) {
   const [activeJob, setActiveJob] = useState<GenerationJob | null>(null);
   const [activeImages, setActiveImages] = useState<ImageItem[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
+  const [previewItem, setPreviewItem] = useState<{ image: ImageItem; job: GenerationJob } | null>(null);
   const [error, setError] = useState("");
 
   const availableRatios = useMemo(
@@ -2051,6 +1852,7 @@ function GalleryView({
   const refreshUsage = useCallback(() => {
     void onUsageChanged().catch(() => undefined);
   }, [onUsageChanged]);
+  const galleryGroups = useMemo(() => buildGalleryGroups(records, activeJob, activeImages, elapsedSeconds), [records, activeImages, activeJob, elapsedSeconds]);
 
   const upsertRecord = useCallback((nextJob: GenerationJob, nextImages: ImageItem[]) => {
     setRecords((current) => {
@@ -2201,80 +2003,232 @@ function GalleryView({
   }
 
   return (
-    <section className="entry-fade figma-records thin-scrollbar h-[calc(100dvh-64px)] flex-1 overflow-y-auto px-5 py-4">
-      <div className="mx-auto flex w-[800px] max-w-full flex-col gap-3">
+    <section className="entry-fade thin-scrollbar h-full flex-1 overflow-y-auto px-5 py-5">
+      <div className="mx-auto w-full max-w-[1680px]">
         {recordsError && <Notice tone="error" text={recordsError} />}
         {error && <Notice tone="error" text={error} />}
-        {records.length === 0 && (
-          <div className="figma-record-card grid min-h-[188px] place-items-center rounded-[10px] border border-white/15 p-6 text-center">
+        {galleryGroups.length === 0 && (
+          <div className="grid min-h-[240px] place-items-center rounded-[18px] border border-white/10 bg-white/[0.03] p-6 text-center">
             <div className="flex flex-col items-center gap-3 text-white/40">
               <Images className="size-7" />
-              <span className="text-xs">生成记录会出现在这里</span>
+              <span className="text-sm">生成成功的图片会出现在这里</span>
             </div>
           </div>
         )}
-        {records.map((record) => {
-          const displayRecord =
-            record.job.id === activeJob?.id
-              ? { ...record, job: activeJob, images: activeImages, elapsedSeconds: elapsedSeconds || record.elapsedSeconds }
-              : record;
-
-          return (
-            <GenerationRecordCard
-              key={record.job.id}
-              record={displayRecord}
-              onDelete={() => void deleteRecord(record)}
-              onRegenerate={() => void regenerateRecord(record)}
-              onEditPrompt={() => onEditPrompt(generationFormFromJob(record.job))}
-              onEditImage={(image, draft) => onEditImage(image, draft ?? generationFormFromJob(record.job))}
-              editOptions={{
-                initialForm: generationFormFromJob(record.job),
-                availableRatios,
-                qualityOptions,
-                formatOptions,
-                maxImagesPerRequest: config.maxImagesPerRequest,
-                turnstileSiteKey: config.turnstileSiteKey,
-                turnstileRequired: config.turnstileRequired,
-                submitting: regeneratingId === record.job.id,
-                onSubmit: createEditTaskFromImage,
-              }}
-            />
-          );
-        })}
+        <div className="flex flex-col gap-8">
+          {galleryGroups.map((group) => (
+            <section key={group.key}>
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <h2 className="text-sm font-semibold text-white/88">{group.label}</h2>
+                <span className="text-xs text-white/35">{group.items.length} 张</span>
+              </div>
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-8">
+                {group.items.map((item) => (
+                  <GalleryImageCard
+                    key={item.key}
+                    item={item}
+                    onOpen={() => setPreviewItem({ image: item.image, job: item.job })}
+                    onEditImage={() => onEditImage(item.image, generationFormFromJob(item.job))}
+                    onEditPrompt={() => onEditPrompt(generationFormFromJob(item.job))}
+                    onRegenerate={() => void regenerateRecord({ job: item.job, images: item.recordImages, elapsedSeconds: item.elapsedSeconds })}
+                    onDelete={() => void deleteRecord({ job: item.job, images: item.recordImages, elapsedSeconds: item.elapsedSeconds })}
+                  />
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
         {nextCursor && (
-          <button type="button" className="mx-auto mb-2 h-8 rounded-md border border-white/15 px-4 text-xs text-white/60" onClick={() => void loadRecords(nextCursor)}>
+          <CossButton type="button" variant="outline" className="mx-auto mt-8 block h-9 rounded-md border border-white/15 bg-transparent px-4 text-xs text-white/60 hover:bg-white/10 hover:text-white/80" onClick={() => void loadRecords(nextCursor)}>
             加载更多
-          </button>
+          </CossButton>
         )}
+      </div>
+      {previewItem && (
+        <ImagePreviewDialog
+          image={previewItem.image}
+          onClose={() => setPreviewItem(null)}
+          onEdit={(draft, mask) => {
+            onEditImage(previewItem.image, draft, mask);
+            setPreviewItem(null);
+          }}
+          editOptions={{
+            initialForm: generationFormFromJob(previewItem.job),
+            availableRatios,
+            qualityOptions,
+            formatOptions,
+            maxImagesPerRequest: config.maxImagesPerRequest,
+            turnstileSiteKey: config.turnstileSiteKey,
+            turnstileRequired: config.turnstileRequired,
+            submitting: Boolean(regeneratingId),
+            onSubmit: createEditTaskFromImage,
+          }}
+        />
+      )}
+    </section>
+  );
+}
+
+function buildGalleryGroups(records: GenerationRecord[], activeJob: GenerationJob | null, activeImages: ImageItem[], elapsedSeconds: number) {
+  const normalizedRecords = records.map((record) =>
+    record.job.id === activeJob?.id
+      ? { ...record, job: activeJob, images: activeImages, elapsedSeconds: elapsedSeconds || record.elapsedSeconds }
+      : record,
+  );
+  const grouped = new Map<
+    string,
+    {
+      label: string;
+      items: Array<{ key: string; image: ImageItem; job: GenerationJob; recordImages: ImageItem[]; elapsedSeconds: number | null }>;
+    }
+  >();
+
+  for (const record of normalizedRecords) {
+    for (const image of record.images) {
+      const dateKey = galleryDayKey(image.createdAt || record.job.created_at);
+      const bucket = grouped.get(dateKey) ?? { label: formatGalleryGroupLabel(dateKey), items: [] };
+      bucket.items.push({
+        key: image.id,
+        image,
+        job: record.job,
+        recordImages: record.images,
+        elapsedSeconds: record.elapsedSeconds,
+      });
+      grouped.set(dateKey, bucket);
+    }
+  }
+
+  return Array.from(grouped.entries())
+    .sort(([left], [right]) => (left < right ? 1 : -1))
+    .map(([key, value]) => ({
+      key,
+      label: value.label,
+      items: value.items.sort((left, right) => (left.image.createdAt < right.image.createdAt ? 1 : -1)),
+    }));
+}
+
+function galleryDayKey(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "older";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatGalleryGroupLabel(key: string): string {
+  if (key === "older") return "较早";
+  const date = new Date(`${key}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return "较早";
+  const now = new Date();
+  if (isSameLocalDay(date, now)) return "今天";
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (isSameLocalDay(date, yesterday)) return "昨天";
+  return `${date.getMonth() + 1}月${date.getDate()}日`;
+}
+
+function isSameLocalDay(left: Date, right: Date): boolean {
+  return left.getFullYear() === right.getFullYear() && left.getMonth() === right.getMonth() && left.getDate() === right.getDate();
+}
+
+function GalleryHoverActionIcon({ src, className }: { src: string; className?: string }) {
+  return <img aria-hidden="true" src={src} alt="" className={cn("size-4 shrink-0", className)} draggable={false} />;
+}
+
+function buildGalleryImageActions(
+  item: { image: ImageItem; job: GenerationJob },
+  onEditImage: () => void,
+  onEditPrompt: () => void,
+  onRegenerate: () => void,
+  onDelete: () => void,
+): HoverImageAction[] {
+  return [
+    { key: "continue", label: "基于这张图片继续创作", icon: <GalleryHoverActionIcon src={generationContinueIcon} />, onSelect: onEditPrompt },
+    { key: "local-edit", label: "局部编辑", icon: <GalleryHoverActionIcon src={generationLocalEditIcon} />, onSelect: onEditImage },
+    { key: "regenerate", label: "重新生成", icon: <GalleryHoverActionIcon src={generationRegenerateIcon} />, onSelect: onRegenerate },
+    { key: "copy", label: "复制提示词", icon: <GalleryHoverActionIcon src={generationCopyIcon} />, onSelect: () => void copyPrompt(item.job.prompt) },
+    { key: "download", label: "下载这张图片", icon: <GalleryHoverActionIcon src={generationDownloadIcon} />, href: imageDownloadUrl(item.image) },
+    {
+      key: "delete",
+      label: "删除这次生成",
+      icon: <GalleryHoverActionIcon src={referenceDeleteIcon} />,
+      onSelect: onDelete,
+      confirm: {
+        title: "删除这次生成？",
+        description: "会删除这次生成的图片、参考图、遮罩和生成使用的提示词记录。此操作不能撤销。",
+        confirmLabel: "删除",
+      },
+    },
+  ];
+}
+
+function GalleryImageCard({
+  item,
+  onOpen,
+  onEditImage,
+  onEditPrompt,
+  onRegenerate,
+  onDelete,
+}: {
+  item: { image: ImageItem; job: GenerationJob };
+  onOpen: () => void;
+  onEditImage: () => void;
+  onEditPrompt: () => void;
+  onRegenerate: () => void;
+  onDelete: () => void;
+}) {
+  const actions = buildGalleryImageActions(item, onEditImage, onEditPrompt, onRegenerate, onDelete);
+
+  return (
+    <div className="group relative overflow-hidden rounded-[16px] border border-white/10 bg-white/[0.04]">
+      <CossButton type="button" variant="ghost" className="block aspect-square h-auto w-full rounded-none border-0 bg-transparent p-0 hover:bg-transparent" onClick={onOpen}>
+        <img src={item.image.url} alt={item.job.prompt || "生成图片"} className="h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]" />
+      </CossButton>
+      <div className="pointer-events-none absolute bottom-3 right-3 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
+        <HoverImageActionBar actions={actions} maxInlineActions={actions.length} />
+      </div>
+    </div>
+  );
+}
+
+function InspirationPlaceholderView() {
+  return (
+    <section className="entry-fade grid h-full flex-1 place-items-center px-6">
+      <div className="rounded-[22px] border border-white/10 bg-white/[0.04] px-8 py-10 text-center">
+        <p className="text-base font-medium text-white/90">灵感页正在完善·····</p>
       </div>
     </section>
   );
 }
 
 function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => Promise<void> }) {
-  const [baseURL, setBaseURL] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [apiKeyHint, setApiKeyHint] = useState("");
-  const [promptOptimizerModel, setPromptOptimizerModel] = useState(optionOrFallback(config.promptOptimizerModel, PROMPT_OPTIMIZER_MODEL_OPTIONS));
-  const [model, setModel] = useState(optionOrFallback(config.model, IMAGE_MODEL_OPTIONS));
-  const [usesTokenFourjProvider, setUsesTokenFourjProvider] = useState(false);
+  const [imageBaseURL, setImageBaseURL] = useState("");
+  const [imageApiKey, setImageApiKey] = useState("");
+  const [imageApiKeyHint, setImageApiKeyHint] = useState("");
+  const [imageModel, setImageModel] = useState(optionOrFallback(config.model, IMAGE_MODEL_OPTIONS));
+  const [promptBaseURL, setPromptBaseURL] = useState("");
+  const [promptApiKey, setPromptApiKey] = useState("");
+  const [promptApiKeyHint, setPromptApiKeyHint] = useState("");
+  const [promptModel, setPromptModel] = useState(optionOrFallback(config.promptOptimizerModel, PROMPT_OPTIMIZER_MODEL_OPTIONS));
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
-  const [saving, setSaving] = useState(false);
+  const [savingKind, setSavingKind] = useState<"image" | "prompt" | null>(null);
+  const [testingKind, setTestingKind] = useState<"image" | "prompt" | null>(null);
 
   useEffect(() => {
     let mounted = true;
-    api<{ ok: true; provider: ProviderSettings | null }>("/api/settings/provider").then((result) => {
+    api<{ ok: true } & SettingsProviders>("/api/settings/provider").then((result) => {
       if (!mounted) return;
-      if (result.provider) {
-        setBaseURL(result.provider.baseURL);
-        setApiKeyHint(result.provider.apiKeyHint);
-        setPromptOptimizerModel(optionOrFallback(result.provider.promptOptimizerModel, PROMPT_OPTIMIZER_MODEL_OPTIONS));
-        setModel(optionOrFallback(result.provider.model, IMAGE_MODEL_OPTIONS));
-        setUsesTokenFourjProvider(result.provider.usesTokenFourjProvider);
-      } else {
-        setApiKeyHint("");
-        setUsesTokenFourjProvider(false);
+      if (result.imageProvider) {
+        setImageBaseURL(result.imageProvider.baseURL);
+        setImageApiKeyHint(result.imageProvider.apiKeyHint);
+        setImageModel(optionOrFallback(result.imageProvider.model, IMAGE_MODEL_OPTIONS));
+      }
+      if (result.promptProvider) {
+        setPromptBaseURL(result.promptProvider.baseURL);
+        setPromptApiKeyHint(result.promptProvider.apiKeyHint);
+        setPromptModel(optionOrFallback(result.promptProvider.model, PROMPT_OPTIMIZER_MODEL_OPTIONS));
       }
     });
     return () => {
@@ -2282,131 +2236,209 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
     };
   }, []);
 
-  async function save(event: FormEvent) {
-    event.preventDefault();
-    setSaving(true);
+  async function save(kind: "image" | "prompt") {
+    setSavingKind(kind);
     setError("");
     setMessage("");
     try {
-      const trimmedApiKey = apiKey.trim();
-      const result = await api<{ ok: true; provider: ProviderSettings }>("/api/settings/provider", {
+      const result = await api<{ ok: true } & SettingsProviders>("/api/settings/provider", {
         method: "POST",
         body: JSON.stringify({
-          baseURL: baseURL.trim(),
-          ...(trimmedApiKey ? { apiKey: trimmedApiKey } : {}),
-          model,
-          promptOptimizerModel,
+          ...(kind === "image"
+            ? {
+                imageProvider: {
+                  baseURL: imageBaseURL.trim(),
+                  ...(imageApiKey.trim() ? { apiKey: imageApiKey.trim() } : {}),
+                  model: imageModel,
+                },
+              }
+            : {
+                promptProvider: {
+                  baseURL: promptBaseURL.trim(),
+                  ...(promptApiKey.trim() ? { apiKey: promptApiKey.trim() } : {}),
+                  model: promptModel,
+                },
+              }),
         }),
       });
-      setUsesTokenFourjProvider(result.provider.usesTokenFourjProvider);
-      setBaseURL(result.provider.baseURL);
-      setApiKey(trimmedApiKey);
-      setApiKeyHint(result.provider.apiKeyHint);
-      setMessage("Provider 已保存。");
+      setImageApiKeyHint(result.imageProvider?.apiKeyHint ?? imageApiKeyHint);
+      setPromptApiKeyHint(result.promptProvider?.apiKeyHint ?? promptApiKeyHint);
+      setImageBaseURL(result.imageProvider?.baseURL ?? imageBaseURL.trim());
+      setPromptBaseURL(result.promptProvider?.baseURL ?? promptBaseURL.trim());
+      setImageModel(optionOrFallback(result.imageProvider?.model, IMAGE_MODEL_OPTIONS));
+      setPromptModel(optionOrFallback(result.promptProvider?.model, PROMPT_OPTIMIZER_MODEL_OPTIONS));
+      if (kind === "image") {
+        setImageApiKey("");
+      } else {
+        setPromptApiKey("");
+      }
+      setMessage(`${kind === "image" ? "生图" : "提示词"} Provider 配置已保存。`);
       await onSaved();
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存失败。");
     } finally {
-      setSaving(false);
+      setSavingKind(null);
     }
   }
 
-  async function test() {
+  async function test(kind: "image" | "prompt") {
+    setTestingKind(kind);
     setError("");
     setMessage("");
     try {
-      const trimmedBaseURL = baseURL.trim();
-      const trimmedApiKey = apiKey.trim();
-      const testsFormProvider = Boolean(trimmedBaseURL);
       const result = await api<{ ok: true; result: { ok: boolean; message: string; status: number } }>("/api/provider/test", {
         method: "POST",
         body: JSON.stringify(
-          testsFormProvider
+          kind === "image"
             ? {
-                baseURL: trimmedBaseURL,
-                ...(trimmedApiKey ? { apiKey: trimmedApiKey } : {}),
-                model,
-                promptOptimizerModel,
+                kind,
+                baseURL: imageBaseURL.trim(),
+                ...(imageApiKey.trim() ? { apiKey: imageApiKey.trim() } : {}),
               }
-            : {},
+            : {
+                kind,
+                baseURL: promptBaseURL.trim(),
+                ...(promptApiKey.trim() ? { apiKey: promptApiKey.trim() } : {}),
+              },
         ),
       });
-      setMessage(result.result.message);
-      if (!testsFormProvider) {
-        await onSaved();
-      }
+      setMessage(`${kind === "image" ? "生图" : "提示词"} Provider：${result.result.message}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "测试失败。");
+    } finally {
+      setTestingKind(null);
     }
   }
 
   return (
-    <section className="entry-fade thin-scrollbar h-[calc(100dvh-64px)] flex-1 overflow-y-auto bg-[#191919]">
-      <form className="mx-auto flex w-[368px] max-w-[calc(100vw-32px)] flex-col pt-10" onSubmit={save}>
-        {!usesTokenFourjProvider && (
-          <div className="flex h-10 items-center gap-2 overflow-hidden rounded-[10px] border border-white/15 p-2">
-            <span className="grid size-6 shrink-0 place-items-center overflow-hidden rounded bg-white/10">
-              <img src={openaiIcon} alt="" className="size-4" />
-            </span>
-            <strong className="min-w-0 flex-1 truncate text-xs font-semibold leading-none text-white">推荐使用 Small Token</strong>
-            <button type="button" className="shrink-0 text-xs leading-[18px] text-[#6eff30]">
-              去购买
-            </button>
-          </div>
-        )}
-
-        <div className="mt-10 flex flex-col gap-2">
-          <SettingsTextField
-            id="provider-base-url"
-            label="BaseURL"
-            value={baseURL}
-            onChange={(event) => setBaseURL(event.target.value)}
-            placeholder="请输入 baseURL"
+    <section className="entry-fade thin-scrollbar h-full flex-1 overflow-y-auto bg-[#191919] px-5 py-6">
+      <div className="mx-auto flex w-full max-w-[980px] flex-col gap-5">
+        <div className="grid gap-5 xl:grid-cols-2">
+          <SettingsProviderSection
+            kind="image"
+            title="生图 Provider"
+            baseURL={imageBaseURL}
+            apiKey={imageApiKey}
+            apiKeyHint={imageApiKeyHint}
+            model={imageModel}
+            modelOptions={IMAGE_MODEL_OPTIONS}
+            modelLabel="生图模型"
+            onBaseURLChange={setImageBaseURL}
+            onApiKeyChange={setImageApiKey}
+            onModelChange={(value) => setImageModel(optionOrFallback(value, IMAGE_MODEL_OPTIONS))}
+            onTest={() => void test("image")}
+            onSave={() => void save("image")}
+            saving={savingKind === "image"}
+            testing={testingKind === "image"}
           />
-          <SettingsTextField
-            id="provider-api-key"
-            label="API Key"
-            value={apiKey}
-            onChange={(event) => setApiKey(event.target.value)}
-            type="password"
-            autoComplete="new-password"
-            placeholder={apiKeyHint ? `已保存：${apiKeyHint}` : "请输入 API Key"}
-          />
-          <SettingsSelectField
-            label="提示词优化模型"
-            value={promptOptimizerModel}
-            values={PROMPT_OPTIMIZER_MODEL_OPTIONS}
-            onChange={(value) => setPromptOptimizerModel(optionOrFallback(value, PROMPT_OPTIMIZER_MODEL_OPTIONS))}
-          />
-          <SettingsSelectField
-            label="生图模型"
-            value={model}
-            values={IMAGE_MODEL_OPTIONS}
-            onChange={(value) => setModel(optionOrFallback(value, IMAGE_MODEL_OPTIONS))}
+          <SettingsProviderSection
+            kind="prompt"
+            title="提示词 Provider"
+            baseURL={promptBaseURL}
+            apiKey={promptApiKey}
+            apiKeyHint={promptApiKeyHint}
+            model={promptModel}
+            modelOptions={PROMPT_OPTIMIZER_MODEL_OPTIONS}
+            modelLabel="提示词模型"
+            onBaseURLChange={setPromptBaseURL}
+            onApiKeyChange={setPromptApiKey}
+            onModelChange={(value) => setPromptModel(optionOrFallback(value, PROMPT_OPTIMIZER_MODEL_OPTIONS))}
+            onTest={() => void test("prompt")}
+            onSave={() => void save("prompt")}
+            saving={savingKind === "prompt"}
+            testing={testingKind === "prompt"}
           />
         </div>
 
-        <div className="mt-4 flex gap-2">
-          <Button
-            className="h-10 flex-1 rounded-[10px] border border-[#6eff30] bg-transparent px-2.5 py-0 text-xs font-semibold leading-none text-[#6eff30] hover:bg-[#6eff30]/10 hover:text-[#6eff30]"
-            disabled={saving}
-          >
-            {saving ? "保存中" : "保存"}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            className="h-10 flex-1 rounded-[10px] border border-white/90 bg-transparent px-2.5 py-0 text-xs font-semibold leading-none text-white/90 hover:bg-white/10 hover:text-white"
-            onClick={test}
-          >
-            测试
-          </Button>
+        <div className="grid gap-3">
+          {message && <Notice tone="success" text={message} />}
+          {error && <Notice tone="error" text={error} />}
         </div>
+      </div>
+    </section>
+  );
+}
 
-        <p className="mt-2 text-xs leading-[18px] text-white/40">所有数据均加密保存</p>
-        {message && <p className="mt-2 text-xs leading-[18px] text-[#6eff30]">{message}</p>}
-        {error && <p className="mt-2 text-xs leading-[18px] text-destructive">{error}</p>}
-      </form>
+function SettingsProviderSection({
+  kind,
+  title,
+  baseURL,
+  apiKey,
+  apiKeyHint,
+  model,
+  modelOptions,
+  modelLabel,
+  onBaseURLChange,
+  onApiKeyChange,
+  onModelChange,
+  onTest,
+  onSave,
+  saving,
+  testing,
+}: {
+  kind: "image" | "prompt";
+  title: string;
+  baseURL: string;
+  apiKey: string;
+  apiKeyHint: string;
+  model: string;
+  modelOptions: readonly string[];
+  modelLabel: string;
+  onBaseURLChange: (value: string) => void;
+  onApiKeyChange: (value: string) => void;
+  onModelChange: (value: string) => void;
+  onTest: () => void;
+  onSave: () => void;
+  saving: boolean;
+  testing: boolean;
+}) {
+  return (
+    <section className="rounded-[24px] border border-white/10 bg-white/[0.04] p-5">
+      <div className="mb-5 flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold text-white/90">{title}</h2>
+        </div>
+        <span className="grid size-8 place-items-center rounded-[10px] bg-white/10">
+          <img src={openaiIcon} alt="" className="size-4" />
+        </span>
+      </div>
+
+      <CossSeparator className="mb-5 bg-white/8" />
+
+      <div className="flex flex-col gap-3">
+        <SettingsTextField id={`${title}-base-url`} label="BaseURL" value={baseURL} onChange={(event) => onBaseURLChange(event.target.value)} placeholder="请输入 baseURL" />
+        <SettingsTextField
+          id={`${title}-api-key`}
+          label="API Key"
+          value={apiKey}
+          onChange={(event) => onApiKeyChange(event.target.value)}
+          type="password"
+          autoComplete="new-password"
+          placeholder={apiKeyHint ? `已保存：${apiKeyHint}` : "请输入 API Key"}
+        />
+        <SettingsSelectField label={modelLabel} value={model} values={modelOptions} onChange={onModelChange} />
+      </div>
+
+      <div className="mt-4 flex flex-wrap items-center gap-3">
+        <CossButton
+          type="button"
+          variant="outline"
+          className="h-10 rounded-[12px] border-white/25 bg-white/[0.08] px-4 py-0 text-xs font-semibold leading-none text-white/90 hover:bg-white/[0.14] hover:text-white"
+          loading={saving}
+          onClick={onSave}
+        >
+          {saving ? "保存中" : `保存${kind === "image" ? "生图" : "提示词"} Provider`}
+        </CossButton>
+        <CossButton
+          type="button"
+          variant="outline"
+          className="h-10 rounded-[12px] border-white/20 bg-transparent px-4 py-0 text-xs font-semibold leading-none text-white/90 hover:bg-white/10 hover:text-white"
+          onClick={onTest}
+          loading={testing}
+        >
+          {testing ? "测试中" : "测试连接"}
+        </CossButton>
+      </div>
     </section>
   );
 }
@@ -2423,10 +2455,10 @@ function SettingsTextField({
   return (
     <label className="flex flex-col gap-2" htmlFor={id}>
       <span className="text-xs leading-none text-white/60">{label}</span>
-      <Input
+      <CossInput
         id={id}
         className={cn(
-          "figma-settings-input h-10 rounded-[10px] border-white/15 bg-transparent px-2 py-2.5 text-xs font-bold leading-none text-white/90 caret-white/90 placeholder:text-white/40 placeholder:opacity-100 focus-visible:ring-0",
+          "figma-settings-input text-sm font-semibold caret-white/90 placeholder:opacity-100 focus-visible:ring-white/15",
           className,
         )}
         {...props}
@@ -2449,30 +2481,14 @@ function SettingsSelectField({
   return (
     <label className="flex flex-col gap-2">
       <span className="text-xs leading-none text-white/60">{label}</span>
-      <Select value={value} onValueChange={onChange}>
-        <SelectTrigger className="h-10 rounded-[10px] border-white/15 bg-transparent px-2 py-2.5 text-xs font-semibold leading-none text-white focus:ring-0 focus:ring-offset-0 [&>svg]:size-3 [&>svg]:opacity-100">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent className="border-white/15 bg-[#191919] text-white">
-          <SelectGroup>
-            {values.map((item) => (
-              <SelectItem key={item} value={item}>
-                {item}
-              </SelectItem>
-            ))}
-          </SelectGroup>
-        </SelectContent>
-      </Select>
+      <CossSelect value={value} onChange={(event) => onChange(event.target.value)} className="h-10 justify-start rounded-[10px] border-white/15 bg-transparent px-4 text-sm font-semibold text-white/90">
+        {values.map((item) => (
+          <option key={item} value={item} className="bg-[#191919] text-white">
+            {item}
+          </option>
+        ))}
+      </CossSelect>
     </label>
-  );
-}
-
-function Field({ label, children }: { label: ReactNode; children: ReactNode }) {
-  return (
-    <div className="flex flex-col gap-2">
-      <Label>{label}</Label>
-      {children}
-    </div>
   );
 }
 
@@ -2878,8 +2894,10 @@ function mergeGenerationRecordList(
 }
 
 function mergeGenerationRecord(current: GenerationRecord, next: GenerationRecord): GenerationRecord {
+  const job = mergePolledJobState(current.job, next.job);
   return {
     ...next,
+    job,
     images: mergeImageItems(current.images, next.images),
     elapsedSeconds: next.elapsedSeconds ?? current.elapsedSeconds,
   };
@@ -2983,7 +3001,7 @@ function generationJobErrorMessage(job: Pick<GenerationJob, "error_code" | "erro
 }
 
 function isTerminalJobStatus(status: GenerationJob["status"]): boolean {
-  return status === "succeeded" || status === "partial_succeeded" || status === "failed" || status === "cancelled";
+  return isTerminalGenerationJobStatus(status);
 }
 
 async function copyPrompt(prompt: string): Promise<void> {

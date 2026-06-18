@@ -7,8 +7,17 @@ export const conversationFlowGapPx = 64;
 export const scrollStickThresholdPx = 48;
 export const collapsedPromptMaxLines = 5;
 export const collapsedPromptLineHeightPx = 21;
+export const emptyFirstComposerTopPercent = 34.7;
+export const emptyStateCopyToComposerGapPx = 40;
 
-export function conversationCanvasBottomPadding(composerHeight: number): number {
+export type ComposerLayoutMode = "empty-first-message" | "conversation";
+
+export function resolveComposerLayoutMode(flowCount: number): ComposerLayoutMode {
+  return flowCount > 0 ? "conversation" : "empty-first-message";
+}
+
+export function conversationCanvasBottomPadding(composerHeight: number, layoutMode: ComposerLayoutMode = "conversation"): number {
+  if (layoutMode === "empty-first-message") return conversationTopPaddingPx;
   return Math.max(composerHeight + conversationComposerGapPx + conversationComposerBottomOffsetPx, conversationTopPaddingPx);
 }
 

@@ -1,20 +1,30 @@
-import { ClipboardEvent, ChangeEvent, Dispatch, FormEvent, ReactNode, RefObject, SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ClipboardEvent, ChangeEvent, Dispatch, FormEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { BorderBeam } from "border-beam";
 import {
-  IconArrowRotateClockwise,
   IconChevronDownSmall,
-  IconClipboard,
-  IconCloudDownload,
+  IconCircleDotsCenter2,
   IconCrossSmall,
   IconMagicWand2,
   IconSparkle,
 } from "@central-icons-react/round-filled-radius-2-stroke-1.5";
+import { Redo2, Undo2 } from "lucide-react";
 import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem } from "../../api";
+import generationContinueIcon from "../../assets/figma/generation-continue.svg";
+import generationCopyIcon from "../../assets/figma/generation-copy.svg";
+import generationDownloadIcon from "../../assets/figma/generation-download.svg";
+import generationLocalEditIcon from "../../assets/figma/generation-local-edit.svg";
+import generationReferenceSourceIcon from "../../assets/figma/generation-reference-source.svg";
+import generationRegenerateIcon from "../../assets/figma/generation-regenerate.svg";
 import referenceDeleteIcon from "../../assets/figma/reference-delete.svg";
-import referenceIcon from "../../assets/figma/reference-icon.svg";
 import sidebarAdd from "../../assets/figma/sidebar-add.svg";
+import { claimGenerationSubmitLock, isTerminalGenerationJobStatus, mergePolledJobState, releaseGenerationSubmitLock } from "../../generation-state";
+import { Dialog, DialogDescription, DialogFooter, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "../../components/ui/dialog";
 import { cn } from "../../lib/utils";
+import { Group } from "../../components/ui/group";
 import { Input } from "../../components/ui/input";
+import { Menu, MenuGroup, MenuItem, MenuPopup, MenuTrigger } from "../../components/ui/menu";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../components/ui/tabs";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../../components/ui/tooltip";
 import { AppShell } from "../generate-shell/AppShell";
 import { CossButton, CossTextarea } from "../shared/coss";
 import {
@@ -23,10 +33,27 @@ import {
   conversationFlowGapPx,
   conversationHorizontalPaddingPx,
   conversationTopPaddingPx,
+  emptyStateCopyToComposerGapPx,
+  emptyFirstComposerTopPercent,
   generationModuleGapPx,
   isScrollNearBottom,
+  resolveComposerLayoutMode,
+  type ComposerLayoutMode,
 } from "./layout";
-import { buildConversationRecords, buildGenerationFlowItem, buildSidebarConversations, composerDraftFromRecord, createDraftConversation, mergeJobReferenceImages, submittedReferenceImages, updateDraftConversationTitle, type ConversationListItem } from "./mappers";
+import {
+  buildConversationRecords,
+  buildGenerationFlowItem,
+  buildSidebarConversations,
+  composerDraftFromRecord,
+  conversationIdForRecord,
+  createDraftConversation,
+  mergeJobReferenceImages,
+  resolveDefaultActiveConversationId,
+  resolveLatestVisibleConversationId,
+  submittedReferenceImages,
+  updateDraftConversationTitle,
+  type ConversationListItem,
+} from "./mappers";
 import { formatGenerationSettingsSummary, formatLabels, formatOptions, generationSettingsSummaryParts, qualityLabels, qualityOptions, ratioLabels, ratioOptions, resolutionOptions } from "./options";
 
 const generationStageMaxWidthPx = 840;
@@ -41,7 +68,9 @@ interface GenerateMenuViewProps {
   nextCursor: string | null;
   loadRecords: (cursor?: string, options?: { background?: boolean }) => Promise<void>;
   onProviderNeeded: () => void;
-  onNavigate: (view: "generate" | "gallery" | "settings") => void;
+  onNavigate: (view: "generate" | "gallery" | "settings" | "inspiration") => void;
+  pendingJumpTarget?: { conversationId: string; jobId: string } | null;
+  onJumpHandled?: () => void;
   onLogout: () => void;
   onUsageChanged: () => Promise<void>;
 }
@@ -71,9 +100,40 @@ interface SourceImagePreview {
   name: string;
 }
 
+interface ImageSelectionMask {
+  file: File;
+  name: string;
+  url: string;
+  previewName: string;
+}
+
+interface ImageSelectionPoint {
+  x: number;
+  y: number;
+}
+
+interface ImageSelectionStroke {
+  brushRatio: number;
+  points: ImageSelectionPoint[];
+}
+
 interface PreviewImage {
   url: string;
   prompt?: string;
+  actions?: HoverImageAction[];
+}
+
+export interface HoverImageAction {
+  key: string;
+  label: string;
+  icon: ReactNode;
+  onSelect?: () => void;
+  href?: string;
+  confirm?: {
+    title: string;
+    description: string;
+    confirmLabel: string;
+  };
 }
 
 declare global {
@@ -137,7 +197,11 @@ function ComposerReferenceIcon({ className }: { className?: string }) {
 }
 
 function SentReferenceIcon({ className }: { className?: string }) {
-  return <img aria-hidden="true" src={referenceIcon} alt="" className={className} draggable={false} />;
+  return <img aria-hidden="true" src={generationReferenceSourceIcon} alt="" className={className} draggable={false} />;
+}
+
+function ToolbarActionIcon({ src, className }: { src: string; className?: string }) {
+  return <img aria-hidden="true" src={src} alt="" className={cn("size-4 shrink-0", className)} draggable={false} />;
 }
 
 function ComposerOptimizeIcon({ className }: { className?: string }) {
@@ -193,6 +257,50 @@ const composerTextareaLineHeight = 21;
 const composerTextareaMinRows = 2;
 const composerTextareaMaxRows = 12;
 const imageModelOptions = ["gpt-image-2"] as const;
+const imagePreviewActionOrder = ["continue", "local-edit", "regenerate", "copy", "download", "delete"] as const;
+const imageSelectionBrushRatio = 0.085;
+export const loadingStatusAnimationDurationMs = 24_480;
+export const composerPromptPlaceholderText = "可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等";
+export const composerPromptTextMetricsClassName = "text-[15px] leading-[21px]";
+export const imagePreviewToolbarPositionClassName = "absolute bottom-4 right-4 z-10";
+export const loadingStatusLines = [
+  "正在生成图片",
+  "正在排队处理",
+  "正在渲染细节",
+  "正在铺陈光影",
+  "正在调整构图",
+  "正在推敲层次",
+  "正在润色质感",
+  "正在平衡色彩",
+] as const;
+export const loadingStatusLoopLines = [...loadingStatusLines, loadingStatusLines[0]] as const;
+export const composerPromptTextareaClassName =
+  `ohm-textarea-scrollbar relative z-[1] min-h-[42px] max-h-[252px] resize-none overflow-x-hidden overflow-y-auto border-0 p-0 ${composerPromptTextMetricsClassName} text-white/90 placeholder:text-[15px] placeholder:leading-[21px] placeholder:text-white/30 focus-visible:ring-0`;
+
+export function imagePreviewActionKeys() {
+  return [...imagePreviewActionOrder];
+}
+
+export function resolveConversationAutoScrollBehavior({
+  previousConversationId,
+  nextConversationId,
+  previousFlowCount,
+  nextFlowCount,
+}: {
+  previousConversationId: string | null;
+  nextConversationId: string | null;
+  previousFlowCount: number;
+  nextFlowCount: number;
+}): ScrollBehavior {
+  if (!nextConversationId) return "auto";
+  if (previousConversationId !== nextConversationId) return "auto";
+  if (nextFlowCount > previousFlowCount) return "smooth";
+  return "auto";
+}
+
+export function resolveComposerPanelMode(flowCount: number): ComposerLayoutMode {
+  return resolveComposerLayoutMode(flowCount);
+}
 
 export function GenerateMenuView({
   config,
@@ -204,17 +312,23 @@ export function GenerateMenuView({
   loadRecords,
   onProviderNeeded,
   onNavigate,
+  pendingJumpTarget,
+  onJumpHandled,
   onLogout,
   onUsageChanged,
 }: GenerateMenuViewProps) {
   const [form, setForm] = useState<GenerateForm>(defaultForm);
   const [referenceImages, setReferenceImages] = useState<ReferenceImagePreview[]>([]);
   const [sourceImagePreview, setSourceImagePreview] = useState<SourceImagePreview | null>(null);
-  const [activeConversationId, setActiveConversationId] = useState<string | null>(records[0]?.job.id ?? null);
+  const [referenceMask, setReferenceMask] = useState<ImageSelectionMask | null>(null);
+  const [localEditPreviewUrl, setLocalEditPreviewUrl] = useState<string | null>(null);
+  const [localEditImage, setLocalEditImage] = useState<ImageItem | null>(null);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(() => resolveDefaultActiveConversationId(records));
   const [draftConversation, setDraftConversation] = useState<ReturnType<typeof createDraftConversation> | null>(null);
   const [activeJob, setActiveJob] = useState<GenerationJob | null>(null);
   const [activeImages, setActiveImages] = useState<ImageItem[]>([]);
   const [conversationIdsByRecordId, setConversationIdsByRecordId] = useState<Record<string, string>>({});
+  const [submittedReferenceImagesByJobId, setSubmittedReferenceImagesByJobId] = useState<Record<string, NonNullable<GenerationJob["referenceImages"]>>>({});
   const [sourceImageId, setSourceImageId] = useState<string | undefined>();
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -226,7 +340,12 @@ export function GenerateMenuView({
   const objectUrlsRef = useRef<string[]>([]);
   const canvasScrollRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLFormElement | null>(null);
+  const submitLockRef = useRef(false);
+  const pollInFlightRef = useRef(false);
+  const activeJobRef = useRef<GenerationJob | null>(null);
   const shouldStickToBottomRef = useRef(true);
+  const lastAutoScrolledConversationIdRef = useRef<string | null>(null);
+  const lastAutoScrolledFlowCountRef = useRef(0);
   const [composerHeight, setComposerHeight] = useState(170);
 
   const conversations = useMemo(
@@ -234,14 +353,18 @@ export function GenerateMenuView({
     [conversationIdsByRecordId, draftConversation, records],
   );
   const activeConversation = useMemo(() => {
-    if (activeConversationId) return conversations.find((conversation) => conversation.id === activeConversationId) ?? null;
-    if (draftConversation) return null;
-    return conversations[0] ?? null;
+    const fallbackConversationId = draftConversation ? null : resolveLatestVisibleConversationId(conversations);
+    const resolvedActiveConversationId = activeConversationId ?? fallbackConversationId;
+    if (!resolvedActiveConversationId) return null;
+    return conversations.find((conversation) => conversation.id === resolvedActiveConversationId) ?? null;
   }, [activeConversationId, conversations, draftConversation]);
   const activeConversationRecords = useMemo(() => {
     if (draftConversation || !activeConversation?.id) return [];
-    return buildConversationRecords(records, conversationIdsByRecordId, activeConversation.id);
-  }, [activeConversation?.id, conversationIdsByRecordId, draftConversation, records]);
+    return buildConversationRecords(records, conversationIdsByRecordId, activeConversation.id).map((record) => ({
+      ...record,
+      job: mergeJobReferenceImages(record.job, submittedReferenceImagesByJobId[record.job.id] ? { ...record.job, referenceImages: submittedReferenceImagesByJobId[record.job.id] } : null),
+    }));
+  }, [activeConversation?.id, conversationIdsByRecordId, draftConversation, records, submittedReferenceImagesByJobId]);
   const activeFlows = useMemo(
     () =>
       activeConversationRecords.map((record) =>
@@ -249,6 +372,11 @@ export function GenerateMenuView({
       ),
     [activeConversationRecords, activeImages, activeJob],
   );
+  const composerLayoutMode = useMemo(() => resolveComposerPanelMode(activeFlows.length), [activeFlows.length]);
+
+  useEffect(() => {
+    activeJobRef.current = activeJob;
+  }, [activeJob]);
 
   useEffect(() => {
     setConversationIdsByRecordId((current) => {
@@ -256,7 +384,7 @@ export function GenerateMenuView({
       const next = { ...current };
       for (const record of records) {
         if (next[record.job.id]) continue;
-        next[record.job.id] = record.job.id;
+        next[record.job.id] = conversationIdForRecord(record);
         changed = true;
       }
       return changed ? next : current;
@@ -264,8 +392,35 @@ export function GenerateMenuView({
   }, [records]);
 
   useEffect(() => {
-    if (!draftConversation && !activeConversationId && records[0]) setActiveConversationId(conversationIdsByRecordId[records[0].job.id] ?? records[0].job.id);
-  }, [activeConversationId, conversationIdsByRecordId, draftConversation, records]);
+    if (draftConversation) return;
+    const latestConversationId = resolveLatestVisibleConversationId(conversations);
+    if (!latestConversationId) {
+      if (activeConversationId !== null) setActiveConversationId(null);
+      return;
+    }
+    const hasActiveConversation = activeConversationId ? conversations.some((conversation) => conversation.id === activeConversationId) : false;
+    if (hasActiveConversation) return;
+    if (activeConversationId !== latestConversationId) setActiveConversationId(latestConversationId);
+  }, [activeConversationId, conversations, draftConversation]);
+
+  useEffect(() => {
+    if (!pendingJumpTarget) return;
+    shouldStickToBottomRef.current = false;
+    setDraftConversation(null);
+    setActiveConversationId(pendingJumpTarget.conversationId);
+  }, [pendingJumpTarget]);
+
+  useEffect(() => {
+    if (!pendingJumpTarget) return;
+    if ((activeConversation?.id ?? null) !== pendingJumpTarget.conversationId) return;
+    if (!activeConversationRecords.some((record) => record.job.id === pendingJumpTarget.jobId)) return;
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.querySelector<HTMLElement>(`[data-generation-job-id="${pendingJumpTarget.jobId}"]`);
+      target?.scrollIntoView({ block: "center", behavior: "smooth" });
+      onJumpHandled?.();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeConversation?.id, activeConversationRecords, onJumpHandled, pendingJumpTarget]);
 
   useEffect(() => {
     if (!draftConversation) return;
@@ -275,9 +430,13 @@ export function GenerateMenuView({
   useEffect(() => {
     if (!activeJob || isTerminalJobStatus(activeJob.status)) return;
     const timer = window.setInterval(async () => {
+      if (pollInFlightRef.current) return;
+      pollInFlightRef.current = true;
       try {
         const result = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${activeJob.id}`);
-        const nextJob = mergeJobReferenceImages(result.job, activeJob);
+        const fallbackReferenceImages = submittedReferenceImagesByJobId[activeJob.id] ?? activeJob.referenceImages;
+        const mergedReferenceJob = mergeJobReferenceImages(result.job, fallbackReferenceImages ? { ...result.job, referenceImages: fallbackReferenceImages } : activeJob);
+        const nextJob = mergePolledJobState(activeJobRef.current, mergedReferenceJob);
         setActiveJob(nextJob);
         setActiveImages(result.images);
         upsertRecord(setRecords, nextJob, result.images);
@@ -288,10 +447,15 @@ export function GenerateMenuView({
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : "刷新任务状态失败。");
+      } finally {
+        pollInFlightRef.current = false;
       }
     }, pollIntervalMs);
-    return () => window.clearInterval(timer);
-  }, [activeJob?.id, activeJob?.status, loadRecords, onUsageChanged, setRecords]);
+    return () => {
+      pollInFlightRef.current = false;
+      window.clearInterval(timer);
+    };
+  }, [activeJob?.id, activeJob?.status, activeJob?.referenceImages, loadRecords, onUsageChanged, setRecords, submittedReferenceImagesByJobId]);
 
   useEffect(() => {
     if (!textareaRef.current) return;
@@ -317,13 +481,55 @@ export function GenerateMenuView({
   }, []);
 
   useEffect(() => {
+    if (!sourceImagePreview || !referenceMask) {
+      setLocalEditPreviewUrl(null);
+      return;
+    }
+
+    let cancelled = false;
+    let objectUrl: string | null = null;
+
+    void buildLocalEditPreviewUrl(sourceImagePreview.url, referenceMask.url)
+      .then((url) => {
+        if (cancelled) {
+          if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+          return;
+        }
+        objectUrl = url.startsWith("blob:") ? url : null;
+        setLocalEditPreviewUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setLocalEditPreviewUrl(sourceImagePreview.url);
+      });
+
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [referenceMask, sourceImagePreview]);
+
+  useEffect(() => {
     const canvas = canvasScrollRef.current;
-    if (!canvas || !shouldStickToBottomRef.current) return;
-    const frame = window.requestAnimationFrame(() => {
-      canvas.scrollTo({ top: canvas.scrollHeight, behavior: "smooth" });
+    const nextConversationId = activeConversation?.id ?? null;
+    const nextFlowCount = activeFlows.length;
+    if (!canvas || !shouldStickToBottomRef.current) {
+      lastAutoScrolledConversationIdRef.current = nextConversationId;
+      lastAutoScrolledFlowCountRef.current = nextFlowCount;
+      return;
+    }
+    const behavior = resolveConversationAutoScrollBehavior({
+      previousConversationId: lastAutoScrolledConversationIdRef.current,
+      nextConversationId,
+      previousFlowCount: lastAutoScrolledFlowCountRef.current,
+      nextFlowCount,
     });
+    const frame = window.requestAnimationFrame(() => {
+      canvas.scrollTo({ top: canvas.scrollHeight, behavior });
+    });
+    lastAutoScrolledConversationIdRef.current = nextConversationId;
+    lastAutoScrolledFlowCountRef.current = nextFlowCount;
     return () => window.cancelAnimationFrame(frame);
-  }, [activeFlows, error]);
+  }, [activeConversation?.id, activeFlows.length, error]);
 
   const updateForm = useCallback(<K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) => {
     setForm((current) => updateGenerateForm(current, key, value));
@@ -331,31 +537,51 @@ export function GenerateMenuView({
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (!claimGenerationSubmitLock(submitLockRef)) return;
     if (!providerConfigured) {
+      releaseGenerationSubmitLock(submitLockRef);
       onProviderNeeded();
       return;
     }
     if (!form.prompt.trim()) {
+      releaseGenerationSubmitLock(submitLockRef);
       textareaRef.current?.focus();
       return;
     }
     if (config.turnstileRequired && config.turnstileSiteKey && !turnstileToken) {
+      releaseGenerationSubmitLock(submitLockRef);
       setError("请先完成人机验证。");
       return;
     }
 
     setLoading(true);
     setError("");
-    const submittedReferences = submittedReferenceImages(referenceImages, sourceImagePreview);
+    const submittedReferences = submittedReferenceImages(
+      referenceImages,
+      sourceImagePreview
+        ? { ...sourceImagePreview, url: localEditPreviewUrl ?? sourceImagePreview.url }
+        : null,
+    );
     try {
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
-        body: generationRequestBody(form, referenceImages, sourceImageId, turnstileToken),
+        body: generationRequestBody(
+          form,
+          referenceImages,
+          sourceImageId,
+          turnstileToken,
+          referenceMask,
+          draftConversation ? undefined : activeConversationId ?? undefined,
+        ),
       });
       void onUsageChanged();
       const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
       const firstPollJob = mergeJobReferenceImages(firstPoll.job, submittedReferences.length > 0 ? { ...firstPoll.job, referenceImages: submittedReferences } : null);
-      const conversationId = draftConversation?.id ?? activeConversationId ?? firstPoll.job.id;
+      if (submittedReferences.length > 0) {
+        setSubmittedReferenceImagesByJobId((current) => ({ ...current, [firstPollJob.id]: submittedReferences }));
+      }
+      const conversationId =
+        conversationIdForRecord({ job: firstPollJob, images: firstPoll.images, elapsedSeconds: null }) || activeConversationId || firstPoll.job.id;
       shouldStickToBottomRef.current = true;
       setActiveJob(firstPollJob);
       setActiveImages(firstPoll.images);
@@ -367,10 +593,12 @@ export function GenerateMenuView({
       setReferenceImages([]);
       setSourceImageId(undefined);
       setSourceImagePreview(null);
+      setReferenceMask(null);
       void loadRecords(undefined, { background: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "创建任务失败。");
     } finally {
+      releaseGenerationSubmitLock(submitLockRef);
       setLoading(false);
     }
   }
@@ -446,6 +674,7 @@ export function GenerateMenuView({
     else setError("");
     setSourceImageId(undefined);
     setSourceImagePreview(null);
+    setReferenceMask(null);
     setReferenceImages((current) => [...current, ...accepted]);
   }
 
@@ -455,6 +684,7 @@ export function GenerateMenuView({
     setReferenceImages([]);
     setSourceImageId(undefined);
     setSourceImagePreview(null);
+    setReferenceMask(null);
     if (referenceInputRef.current) referenceInputRef.current.value = "";
   }
 
@@ -464,16 +694,19 @@ export function GenerateMenuView({
     setForm((current) => ({ ...current, prompt: draft.prompt, quality: draft.selectedQuality }));
     setSourceImageId(draft.sourceImageId);
     setSourceImagePreview(image ? { id: image.id, url: image.url, name: "参考图 1" } : null);
+    setReferenceMask(null);
     revokeObjectUrls(objectUrlsRef.current);
     objectUrlsRef.current = [];
     setReferenceImages([]);
     setDraftConversation(null);
-    setActiveConversationId(conversationIdsByRecordId[record.job.id] ?? record.job.id);
+    setActiveConversationId(conversationIdForRecord(record, conversationIdsByRecordId));
     window.requestAnimationFrame(() => textareaRef.current?.focus());
   }
 
   async function regenerate(record: GenerationRecord) {
+    if (!claimGenerationSubmitLock(submitLockRef)) return;
     if (!providerConfigured) {
+      releaseGenerationSubmitLock(submitLockRef);
       onProviderNeeded();
       return;
     }
@@ -482,7 +715,9 @@ export function GenerateMenuView({
     try {
       const result = await api<{ ok: true; jobId: string; status: "queued" }>(`/api/generations/${record.job.id}/regenerate`, { method: "POST" });
       const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
-      const conversationId = conversationIdsByRecordId[record.job.id] ?? record.job.id;
+      const conversationId =
+        conversationIdForRecord({ job: firstPoll.job, images: firstPoll.images, elapsedSeconds: null }, conversationIdsByRecordId)
+        || conversationIdForRecord(record, conversationIdsByRecordId);
       shouldStickToBottomRef.current = true;
       setActiveJob(firstPoll.job);
       setActiveImages(firstPoll.images);
@@ -494,14 +729,54 @@ export function GenerateMenuView({
     } catch (err) {
       setError(err instanceof Error ? err.message : "重新生成失败。");
     } finally {
+      releaseGenerationSubmitLock(submitLockRef);
       setLoading(false);
     }
+  }
+
+  async function deleteRecord(record: GenerationRecord) {
+    setError("");
+    try {
+      await api<{ ok: true }>(`/api/generations/${record.job.id}`, { method: "DELETE" });
+      setRecords((current) => current.filter((item) => item.job.id !== record.job.id));
+      setSubmittedReferenceImagesByJobId((current) => {
+        const { [record.job.id]: _removed, ...rest } = current;
+        return rest;
+      });
+      setConversationIdsByRecordId((current) => {
+        const { [record.job.id]: _removed, ...rest } = current;
+        return rest;
+      });
+      if (activeJob?.id === record.job.id) {
+        setActiveJob(null);
+        setActiveImages([]);
+      }
+      setPreviewImage(null);
+      void loadRecords(undefined, { background: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除记录失败。");
+    }
+  }
+
+  async function applyLocalEdit(image: ImageItem, strokes: ImageSelectionStroke[]) {
+    const localEditMask = await createSelectionMask(image, strokes);
+    shouldStickToBottomRef.current = true;
+    revokeObjectUrls(objectUrlsRef.current);
+    objectUrlsRef.current = [];
+    const maskUrl = URL.createObjectURL(localEditMask.file);
+    objectUrlsRef.current.push(maskUrl);
+    setReferenceImages([]);
+    setReferenceMask({ ...localEditMask, url: maskUrl, previewName: "局部重绘遮罩" });
+    setSourceImageId(image.id);
+    setSourceImagePreview({ id: image.id, url: image.url, name: "局部重绘" });
+    setLocalEditImage(null);
+    window.requestAnimationFrame(() => textareaRef.current?.focus());
   }
 
   const sidebar = (
     <ConversationSidebar
       conversations={conversations}
-      activeId={draftConversation?.id ?? activeConversationId}
+      activeId={draftConversation?.id ?? activeConversation?.id ?? activeConversationId}
       error={recordsError}
       nextCursor={nextCursor}
       onNew={() => {
@@ -530,11 +805,14 @@ export function GenerateMenuView({
       <GenerationCanvas
         scrollRef={canvasScrollRef}
         composerHeight={composerHeight}
+        composerLayoutMode={composerLayoutMode}
         flows={activeFlows}
         error={error}
         onPreview={setPreviewImage}
         onContinue={continueFromRecord}
+        onLocalEdit={(image) => setLocalEditImage(image)}
         onRegenerate={regenerate}
+        onDelete={(record) => void deleteRecord(record)}
         onCopyPrompt={(prompt) => void navigator.clipboard?.writeText(prompt)}
         onScrollStickyChange={(isSticky) => {
           shouldStickToBottomRef.current = isSticky;
@@ -542,6 +820,7 @@ export function GenerateMenuView({
       />
       <ComposerPanel
         formRef={composerRef}
+        layoutMode={composerLayoutMode}
         form={form}
         config={config}
         loading={loading}
@@ -549,6 +828,8 @@ export function GenerateMenuView({
         providerConfigured={providerConfigured}
         referenceImages={referenceImages}
         sourceImagePreview={sourceImagePreview}
+        referenceMask={referenceMask}
+        localEditPreviewUrl={localEditPreviewUrl}
         textareaRef={textareaRef}
         referenceInputRef={referenceInputRef}
         onSubmit={submit}
@@ -558,6 +839,7 @@ export function GenerateMenuView({
         onRemoveSourceReference={() => {
           setSourceImageId(undefined);
           setSourceImagePreview(null);
+          setReferenceMask(null);
         }}
         onRemoveReference={(index) =>
           setReferenceImages((current) => {
@@ -575,6 +857,14 @@ export function GenerateMenuView({
         onTurnstileToken={setTurnstileToken}
       />
       {previewImage && <ImagePreview image={previewImage} onClose={() => setPreviewImage(null)} />}
+      <LocalEditDialog
+        image={localEditImage}
+        open={Boolean(localEditImage)}
+        onOpenChange={(open) => {
+          if (!open) setLocalEditImage(null);
+        }}
+        onConfirm={applyLocalEdit}
+      />
     </AppShell>
   );
 }
@@ -617,19 +907,20 @@ function ConversationSidebar({
           return (
             <div key={conversation.id}>
               {showGroup && <p className={cn("mb-2 text-xs font-semibold leading-5 text-white/30", groupClassName)}>{conversation.groupLabel}</p>}
-              <button
+              <CossButton
                 type="button"
+                variant="ghost"
                 className={cn(
-                  "mb-2 flex h-8 w-full items-center gap-2 overflow-hidden rounded-[8px] bg-transparent text-left text-sm font-normal leading-[22px] text-white/90 transition-colors hover:bg-white/10",
+                  "mb-2 flex h-8 w-full items-center gap-2 overflow-hidden rounded-[8px] border-0 bg-transparent px-0 text-left text-sm font-normal leading-[22px] text-white/90 transition-colors hover:bg-white/10",
                   activeId === conversation.id && "bg-white/10",
                 )}
                 onClick={() => onSelect(conversation.id)}
               >
                 <span className="grid size-8 shrink-0 place-items-center overflow-hidden rounded-[8px] bg-white/10">
-                  {conversation.previewImage ? <img src={conversation.previewImage} alt="" className="size-full object-cover" /> : <IconSparkle ariaHidden size={16} className="text-white/45" />}
+                  {conversation.previewImage ? <img src={conversation.previewImage} alt="" loading="lazy" decoding="async" className="size-full object-cover" /> : <IconSparkle ariaHidden size={16} className="text-white/45" />}
                 </span>
                 <span className="block min-w-0 flex-1 truncate pr-3">{conversation.title}</span>
-              </button>
+              </CossButton>
             </div>
           );
         })}
@@ -646,21 +937,27 @@ function ConversationSidebar({
 function GenerationCanvas({
   scrollRef,
   composerHeight,
+  composerLayoutMode,
   flows,
   error,
   onPreview,
   onContinue,
+  onLocalEdit,
   onRegenerate,
+  onDelete,
   onCopyPrompt,
   onScrollStickyChange,
 }: {
   scrollRef: RefObject<HTMLDivElement>;
   composerHeight: number;
+  composerLayoutMode: ComposerLayoutMode;
   flows: Array<ReturnType<typeof buildGenerationFlowItem>>;
   error: string;
   onPreview: (image: PreviewImage) => void;
   onContinue: (record: GenerationRecord, image?: ImageItem) => void;
+  onLocalEdit: (image: ImageItem) => void;
   onRegenerate: (record: GenerationRecord) => void;
+  onDelete: (record: GenerationRecord) => void;
   onCopyPrompt: (prompt: string) => void;
   onScrollStickyChange: (isSticky: boolean) => void;
 }) {
@@ -671,7 +968,7 @@ function GenerationCanvas({
       style={{
         paddingTop: conversationTopPaddingPx,
         paddingRight: conversationHorizontalPaddingPx,
-        paddingBottom: conversationCanvasBottomPadding(composerHeight),
+        paddingBottom: conversationCanvasBottomPadding(composerHeight, composerLayoutMode),
         paddingLeft: conversationHorizontalPaddingPx,
       }}
       onScroll={(event) => {
@@ -687,11 +984,13 @@ function GenerationCanvas({
             flow={flow}
             onPreview={onPreview}
             onContinue={onContinue}
+            onLocalEdit={onLocalEdit}
             onRegenerate={onRegenerate}
+            onDelete={onDelete}
             onCopyPrompt={onCopyPrompt}
           />
         ))}
-        {flows.length === 0 && <EmptyConversationState />}
+        {flows.length === 0 && composerLayoutMode === "conversation" && <EmptyConversationState />}
       </div>
     </div>
   );
@@ -709,13 +1008,17 @@ function GenerationCard({
   flow,
   onPreview,
   onContinue,
+  onLocalEdit,
   onRegenerate,
+  onDelete,
   onCopyPrompt,
 }: {
   flow: ReturnType<typeof buildGenerationFlowItem>;
   onPreview: (image: PreviewImage) => void;
   onContinue: (record: GenerationRecord, image?: ImageItem) => void;
+  onLocalEdit: (image: ImageItem) => void;
   onRegenerate: (record: GenerationRecord) => void;
+  onDelete: (record: GenerationRecord) => void;
   onCopyPrompt: (prompt: string) => void;
 }) {
   const record: GenerationRecord = { job: flow.job, images: flow.images, elapsedSeconds: flow.elapsedSeconds };
@@ -724,8 +1027,7 @@ function GenerationCard({
   const promptRef = useRef<HTMLParagraphElement | null>(null);
   const referenceImages = flow.job.referenceImages ?? [];
   const chips = buildFlowChips(flow);
-  const failureLabel = flow.job.error_message ?? flow.job.error_reason ?? "生成失败";
-  const showStatusRow = flow.status === "pending" || flow.status === "failed";
+  const showStatusRow = flow.status === "pending";
   const stageImages = flow.images.slice(0, Math.max(1, flow.job.quantity));
   const stageLayout = generationStageLayout(flow.job, stageImages);
 
@@ -740,7 +1042,7 @@ function GenerationCard({
   }, [flow.job.prompt]);
 
   return (
-    <article className="relative text-white/90">
+    <article className="relative text-white/90" data-generation-job-id={flow.job.id}>
       {referenceImages.length > 0 && (
         <div className="mb-2 flex min-h-8 w-full items-start gap-2">
           <span className="mt-2 grid size-4 shrink-0 place-items-center text-white/90">
@@ -748,17 +1050,30 @@ function GenerationCard({
           </span>
           <div className="flex min-h-8 min-w-0 flex-1 flex-wrap items-center gap-2">
             {referenceImages.map((image, index) => (
-              <button
+              <CossButton
                 key={`${image.url}-${index}`}
                 type="button"
+                variant="secondary"
                 className="inline-flex h-8 shrink-0 items-center gap-1 overflow-hidden rounded-[8px] border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white transition hover:bg-white/12"
-                onClick={() => onPreview({ url: image.url, prompt: image.name || `参考图 ${index + 1}` })}
+                onClick={() =>
+                  onPreview({
+                    url: image.url,
+                    prompt: image.name || `参考图 ${index + 1}`,
+                    actions: [
+                      {
+                        key: "download",
+                        label: "下载这张图片",
+                        icon: <ToolbarActionIcon src={generationDownloadIcon} />,
+                        href: image.url,
+                      },
+                    ],
+                  })}
               >
                 <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[5px] border border-transparent bg-white/10">
-                  <img src={image.url} alt={`参考图 ${index + 1}`} className="size-full object-cover" />
+                  <img src={image.url} alt={image.name || `参考图 ${index + 1}`} loading="lazy" decoding="async" className="size-full object-cover" />
                 </span>
-                <span className="whitespace-nowrap">参考图 {index + 1}</span>
-              </button>
+                <span className="whitespace-nowrap">{image.name || `参考图 ${index + 1}`}</span>
+              </CossButton>
             ))}
           </div>
         </div>
@@ -797,50 +1112,336 @@ function GenerationCard({
       {showStatusRow && (
         <div className="flex items-center gap-2 text-sm leading-[22px] text-white" style={{ marginTop: generationModuleGapPx }}>
           <span className="inline-flex size-[14px] items-center justify-center">
-            {flow.status === "pending" ? <LoadersWtfStatusIcon /> : <IconMagicWand2 ariaHidden size={14} />}
+            <LoadersWtfStatusIcon />
           </span>
-          {flow.status === "pending" ? <LoadingStatusText /> : <span>{failureLabel}</span>}
+          <LoadingStatusText />
         </div>
       )}
 
-      <div className={cn("relative overflow-hidden rounded-[24px] border-[1.2px] border-white/20 bg-white/[0.06]", showStatusRow ? "mt-2" : "mt-6")} style={{ width: stageLayout.width, height: stageLayout.height }}>
-        {flow.status === "pending" && <PendingStage />}
-        {flow.status !== "pending" && stageImages.length > 0 && (
-          <div className="flex h-full w-full">
-            {stageImages.map((image, index) => (
-              <div key={image.id} className={cn("group/image relative h-full min-w-0 flex-1 overflow-hidden bg-[#222]", index > 0 && "border-l border-white/20")}>
-                <button type="button" className="block h-full w-full" onClick={() => onPreview(image)}>
-                  <img src={image.url} alt={image.prompt ?? "生成图片"} className="h-full w-full object-cover" />
-                </button>
-                <div className="pointer-events-none absolute bottom-3 right-3 flex items-center gap-1.5 opacity-0 transition-opacity group-hover/image:pointer-events-auto group-hover/image:opacity-100">
-                  <CossButton aria-label="基于这张图片继续创作" size="icon" variant="ghost" className="bg-black/30 backdrop-blur-sm" onClick={() => onContinue(record, image)}>
-                    <IconMagicWand2 ariaHidden size={16} />
-                  </CossButton>
-                  <CossButton aria-label="重新生成" size="icon" variant="ghost" className="bg-black/30 backdrop-blur-sm" onClick={() => void onRegenerate(record)}>
-                    <IconArrowRotateClockwise ariaHidden size={16} />
-                  </CossButton>
-                  <CossButton aria-label="复制提示词" size="icon" variant="ghost" className="bg-black/30 backdrop-blur-sm" onClick={() => onCopyPrompt(flow.job.prompt)}>
-                    <IconClipboard ariaHidden size={16} />
-                  </CossButton>
-                  <a
-                    aria-label="下载这张图片"
-                    className="ohm-smooth-control inline-flex size-8 items-center justify-center bg-black/30 text-white/72 backdrop-blur-sm hover:bg-black/40 hover:text-white"
-                    href={`/api/images/${image.id}/download?raw=1&download=1`}
-                  >
-                    <IconCloudDownload ariaHidden size={16} />
-                  </a>
-                </div>
-              </div>
-            ))}
+      {flow.status === "pending" ? (
+        <BorderBeam
+          className={cn("generation-preview-beam", showStatusRow ? "mt-2" : "mt-6")}
+          size="pulse-inner"
+          colorVariant="colorful"
+          style={{ width: stageLayout.width, height: stageLayout.height }}
+        >
+          <div className="relative h-full w-full overflow-hidden rounded-[24px] border-[1.2px] border-transparent bg-white/[0.06]">
+            <PendingStage />
           </div>
-        )}
-        {flow.status === "failed" && (
-          <div className="flex h-full items-center justify-center px-8 text-center text-sm leading-6 text-white/40">
-            {flow.job.error_message ?? "生成失败"}
-          </div>
-        )}
-      </div>
+        </BorderBeam>
+      ) : (
+        <div
+          className={cn("relative overflow-hidden rounded-[24px] border-[1.2px] border-white/20 bg-white/[0.06]", showStatusRow ? "mt-2" : "mt-6")}
+          style={{ width: stageLayout.width, height: stageLayout.height }}
+        >
+          {stageImages.length > 0 && (
+            <div className="flex h-full w-full">
+              {stageImages.map((image, index) => (
+                <GenerationStageImageCell
+                  key={image.id}
+                  image={image}
+                  prompt={flow.job.prompt}
+                  record={record}
+                  showDivider={index > 0}
+                  onPreview={onPreview}
+                  onContinue={onContinue}
+                  onLocalEdit={onLocalEdit}
+                  onRegenerate={onRegenerate}
+                  onDelete={onDelete}
+                  onCopyPrompt={onCopyPrompt}
+                />
+              ))}
+            </div>
+          )}
+          {flow.status === "failed" && (
+            <div className="flex h-full items-center justify-center px-8 text-center text-sm leading-6 text-white/40">
+              {flow.job.error_message ?? "生成失败"}
+            </div>
+          )}
+        </div>
+      )}
     </article>
+  );
+}
+
+function GenerationStageImageCell({
+  image,
+  prompt,
+  record,
+  showDivider,
+  onPreview,
+  onContinue,
+  onLocalEdit,
+  onRegenerate,
+  onDelete,
+  onCopyPrompt,
+}: {
+  image: ImageItem;
+  prompt: string;
+  record: GenerationRecord;
+  showDivider: boolean;
+  onPreview: (image: PreviewImage) => void;
+  onContinue: (record: GenerationRecord, image?: ImageItem) => void;
+  onLocalEdit: (image: ImageItem) => void;
+  onRegenerate: (record: GenerationRecord) => void;
+  onDelete: (record: GenerationRecord) => void;
+  onCopyPrompt: (prompt: string) => void;
+}) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [isPinnedOpen, setIsPinnedOpen] = useState(false);
+  const [maxInlineActions, setMaxInlineActions] = useState(3);
+  const actions = buildGeneratedImageActions(image, prompt, record, onContinue, onLocalEdit, onRegenerate, onDelete, onCopyPrompt);
+
+  useEffect(() => {
+    if (!rootRef.current) return;
+    const element = rootRef.current;
+    const updateCount = () => {
+      const width = element.getBoundingClientRect().width;
+      if (width >= 164) setMaxInlineActions(5);
+      else if (width >= 132) setMaxInlineActions(4);
+      else if (width >= 100) setMaxInlineActions(3);
+      else setMaxInlineActions(2);
+    };
+
+    updateCount();
+    const observer = new ResizeObserver(updateCount);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  return (
+    <div ref={rootRef} className={cn("group/image relative h-full min-w-0 flex-1 overflow-hidden bg-[#222]", showDivider && "border-l border-white/20")}>
+      <CossButton type="button" variant="ghost" className="block h-full w-full rounded-none border-0 bg-transparent p-0 hover:bg-transparent" onClick={() => onPreview({ url: image.url, prompt: image.prompt ?? prompt, actions })}>
+        <img src={image.url} alt={image.prompt ?? "生成图片"} decoding="async" className="h-full w-full object-cover" />
+      </CossButton>
+      <div
+        className={cn(
+          "pointer-events-none absolute bottom-3 right-3 opacity-0 transition-opacity group-hover/image:pointer-events-auto group-hover/image:opacity-100",
+          isPinnedOpen && "pointer-events-auto opacity-100",
+        )}
+      >
+        <HoverImageActionBar actions={actions} maxInlineActions={maxInlineActions} onMoreOpenChange={setIsPinnedOpen} />
+      </div>
+    </div>
+  );
+}
+
+function buildGeneratedImageActions(
+  image: ImageItem,
+  prompt: string,
+  record: GenerationRecord,
+  onContinue: (record: GenerationRecord, image?: ImageItem) => void,
+  onLocalEdit: (image: ImageItem) => void,
+  onRegenerate: (record: GenerationRecord) => void,
+  onDelete: (record: GenerationRecord) => void,
+  onCopyPrompt: (prompt: string) => void,
+): HoverImageAction[] {
+  return [
+    { key: "continue", label: "基于这张图片继续创作", icon: <ToolbarActionIcon src={generationContinueIcon} />, onSelect: () => onContinue(record, image) },
+    { key: "local-edit", label: "局部编辑", icon: <ToolbarActionIcon src={generationLocalEditIcon} />, onSelect: () => onLocalEdit(image) },
+    { key: "regenerate", label: "重新生成", icon: <ToolbarActionIcon src={generationRegenerateIcon} />, onSelect: () => void onRegenerate(record) },
+    { key: "copy", label: "复制提示词", icon: <ToolbarActionIcon src={generationCopyIcon} />, onSelect: () => onCopyPrompt(prompt) },
+    { key: "download", label: "下载这张图片", icon: <ToolbarActionIcon src={generationDownloadIcon} />, href: `/api/images/${image.id}/download?raw=1&download=1` },
+    {
+      key: "delete",
+      label: "删除这次生成",
+      icon: <ToolbarActionIcon src={referenceDeleteIcon} />,
+      onSelect: () => onDelete(record),
+      confirm: {
+        title: "删除这次生成？",
+        description: "会删除这次生成的图片、参考图、遮罩和生成使用的提示词记录。此操作不能撤销。",
+        confirmLabel: "删除",
+      },
+    },
+  ];
+}
+
+export function HoverImageActionBar({
+  actions,
+  maxInlineActions,
+  onMoreOpenChange,
+}: {
+  actions: HoverImageAction[];
+  maxInlineActions: number;
+  onMoreOpenChange?: (open: boolean) => void;
+}) {
+  const inlineActions = actions.slice(0, maxInlineActions);
+  const overflowActions = actions.slice(maxInlineActions);
+  const moreTriggerRef = useRef<HTMLButtonElement | null>(null);
+
+  function handleMoreOpenChange(open: boolean) {
+    onMoreOpenChange?.(open);
+    if (!open && moreTriggerRef.current && document.activeElement === moreTriggerRef.current) {
+      moreTriggerRef.current.blur();
+    }
+  }
+
+  return (
+    <TooltipProvider delay={120}>
+      <Group className="pointer-events-auto rounded-[16px] border border-white/[0.08] bg-[#121212] p-0.5 shadow-[0_18px_40px_rgb(0_0_0/0.46)]">
+        {inlineActions.map((action) => (
+          <ActionGroupEntry key={action.key} action={action} />
+        ))}
+        {overflowActions.length > 0 && (
+          <Tooltip>
+            <Menu onOpenChange={handleMoreOpenChange}>
+              <TooltipTrigger
+                render={
+                  <MenuTrigger
+                    ref={moreTriggerRef}
+                    aria-label="更多操作"
+                    className="ohm-smooth-control inline-flex size-8 shrink-0 items-center justify-center rounded-[12px] border border-transparent bg-transparent text-white/72 outline-none transition hover:bg-white/[0.08] hover:text-white data-[popup-open]:bg-white/[0.08] data-[popup-open]:text-white"
+                  >
+                    <IconCircleDotsCenter2 ariaHidden size={16} />
+                  </MenuTrigger>
+                }
+              />
+              <MenuPopup className="border-white/[0.08] bg-[#121212] shadow-[0_18px_44px_rgb(0_0_0/0.46)]">
+                <MenuGroup>
+                  {overflowActions.map((action) => (
+                    <OverflowMenuItem key={action.key} action={action} />
+                  ))}
+                </MenuGroup>
+              </MenuPopup>
+            </Menu>
+            <TooltipContent side="top">更多操作</TooltipContent>
+          </Tooltip>
+        )}
+      </Group>
+    </TooltipProvider>
+  );
+}
+
+function ActionGroupEntry({ action }: { action: HoverImageAction }) {
+  return (
+    <HoverActionButton action={action} />
+  );
+}
+
+function HoverActionButton({ action }: { action: HoverImageAction }) {
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const commonClassName =
+    "ohm-smooth-control inline-flex size-8 shrink-0 items-center justify-center rounded-[12px] border border-transparent bg-transparent text-white/72 transition hover:bg-white/[0.08] hover:text-white focus-visible:ring-2 focus-visible:ring-white/20";
+
+  if (action.href) {
+    return (
+      <Tooltip>
+        <TooltipTrigger render={<a aria-label={action.label} className={commonClassName} href={action.href}>{action.icon}</a>} />
+        <TooltipContent side="top">{action.label}</TooltipContent>
+      </Tooltip>
+    );
+  }
+
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <CossButton
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label={action.label}
+              className={commonClassName}
+              onClick={action.confirm ? () => setConfirmOpen(true) : action.onSelect}
+            >
+              {action.icon}
+            </CossButton>
+          }
+        />
+        <TooltipContent side="top">{action.label}</TooltipContent>
+      </Tooltip>
+      {action.confirm && (
+        <ConfirmImageActionDialog
+          action={action}
+          open={confirmOpen}
+          onOpenChange={setConfirmOpen}
+        />
+      )}
+    </>
+  );
+}
+
+function OverflowMenuItem({ action }: { action: HoverImageAction }) {
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  if (action.href) {
+    return (
+      <MenuItem
+        className="text-white/90 data-[highlighted]:bg-white/[0.08]"
+        render={
+          <a href={action.href} />
+        }
+      >
+        <span className="grid size-4 shrink-0 place-items-center text-white/80">{action.icon}</span>
+        <span>{action.label}</span>
+      </MenuItem>
+    );
+  }
+
+  return (
+    <>
+      <MenuItem
+        closeOnClick
+        onClick={action.confirm ? () => setConfirmOpen(true) : action.onSelect}
+        variant={action.confirm ? "destructive" : "default"}
+        className={!action.confirm ? "text-white/90 data-[highlighted]:bg-white/[0.08]" : undefined}
+      >
+        <span className="grid size-4 shrink-0 place-items-center text-white/80">{action.icon}</span>
+        <span>{action.label}</span>
+      </MenuItem>
+      {action.confirm && (
+        <ConfirmImageActionDialog
+          action={action}
+          open={confirmOpen}
+          onOpenChange={setConfirmOpen}
+        />
+      )}
+    </>
+  );
+}
+
+function ConfirmImageActionDialog({
+  action,
+  open,
+  onOpenChange,
+}: {
+  action: HoverImageAction;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  if (!action.confirm) return null;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogPopup className="max-w-[420px] rounded-[20px] bg-[#121212]">
+        <DialogHeader className="border-b-0 pb-2">
+          <div className="grid size-10 shrink-0 place-items-center rounded-[14px] border border-[#ff6b6b]/18 bg-[#ff4f4f]/10 text-[#ffb3b3]">
+            {action.icon}
+          </div>
+          <div className="min-w-0 flex-1">
+            <DialogTitle className="text-base font-medium leading-6 text-white">{action.confirm.title}</DialogTitle>
+            <DialogDescription className="mt-1 text-sm leading-5 text-white/52">{action.confirm.description}</DialogDescription>
+          </div>
+        </DialogHeader>
+        <DialogPanel className="hidden p-0" />
+        <DialogFooter className="border-t-0 pt-2">
+          <CossButton type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+            取消
+          </CossButton>
+          <CossButton
+            type="button"
+            variant="destructive"
+            onClick={() => {
+              onOpenChange(false);
+              action.onSelect?.();
+            }}
+          >
+            {action.confirm.confirmLabel}
+          </CossButton>
+        </DialogFooter>
+      </DialogPopup>
+    </Dialog>
   );
 }
 
@@ -885,10 +1486,12 @@ function LoadingStatusText() {
   return (
     <span className="ohm-loading-status" aria-label="正在生成图片">
       <span className="sr-only">正在生成图片</span>
-      <span className="ohm-loading-status-track" aria-hidden="true">
-        <span className="ohm-loading-status-line">正在生成图片</span>
-        <span className="ohm-loading-status-line">正在排队处理</span>
-        <span className="ohm-loading-status-line">正在渲染细节</span>
+      <span className="ohm-loading-status-track" aria-hidden="true" style={{ animationDuration: `${loadingStatusAnimationDurationMs}ms` }}>
+        {loadingStatusLoopLines.map((line, index) => (
+          <span key={`${line}-${index}`} className="ohm-loading-status-line">
+            {line}
+          </span>
+        ))}
       </span>
     </span>
   );
@@ -920,6 +1523,26 @@ function PendingStage() {
   );
 }
 
+function useDismissiblePopup(rootRef: RefObject<HTMLElement>, open: boolean, onDismiss: () => void) {
+  useEffect(() => {
+    if (!open) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+        onDismiss();
+      }
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onDismiss();
+    }
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open, onDismiss, rootRef]);
+}
+
 function ComposerChoiceMenu({
   label,
   icon,
@@ -937,58 +1560,42 @@ function ComposerChoiceMenu({
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    function handlePointerDown(event: PointerEvent) {
-      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
-        setOpen(false);
-      }
-    }
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") setOpen(false);
-    }
-    window.addEventListener("pointerdown", handlePointerDown);
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.removeEventListener("pointerdown", handlePointerDown);
-      window.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [open]);
+  useDismissiblePopup(rootRef, open, () => setOpen(false));
 
   const selected = options.find((option) => option.value === value) ?? options[0];
 
   return (
     <div ref={rootRef} className="relative shrink-0">
-      <button
-        type="button"
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        aria-label={label}
-        disabled={disabled}
-        className={cn(
-          "ohm-smooth-control inline-flex h-8 max-w-full items-center gap-1 border border-transparent bg-white/10 pl-3 pr-2 text-sm leading-[22px] text-white",
-          disabled ? "cursor-default opacity-100" : "hover:bg-white/12",
-        )}
-        onClick={() => {
-          if (!disabled) setOpen((current) => !current);
-        }}
-      >
-        {icon && <span className="grid size-4 shrink-0 place-items-center text-white/90">{icon}</span>}
-        <span className="whitespace-nowrap">{selected.label}</span>
-        <IconChevronDownSmall ariaHidden size={20} className={cn("shrink-0 text-white/60 transition-transform", open && "rotate-180")} />
-      </button>
+          <CossButton
+            type="button"
+            aria-haspopup="listbox"
+            aria-expanded={open}
+            aria-label={label}
+            disabled={disabled}
+            className={cn(
+              "ohm-smooth-control inline-flex h-8 max-w-full items-center gap-1 border border-transparent bg-white/10 pl-3 pr-2 text-sm leading-[22px] text-white shadow-none",
+              disabled ? "cursor-default opacity-100" : "hover:bg-white/12",
+            )}
+            onClick={() => {
+              if (!disabled) setOpen((current) => !current);
+            }}
+          >
+            {icon && <span className="grid size-4 shrink-0 place-items-center text-white/90">{icon}</span>}
+            <span className="whitespace-nowrap">{selected.label}</span>
+            <IconChevronDownSmall ariaHidden size={20} className={cn("shrink-0 text-white/60 transition-transform", open && "rotate-180")} />
+          </CossButton>
       {open && (
-        <div className="absolute left-0 top-[calc(100%+8px)] z-30 w-max min-w-full overflow-hidden rounded-[10px] border border-white/15 bg-[#232323] p-1 shadow-[0_12px_32px_rgb(0_0_0/0.32)]">
+        <div className="absolute left-0 top-[calc(100%+8px)] z-30 w-max min-w-full overflow-hidden rounded-[10px] border border-white/15 bg-[#121212] p-1 shadow-[0_12px_32px_rgb(0_0_0/0.32)]">
           <div role="listbox" aria-label={label} className="flex w-max min-w-full flex-col gap-1">
             {options.map((option) => (
-              <button
+              <CossButton
                 key={option.value}
                 type="button"
+                variant="ghost"
                 role="option"
                 aria-selected={option.value === selected.value}
                 className={cn(
-                  "rounded-[8px] px-3 py-1.5 text-left text-sm leading-[22px] text-white/78 transition hover:bg-white/10 hover:text-white",
+                  "h-auto rounded-[8px] border-0 px-3 py-1.5 text-left text-sm leading-[22px] text-white/78 transition hover:bg-white/10 hover:text-white",
                   option.value === selected.value && "bg-white/10 text-white",
                 )}
                 onClick={() => {
@@ -997,7 +1604,7 @@ function ComposerChoiceMenu({
                 }}
               >
                 {option.label}
-              </button>
+              </CossButton>
             ))}
           </div>
         </div>
@@ -1020,33 +1627,17 @@ function ComposerGenerationSettingsMenu({
   const quantities = Array.from({ length: Math.min(maxImagesPerRequest, 4) }, (_, index) => index + 1);
   const summary = formatGenerationSettingsSummary(form);
   const summaryParts = generationSettingsSummaryParts(form);
-
-  useEffect(() => {
-    if (!open) return;
-    function handlePointerDown(event: PointerEvent) {
-      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
-        setOpen(false);
-      }
-    }
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") setOpen(false);
-    }
-    window.addEventListener("pointerdown", handlePointerDown);
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.removeEventListener("pointerdown", handlePointerDown);
-      window.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [open]);
+  useDismissiblePopup(rootRef, open, () => setOpen(false));
 
   return (
     <div ref={rootRef} className="relative min-w-0 shrink">
-      <button
+      <CossButton
         type="button"
+        variant="secondary"
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-label={`生成参数：${summary}`}
-        className="ohm-smooth-control inline-flex h-8 max-w-[360px] items-center gap-1 border border-transparent bg-white/10 pl-3 pr-2 text-sm font-normal leading-[22px] text-white hover:bg-white/12"
+        className="ohm-smooth-control inline-flex h-8 max-w-[360px] items-center gap-1 border border-transparent bg-white/10 pl-3 pr-2 text-sm font-normal leading-[22px] text-white shadow-none hover:bg-white/12"
         onClick={() => setOpen((current) => !current)}
       >
         <ComposerQualityIcon className="size-4 shrink-0 text-white/90" />
@@ -1059,9 +1650,9 @@ function ComposerGenerationSettingsMenu({
           ))}
         </span>
         <IconChevronDownSmall ariaHidden size={20} className={cn("shrink-0 text-white/60 transition-transform", open && "rotate-180")} />
-      </button>
+      </CossButton>
       {open && (
-        <div className="absolute bottom-[calc(100%+8px)] left-0 z-40 w-[480px] rounded-[18px] border border-white/15 bg-[#232323] p-4 shadow-[0_18px_48px_rgb(0_0_0/0.38)]">
+        <div className="absolute bottom-[calc(100%+8px)] left-0 z-40 w-[480px] rounded-[18px] border border-white/15 bg-[#121212] p-4 shadow-[0_18px_48px_rgb(0_0_0/0.38)]">
           <div className="flex flex-col gap-6">
             <div>
               <SettingsOptionTabs
@@ -1182,6 +1773,7 @@ function SizeInput({ ariaLabel, value, onChange }: { ariaLabel: string; value: n
 
 function ComposerPanel({
   formRef,
+  layoutMode,
   form,
   config,
   loading,
@@ -1189,6 +1781,8 @@ function ComposerPanel({
   providerConfigured,
   referenceImages,
   sourceImagePreview,
+  referenceMask,
+  localEditPreviewUrl,
   textareaRef,
   referenceInputRef,
   onSubmit,
@@ -1203,6 +1797,7 @@ function ComposerPanel({
   onTurnstileToken,
 }: {
   formRef: RefObject<HTMLFormElement>;
+  layoutMode: ComposerLayoutMode;
   form: GenerateForm;
   config: AppConfig;
   loading: boolean;
@@ -1210,6 +1805,8 @@ function ComposerPanel({
   providerConfigured: boolean;
   referenceImages: ReferenceImagePreview[];
   sourceImagePreview: SourceImagePreview | null;
+  referenceMask: ImageSelectionMask | null;
+  localEditPreviewUrl: string | null;
   textareaRef: RefObject<HTMLTextAreaElement>;
   referenceInputRef: RefObject<HTMLInputElement>;
   onSubmit: (event: FormEvent) => void;
@@ -1231,35 +1828,54 @@ function ComposerPanel({
   return (
     <form
       ref={formRef}
-      className="ohm-smooth-panel ohm-composer-panel absolute bottom-6 left-1/2 flex min-h-[170px] w-[840px] -translate-x-1/2 flex-col items-start gap-4 overflow-visible border p-[15px]"
+      data-composer-layout-mode={layoutMode}
+      className={cn(
+        "ohm-smooth-panel ohm-composer-panel absolute left-1/2 flex min-h-[170px] w-[min(840px,calc(100vw-32px))] max-w-[calc(100vw-32px)] -translate-x-1/2 flex-col items-start gap-4 overflow-visible border p-4",
+        layoutMode === "conversation" ? "bottom-6" : "",
+      )}
+      style={layoutMode === "empty-first-message" ? { top: `${emptyFirstComposerTopPercent}%` } : undefined}
       onSubmit={onSubmit}
     >
+      {layoutMode === "empty-first-message" && (
+        <p
+          className="pointer-events-none absolute left-1/2 whitespace-nowrap text-center text-[28px] font-medium leading-none tracking-[-0.04em] text-white/90 -translate-x-1/2"
+          style={{ bottom: `calc(100% + ${emptyStateCopyToComposerGapPx}px)` }}
+        >
+          让我们一起创造点什么······
+        </p>
+      )}
       <input ref={referenceInputRef} type="file" accept="image/png,image/jpeg,image/webp" multiple className="hidden" onChange={onReferenceInput} />
       <div className="flex min-h-8 w-full flex-wrap items-center gap-x-2 gap-y-2">
         {sourceImagePreview && (
-          <span className="ohm-smooth-control inline-flex h-8 shrink-0 items-center gap-2 overflow-hidden border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white">
+          <span className="ohm-smooth-control inline-flex h-8 min-w-0 max-w-full shrink items-center gap-2 overflow-hidden border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white">
             <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[5px] border border-transparent bg-white/10">
-              <img src={sourceImagePreview.url} alt={sourceImagePreview.name} className="size-full object-cover" />
+              <img src={localEditPreviewUrl ?? sourceImagePreview.url} alt={sourceImagePreview.name} loading="lazy" decoding="async" className="size-full object-cover" />
             </span>
-            <span className="whitespace-nowrap">{sourceImagePreview.name}</span>
-            <button type="button" aria-label="移除继续创作参考图" className="grid size-4 shrink-0 place-items-center text-white/72 hover:text-white" onClick={onRemoveSourceReference}>
+            <span className="min-w-0 truncate whitespace-nowrap">{sourceImagePreview.name}</span>
+            <CossButton type="button" variant="ghost" size="icon-xs" aria-label={`移除${sourceImagePreview.name}`} className="grid size-4 shrink-0 place-items-center border-0 p-0 text-white/72 hover:bg-transparent hover:text-white" onClick={onRemoveSourceReference}>
               <img aria-hidden="true" src={referenceDeleteIcon} alt="" className="size-4" draggable={false} />
-            </button>
+            </CossButton>
           </span>
         )}
         {referenceImages.map((image, index) => (
-          <span key={image.url} className="ohm-smooth-control inline-flex h-8 shrink-0 items-center gap-2 overflow-hidden border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white">
+          <span key={image.url} className="ohm-smooth-control inline-flex h-8 min-w-0 max-w-full shrink items-center gap-2 overflow-hidden border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white">
             <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[5px] border border-transparent bg-white/10">
-              <img src={image.url} alt={image.name} className="size-full object-cover" />
+              <img src={image.url} alt={image.name} loading="lazy" decoding="async" className="size-full object-cover" />
             </span>
-            <span className="whitespace-nowrap">参考图 {index + 1}</span>
-            <button type="button" aria-label={`移除参考图 ${index + 1}`} className="grid size-4 shrink-0 place-items-center text-white/72 hover:text-white" onClick={() => onRemoveReference(index)}>
+            <span className="min-w-0 truncate whitespace-nowrap">参考图 {index + 1}</span>
+            <CossButton type="button" variant="ghost" size="icon-xs" aria-label={`移除参考图 ${index + 1}`} className="grid size-4 shrink-0 place-items-center border-0 p-0 text-white/72 hover:bg-transparent hover:text-white" onClick={() => onRemoveReference(index)}>
               <img aria-hidden="true" src={referenceDeleteIcon} alt="" className="size-4" draggable={false} />
-            </button>
+            </CossButton>
           </span>
         ))}
         {referenceCount < maxReferenceImages && (
-          <CossButton type="button" variant="outline" size="sm" className="h-8 gap-1 border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white hover:bg-white/12" onClick={onPickReference}>
+          <CossButton
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 min-w-[114px] justify-center gap-2 border-transparent bg-white/10 px-3 py-1 text-sm font-normal leading-[22px] text-white hover:bg-white/12"
+            onClick={onPickReference}
+          >
             <ComposerReferenceIcon className="size-4 shrink-0 text-white/90" />
             参考图
           </CossButton>
@@ -1268,16 +1884,19 @@ function ComposerPanel({
           <span className="text-xs leading-5 text-white/30">最多 {maxReferenceImages} 张</span>
         )}
       </div>
-      <CossTextarea
-        ref={textareaRef}
-        value={form.prompt}
-        required
-        rows={composerTextareaMinRows}
-        placeholder="可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等"
-        className="ohm-textarea-scrollbar h-[42px] max-h-[252px] min-h-[42px] overflow-y-auto p-0 leading-[21px] text-white/90 placeholder:text-white/30"
-        onChange={(event) => onUpdate("prompt", event.target.value)}
-        onPaste={onPromptPaste}
-      />
+      <div className="relative w-full">
+        <CossTextarea
+          ref={textareaRef}
+          aria-label="提示词"
+          value={form.prompt}
+          required
+          rows={composerTextareaMinRows}
+          placeholder={composerPromptPlaceholderText}
+          className={composerPromptTextareaClassName}
+          onChange={(event) => onUpdate("prompt", event.target.value)}
+          onPaste={onPromptPaste}
+        />
+      </div>
       <div className="flex w-full items-center justify-between gap-20">
         <div className="flex min-w-0 items-center gap-2">
           <CossButton type="button" variant="outline" size="sm" loading={optimizing} className="h-8 w-[114px] gap-1 border-transparent bg-white/10 px-3 py-1 text-sm font-normal leading-[22px] text-white hover:bg-white/12" onClick={onOptimize}>
@@ -1303,7 +1922,7 @@ function ComposerPanel({
             type="submit"
             loading={loading}
             disabled={submitDisabled}
-            className="h-8 min-w-16 border-transparent bg-white/90 text-black hover:bg-white disabled:opacity-100 disabled:bg-white/20 disabled:text-white/40 disabled:hover:bg-white/20"
+            className="h-8 min-w-16 border-transparent bg-white/90 text-black shadow-none hover:bg-white disabled:opacity-100 disabled:bg-white/20 disabled:text-white/40 disabled:hover:bg-white/20 disabled:shadow-none"
           >
             生图
           </CossButton>
@@ -1319,13 +1938,249 @@ function uniqueModelOptions(options: string[] | undefined, configuredModel: stri
 }
 
 function ImagePreview({ image, onClose }: { image: PreviewImage; onClose: () => void }) {
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/72 p-8" role="dialog" aria-modal="true" aria-label="图片预览">
-      <button type="button" aria-label="关闭预览" className="absolute right-6 top-6 grid size-9 place-items-center rounded-full bg-white/10 text-white/80" onClick={onClose}>
-        <IconCrossSmall ariaHidden size={20} />
-      </button>
-      <img src={image.url} alt={image.prompt ?? "生成图片"} className="ohm-smooth-card max-h-[calc(100dvh-64px)] max-w-[calc(100vw-64px)] object-contain" />
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-black/72 p-8 backdrop-blur-md"
+      role="dialog"
+      aria-modal="true"
+      aria-label="图片预览"
+      onClick={onClose}
+    >
+      <div className="relative flex max-h-[calc(100dvh-64px)] max-w-[calc(100vw-64px)] items-center justify-center" onClick={(event) => event.stopPropagation()}>
+        <img src={image.url} alt="" aria-hidden="true" decoding="async" className="pointer-events-none absolute inset-0 h-full w-full scale-110 object-contain opacity-32 blur-3xl" />
+        {image.actions && image.actions.length > 0 && (
+          <div className={imagePreviewToolbarPositionClassName}>
+            <HoverImageActionBar actions={image.actions} maxInlineActions={image.actions.length} />
+          </div>
+        )}
+        <CossButton
+          type="button"
+          variant="ghost"
+          size="icon"
+          aria-label="关闭预览"
+          className="absolute right-4 top-4 z-10 grid size-9 place-items-center rounded-full border-0 bg-white/10 text-white/80 transition hover:bg-white/16 hover:text-white"
+          onClick={onClose}
+        >
+          <IconCrossSmall ariaHidden size={20} />
+        </CossButton>
+      <img
+          src={image.url}
+          alt={image.prompt ?? "生成图片"}
+          className="ohm-smooth-card relative max-h-[calc(100dvh-64px)] max-w-[calc(100vw-64px)] rounded-[24px] border border-white/10 bg-white/[0.04] object-contain shadow-[0_24px_90px_rgb(0_0_0/0.52)]"
+        />
+      </div>
     </div>
+  );
+}
+
+function LocalEditDialog({
+  image,
+  open,
+  onOpenChange,
+  onConfirm,
+}: {
+  image: ImageItem | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onConfirm: (image: ImageItem, strokes: ImageSelectionStroke[]) => Promise<void>;
+}) {
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const selectionCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const activeSelectionStrokeRef = useRef<ImageSelectionStroke | null>(null);
+  const [selectionStrokes, setSelectionStrokes] = useState<ImageSelectionStroke[]>([]);
+  const [redoSelectionStrokes, setRedoSelectionStrokes] = useState<ImageSelectionStroke[]>([]);
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setSelectionStrokes([]);
+    setRedoSelectionStrokes([]);
+    activeSelectionStrokeRef.current = null;
+    setError("");
+    setSubmitting(false);
+  }, [image?.id, open]);
+
+  useEffect(() => {
+    if (!open || !image || !stageRef.current) return;
+    const redraw = () => drawImageSelectionCanvas(selectionCanvasRef.current, stageRef.current, image, selectionStrokes);
+    redraw();
+    const observer = new ResizeObserver(redraw);
+    observer.observe(stageRef.current);
+    return () => observer.disconnect();
+  }, [image, open, selectionStrokes]);
+
+  function startSelectionStroke(event: ReactPointerEvent<HTMLCanvasElement>) {
+    if (!image) return;
+    const point = imageSelectionPointFromEvent(event, stageRef.current, image);
+    if (!point) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const stroke: ImageSelectionStroke = {
+      brushRatio: imageSelectionBrushRatio,
+      points: [point],
+    };
+    activeSelectionStrokeRef.current = stroke;
+    setRedoSelectionStrokes([]);
+    setSelectionStrokes((current) => [...current, stroke]);
+    setError("");
+  }
+
+  function moveSelectionStroke(event: ReactPointerEvent<HTMLCanvasElement>) {
+    const activeStroke = activeSelectionStrokeRef.current;
+    if (!image || !activeStroke) return;
+    const point = imageSelectionPointFromEvent(event, stageRef.current, image);
+    if (!point) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const previous = activeStroke.points[activeStroke.points.length - 1];
+    if (previous && Math.hypot(point.x - previous.x, point.y - previous.y) < 0.003) return;
+    const nextStroke = { ...activeStroke, points: [...activeStroke.points, point] };
+    activeSelectionStrokeRef.current = nextStroke;
+    setSelectionStrokes((current) => [...current.slice(0, -1), nextStroke]);
+  }
+
+  function endSelectionStroke(event: ReactPointerEvent<HTMLCanvasElement>) {
+    if (!activeSelectionStrokeRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    activeSelectionStrokeRef.current = null;
+  }
+
+  function undoSelectionStroke() {
+    setSelectionStrokes((current) => {
+      const removed = current[current.length - 1];
+      if (removed) setRedoSelectionStrokes((redoCurrent) => [removed, ...redoCurrent]);
+      return current.slice(0, -1);
+    });
+  }
+
+  function redoSelectionStroke() {
+    setRedoSelectionStrokes((current) => {
+      const [restored, ...nextRedo] = current;
+      if (restored) setSelectionStrokes((strokes) => [...strokes, restored]);
+      return nextRedo;
+    });
+  }
+
+  async function confirmSelection() {
+    if (!image) return;
+    if (selectionStrokes.length === 0) {
+      setError("先在图片上涂抹需要局部重绘的区域。");
+      return;
+    }
+    setSubmitting(true);
+    setError("");
+    try {
+      await onConfirm(image, selectionStrokes);
+      onOpenChange(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "局部重绘参考图生成失败。");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogPopup showCloseButton className="max-w-[1040px] bg-[#121212]">
+        <DialogHeader>
+          <div className="min-w-0">
+            <DialogTitle className="text-lg font-semibold leading-6 text-white">局部编辑</DialogTitle>
+            <DialogDescription className="mt-1 text-sm leading-6 text-white/56">
+              在图片上直接涂抹需要重绘的区域，确认后会以“局部重绘”带回输入框。
+            </DialogDescription>
+          </div>
+        </DialogHeader>
+        <DialogPanel className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_248px]">
+          <div className="min-w-0">
+            <div
+              ref={stageRef}
+              className="relative flex h-[min(62vh,680px)] min-h-[360px] items-center justify-center overflow-hidden rounded-[20px] border border-white/[0.08] bg-[#171717]"
+            >
+              {image && (
+                <>
+                  <img src={image.url} alt={image.prompt ?? "局部编辑图片"} decoding="async" className="pointer-events-none absolute inset-0 h-full w-full select-none object-contain" draggable={false} />
+                  <canvas
+                    ref={selectionCanvasRef}
+                    className="absolute inset-0 h-full w-full cursor-crosshair touch-none"
+                    onPointerDown={startSelectionStroke}
+                    onPointerMove={moveSelectionStroke}
+                    onPointerUp={endSelectionStroke}
+                    onPointerCancel={endSelectionStroke}
+                    onPointerLeave={endSelectionStroke}
+                  />
+                </>
+              )}
+            </div>
+          </div>
+          <div className="flex min-h-0 flex-col gap-3">
+            <div className="rounded-[18px] border border-white/[0.08] bg-white/[0.03] p-4">
+              <div className="text-sm font-medium leading-6 text-white">操作说明</div>
+              <div className="mt-2 space-y-1 text-sm leading-6 text-white/56">
+                <p>直接在图片上涂抹要重绘的区域。</p>
+                <p>绿色覆盖区域会被当成局部重绘蒙版。</p>
+                <p>确认后会自动带回主输入框。</p>
+              </div>
+            </div>
+            <div className="rounded-[18px] border border-white/[0.08] bg-white/[0.03] p-4">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm font-medium leading-6 text-white">当前状态</span>
+                <span className="rounded-[999px] bg-white/[0.08] px-2 py-1 text-xs leading-none text-white/60">
+                  {selectionStrokes.length} 个选区笔画
+                </span>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <CossButton variant="outline" size="sm" disabled={selectionStrokes.length === 0} className="h-8 border-white/[0.08] bg-white/[0.06] text-white/88 hover:bg-white/[0.1]" onClick={undoSelectionStroke}>
+                  <Undo2 className="size-4" />
+                  上一步
+                </CossButton>
+                <CossButton variant="outline" size="sm" disabled={redoSelectionStrokes.length === 0} className="h-8 border-white/[0.08] bg-white/[0.06] text-white/88 hover:bg-white/[0.1]" onClick={redoSelectionStroke}>
+                  <Redo2 className="size-4" />
+                  下一步
+                </CossButton>
+                <CossButton
+                  variant="ghost"
+                  size="sm"
+                  disabled={selectionStrokes.length === 0}
+                  className="h-8 bg-transparent text-white/64 hover:bg-white/[0.08] hover:text-white"
+                  onClick={() => {
+                    activeSelectionStrokeRef.current = null;
+                    setSelectionStrokes([]);
+                    setRedoSelectionStrokes([]);
+                    setError("");
+                  }}
+                >
+                  清空
+                </CossButton>
+              </div>
+              {error && <p className="mt-3 text-sm leading-6 text-[#ffb4b4]">{error}</p>}
+            </div>
+          </div>
+        </DialogPanel>
+        <DialogFooter>
+          <CossButton variant="ghost" className="h-9 px-4 text-white/72 hover:bg-white/[0.08] hover:text-white" onClick={() => onOpenChange(false)}>
+            取消
+          </CossButton>
+          <CossButton variant="default" loading={submitting} className="h-9 px-4" onClick={() => void confirmSelection()}>
+            带入输入框
+          </CossButton>
+        </DialogFooter>
+      </DialogPopup>
+    </Dialog>
   );
 }
 
@@ -1355,14 +2210,199 @@ function sizeForRatioResolution(ratio: string, resolution: string): [number, num
   return [Math.round((baseWidth * scale) / 16) * 16, Math.round((baseHeight * scale) / 16) * 16];
 }
 
-function generationRequestBody(form: GenerateForm, referenceImages: ReferenceImagePreview[], sourceImageId?: string, turnstileToken = ""): BodyInit {
-  if (referenceImages.length === 0) return JSON.stringify({ ...form, turnstileToken, ...(sourceImageId ? { sourceImageId } : {}) });
+export function generationRequestBody(
+  form: GenerateForm,
+  referenceImages: ReferenceImagePreview[],
+  sourceImageId?: string,
+  turnstileToken = "",
+  maskImage?: ImageSelectionMask | null,
+  conversationId?: string,
+): BodyInit {
+  if (referenceImages.length === 0 && !maskImage) {
+    return JSON.stringify({
+      ...form,
+      turnstileToken,
+      ...(sourceImageId ? { sourceImageId } : {}),
+      ...(conversationId ? { conversationId } : {}),
+    });
+  }
   const body = new FormData();
   Object.entries(form).forEach(([key, value]) => body.set(key, String(value)));
   if (turnstileToken) body.set("turnstileToken", turnstileToken);
   if (sourceImageId) body.set("sourceImageId", sourceImageId);
+  if (conversationId) body.set("conversationId", conversationId);
   referenceImages.slice(0, maxReferenceImages).forEach((image) => body.append("referenceImage", image.file, image.name));
+  if (maskImage) body.set("maskImage", maskImage.file, maskImage.name);
   return body;
+}
+
+function imageContainRect(containerWidth: number, containerHeight: number, imageWidth: number, imageHeight: number) {
+  const ratio = imageWidth > 0 && imageHeight > 0 ? imageWidth / imageHeight : 1;
+  const containerRatio = containerWidth / containerHeight;
+  const width = containerRatio > ratio ? containerHeight * ratio : containerWidth;
+  const height = containerRatio > ratio ? containerHeight : containerWidth / ratio;
+  return {
+    x: (containerWidth - width) / 2,
+    y: (containerHeight - height) / 2,
+    width,
+    height,
+  };
+}
+
+function imageSelectionPointFromEvent(
+  event: ReactPointerEvent<HTMLCanvasElement>,
+  stage: HTMLDivElement | null,
+  image: ImageItem,
+): ImageSelectionPoint | null {
+  if (!stage) return null;
+  const bounds = stage.getBoundingClientRect();
+  const imageRect = imageContainRect(bounds.width, bounds.height, image.width, image.height);
+  const x = event.clientX - bounds.left - imageRect.x;
+  const y = event.clientY - bounds.top - imageRect.y;
+  if (x < 0 || y < 0 || x > imageRect.width || y > imageRect.height) return null;
+  return {
+    x: clampNumber(x / imageRect.width, 0, 1),
+    y: clampNumber(y / imageRect.height, 0, 1),
+  };
+}
+
+function drawImageSelectionCanvas(
+  canvas: HTMLCanvasElement | null,
+  stage: HTMLDivElement | null,
+  image: ImageItem,
+  strokes: ImageSelectionStroke[],
+): void {
+  if (!canvas || !stage) return;
+  const bounds = stage.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(bounds.width));
+  const height = Math.max(1, Math.round(bounds.height));
+  if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+  }
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  context.clearRect(0, 0, width, height);
+
+  const imageRect = imageContainRect(width, height, image.width, image.height);
+  context.save();
+  context.beginPath();
+  context.rect(imageRect.x, imageRect.y, imageRect.width, imageRect.height);
+  context.clip();
+  context.strokeStyle = "rgba(110, 255, 48, 0.78)";
+  context.fillStyle = "rgba(110, 255, 48, 0.78)";
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  for (const stroke of strokes) {
+    drawSelectionStroke(context, stroke, imageRect);
+  }
+  context.restore();
+}
+
+function drawSelectionStroke(
+  context: CanvasRenderingContext2D,
+  stroke: ImageSelectionStroke,
+  imageRect: { x: number; y: number; width: number; height: number },
+): void {
+  if (stroke.points.length === 0) return;
+  const lineWidth = Math.max(8, stroke.brushRatio * Math.min(imageRect.width, imageRect.height));
+  context.lineWidth = lineWidth;
+  const first = stroke.points[0];
+  if (stroke.points.length === 1) {
+    context.beginPath();
+    context.arc(imageRect.x + first.x * imageRect.width, imageRect.y + first.y * imageRect.height, lineWidth / 2, 0, Math.PI * 2);
+    context.fill();
+    return;
+  }
+  context.beginPath();
+  context.moveTo(imageRect.x + first.x * imageRect.width, imageRect.y + first.y * imageRect.height);
+  for (const point of stroke.points.slice(1)) {
+    context.lineTo(imageRect.x + point.x * imageRect.width, imageRect.y + point.y * imageRect.height);
+  }
+  context.stroke();
+}
+
+async function createSelectionMask(
+  image: Pick<ImageItem, "id" | "width" | "height">,
+  strokes: ImageSelectionStroke[],
+): Promise<Pick<ImageSelectionMask, "file" | "name">> {
+  if (!image.width || !image.height) throw new Error("图片尺寸无效，无法生成局部重绘遮罩。");
+  const canvas = document.createElement("canvas");
+  canvas.width = image.width;
+  canvas.height = image.height;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("浏览器不支持局部重绘遮罩生成。");
+
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.globalCompositeOperation = "destination-out";
+  context.strokeStyle = "#000";
+  context.fillStyle = "#000";
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  for (const stroke of strokes) {
+    drawSelectionStroke(context, stroke, { x: 0, y: 0, width: canvas.width, height: canvas.height });
+  }
+
+  const blob = await canvasToBlob(canvas, "image/png");
+  const name = `${image.id}-mask.png`;
+  return {
+    file: new File([blob], name, { type: "image/png" }),
+    name,
+  };
+}
+
+async function buildLocalEditPreviewUrl(sourceUrl: string, maskUrl: string): Promise<string> {
+  const [sourceImage, maskImage] = await Promise.all([loadPreviewImage(sourceUrl), loadPreviewImage(maskUrl)]);
+  const canvas = document.createElement("canvas");
+  canvas.width = sourceImage.naturalWidth || sourceImage.width;
+  canvas.height = sourceImage.naturalHeight || sourceImage.height;
+  const context = canvas.getContext("2d");
+  if (!context || !canvas.width || !canvas.height) return sourceUrl;
+
+  context.drawImage(sourceImage, 0, 0, canvas.width, canvas.height);
+
+  const overlayCanvas = document.createElement("canvas");
+  overlayCanvas.width = canvas.width;
+  overlayCanvas.height = canvas.height;
+  const overlayContext = overlayCanvas.getContext("2d");
+  if (!overlayContext) return sourceUrl;
+
+  overlayContext.fillStyle = "rgba(110, 255, 48, 0.42)";
+  overlayContext.fillRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+  overlayContext.globalCompositeOperation = "destination-out";
+  overlayContext.drawImage(maskImage, 0, 0, overlayCanvas.width, overlayCanvas.height);
+
+  context.drawImage(overlayCanvas, 0, 0, canvas.width, canvas.height);
+  const blob = await canvasToBlob(canvas, "image/png");
+  return URL.createObjectURL(blob);
+}
+
+function loadPreviewImage(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error(`图片加载失败: ${url}`));
+    image.src = url;
+  });
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("局部重绘遮罩生成失败。"));
+    }, type, quality);
+  });
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 function buildFlowChips(flow: ReturnType<typeof buildGenerationFlowItem>): string[] {
@@ -1430,7 +2470,7 @@ function revokeObjectUrls(urls: string[]): void {
 }
 
 function isTerminalJobStatus(status: GenerationJob["status"]): boolean {
-  return status === "succeeded" || status === "partial_succeeded" || status === "failed" || status === "cancelled";
+  return isTerminalGenerationJobStatus(status);
 }
 
 function upsertRecord(

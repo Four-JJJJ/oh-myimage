@@ -1,5 +1,5 @@
-<svg preserveAspectRatio="none" width="100%" height="100%" overflow="visible" style="display: block;" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<svg preserveAspectRatio="none" width="100%" height="100%" overflow="visible" style="display: block;" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
 <g id="Frame">
-<path id="Vector" d="M11.6667 1.64909L15.3333 7.99994L11.6667 14.3508H4.33333L0.666667 7.99994L4.33333 1.64909H11.6667ZM5.75599 5.44653L9.08933 11.22L10.244 10.5533L6.91067 4.77986L5.75599 5.44653Z" fill="var(--fill-0, white)" fill-opacity="0.9"/>
+<path id="Vector" fill-rule="evenodd" clip-rule="evenodd" d="M10.6279 2.6744C11.4773 2.18536 12.5227 2.18536 13.3721 2.6744L19.6222 6.27285C20.4746 6.76365 21 7.67241 21 8.65606V15.3435C21 16.3271 20.4746 17.2359 19.6221 17.7267L13.3721 21.3251C12.5227 21.8141 11.4773 21.8142 10.6279 21.3252L4.37793 17.727C3.52542 17.2362 3 16.3274 3 15.3437V8.65604C3 7.67238 3.5254 6.76363 4.37786 6.27282L10.6279 2.6744ZM8.37503 12C8.37503 9.99797 9.998 8.375 12 8.375C14.0021 8.375 15.625 9.99797 15.625 12C15.625 14.002 14.0021 15.625 12 15.625C9.998 15.625 8.37503 14.002 8.37503 12Z" fill="var(--fill-0, white)" fill-opacity="0.9"/>
 </g>
 </svg>

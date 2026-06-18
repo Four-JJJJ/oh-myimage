@@ -91,32 +91,61 @@ export async function deleteSession(db: AppDatabase, tokenHash: string): Promise
 export async function upsertCredential(
   db: AppDatabase,
   spaceId: string,
-  baseURL: string,
-  model: string,
-  promptOptimizerModel: string,
-  encryptedApiKey: string,
-  apiKeyHint: string,
+  input: {
+    imageBaseURL: string;
+    imageModel: string;
+    imageEncryptedApiKey: string;
+    imageApiKeyHint: string;
+    promptBaseURL: string;
+    promptModel: string;
+    promptEncryptedApiKey: string;
+    promptApiKeyHint: string;
+  },
 ): Promise<void> {
   const existing = await getCredential(db, spaceId);
   if (existing) {
     await db
       .prepare(
         `UPDATE api_credentials
-         SET base_url = ?, model = ?, prompt_optimizer_model = ?, encrypted_api_key = ?, api_key_hint = ?,
-             last_test_ok = 0, last_tested_at = NULL, updated_at = CURRENT_TIMESTAMP
+         SET base_url = ?, model = ?, encrypted_api_key = ?, api_key_hint = ?,
+             prompt_base_url = ?, prompt_optimizer_model = ?, prompt_encrypted_api_key = ?, prompt_api_key_hint = ?,
+             last_test_ok = 0, last_tested_at = NULL, prompt_last_test_ok = 0, prompt_last_tested_at = NULL, updated_at = CURRENT_TIMESTAMP
          WHERE space_id = ?`,
       )
-      .bind(baseURL, model, promptOptimizerModel, encryptedApiKey, apiKeyHint, spaceId)
+      .bind(
+        input.imageBaseURL,
+        input.imageModel,
+        input.imageEncryptedApiKey,
+        input.imageApiKeyHint,
+        input.promptBaseURL,
+        input.promptModel,
+        input.promptEncryptedApiKey,
+        input.promptApiKeyHint,
+        spaceId,
+      )
       .run();
     return;
   }
 
   await db
     .prepare(
-      `INSERT INTO api_credentials (id, space_id, base_url, model, prompt_optimizer_model, encrypted_api_key, api_key_hint)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO api_credentials (
+        id, space_id, base_url, model, encrypted_api_key, api_key_hint,
+        prompt_base_url, prompt_optimizer_model, prompt_encrypted_api_key, prompt_api_key_hint
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .bind(randomId("cred"), spaceId, baseURL, model, promptOptimizerModel, encryptedApiKey, apiKeyHint)
+    .bind(
+      randomId("cred"),
+      spaceId,
+      input.imageBaseURL,
+      input.imageModel,
+      input.imageEncryptedApiKey,
+      input.imageApiKeyHint,
+      input.promptBaseURL,
+      input.promptModel,
+      input.promptEncryptedApiKey,
+      input.promptApiKeyHint,
+    )
     .run();
 }
 
@@ -128,7 +157,19 @@ export async function deleteCredential(db: AppDatabase, spaceId: string): Promis
   await db.prepare("DELETE FROM api_credentials WHERE space_id = ?").bind(spaceId).run();
 }
 
-export async function markCredentialTested(db: AppDatabase, spaceId: string, ok: boolean): Promise<void> {
+export async function markCredentialTested(db: AppDatabase, spaceId: string, kind: "image" | "prompt", ok: boolean): Promise<void> {
+  if (kind === "prompt") {
+    await db
+      .prepare(
+        `UPDATE api_credentials
+         SET prompt_last_test_ok = ?, prompt_last_tested_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE space_id = ?`,
+      )
+      .bind(ok ? 1 : 0, spaceId)
+      .run();
+    return;
+  }
+
   await db
     .prepare(
       `UPDATE api_credentials
@@ -148,18 +189,20 @@ export async function createGenerationJob(
   referenceImages: StoredReferenceImage[] = [],
   maskImage?: StoredReferenceImage,
   jobId = randomId("job"),
+  conversationId?: string | null,
 ): Promise<string> {
   const primaryReference = referenceImages[0];
   const referenceImagesJson = referenceImages.length > 0 ? JSON.stringify(referenceImages.map(referenceImageSnapshot)) : null;
+  const normalizedConversationId = typeof conversationId === "string" && conversationId.trim() ? conversationId.trim() : jobId;
   await db
     .prepare(
       `INSERT INTO generation_jobs (
         id, space_id, status, prompt, aspect_ratio, width, height, quality, quantity,
         output_format, background, compression, moderation, model, base_url_hash,
         reference_image_storage_key, reference_image_mime_type, reference_image_name, reference_image_byte_size,
-        mask_image_storage_key, mask_image_mime_type, mask_image_name, mask_image_byte_size,
+        mask_image_storage_key, mask_image_mime_type, mask_image_name, mask_image_byte_size, conversation_id,
         stage, progress_current, progress_total, reference_images_json
-      ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`,
+      ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`,
     )
     .bind(
       jobId,
@@ -184,6 +227,7 @@ export async function createGenerationJob(
       maskImage?.mimeType ?? null,
       maskImage?.name ?? null,
       maskImage?.byteSize ?? null,
+      normalizedConversationId,
       input.quantity,
       referenceImagesJson,
     )

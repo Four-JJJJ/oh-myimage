@@ -8,8 +8,11 @@ import {
   conversationComposerGapPx,
   conversationFlowGapPx,
   conversationTopPaddingPx,
+  emptyStateCopyToComposerGapPx,
+  emptyFirstComposerTopPercent,
   generationModuleGapPx,
   isScrollNearBottom,
+  resolveComposerLayoutMode,
 } from "./layout";
 import { generationStageLayout } from "./GenerateMenuView";
 import type { ImageItem } from "../../api";
@@ -22,9 +25,21 @@ describe("generate menu layout helpers", () => {
   });
 
   it("reserves enough canvas bottom space for the floating composer", () => {
-    expect(conversationCanvasBottomPadding(170)).toBe(170 + conversationComposerGapPx + conversationComposerBottomOffsetPx);
-    expect(conversationCanvasBottomPadding(0)).toBeGreaterThanOrEqual(conversationTopPaddingPx);
-    expect(conversationCanvasBottomPadding(0)).toBe(conversationComposerGapPx + conversationComposerBottomOffsetPx);
+    expect(conversationCanvasBottomPadding(170, "conversation")).toBe(170 + conversationComposerGapPx + conversationComposerBottomOffsetPx);
+    expect(conversationCanvasBottomPadding(0, "conversation")).toBeGreaterThanOrEqual(conversationTopPaddingPx);
+    expect(conversationCanvasBottomPadding(0, "conversation")).toBe(conversationComposerGapPx + conversationComposerBottomOffsetPx);
+  });
+
+  it("uses the figma-derived top anchor for the first empty message state", () => {
+    expect(emptyFirstComposerTopPercent).toBe(34.7);
+    expect(emptyStateCopyToComposerGapPx).toBe(40);
+    expect(resolveComposerLayoutMode(0)).toBe("empty-first-message");
+    expect(resolveComposerLayoutMode(1)).toBe("conversation");
+  });
+
+  it("drops back to the regular top padding when the first composer is not bottom-fixed", () => {
+    expect(conversationCanvasBottomPadding(170, "empty-first-message")).toBe(conversationTopPaddingPx);
+    expect(conversationCanvasBottomPadding(0, "empty-first-message")).toBe(conversationTopPaddingPx);
   });
 
   it("treats near-bottom scroll positions as sticky", () => {

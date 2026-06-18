@@ -1,0 +1,75 @@
+services:
+  oh-myimage-dev-api:
+    image: ${OH_MYIMAGE_DEV_IMAGE:-oh-myimage:latest}
+    container_name: oh-myimage-dev-api
+    restart: unless-stopped
+    env_file:
+      - /etc/oh-myimage-dev/oh-myimage-dev.env
+    command: ["npm", "run", "start:node"]
+    volumes:
+      - ../dist:/app/dist:ro
+      - ../src:/app/src:ro
+      - ../migrations:/app/migrations:ro
+    ports:
+      - "127.0.0.1:8789:8788"
+    depends_on:
+      oh-myimage-dev-postgres:
+        condition: service_healthy
+      oh-myimage-dev-redis:
+        condition: service_healthy
+
+  oh-myimage-dev-worker:
+    image: ${OH_MYIMAGE_DEV_IMAGE:-oh-myimage:latest}
+    container_name: oh-myimage-dev-worker
+    restart: unless-stopped
+    env_file:
+      - /etc/oh-myimage-dev/oh-myimage-dev.env
+    command: ["npm", "run", "worker:node"]
+    volumes:
+      - ../dist:/app/dist:ro
+      - ../src:/app/src:ro
+      - ../migrations:/app/migrations:ro
+    depends_on:
+      oh-myimage-dev-api:
+        condition: service_started
+      oh-myimage-dev-postgres:
+        condition: service_healthy
+      oh-myimage-dev-redis:
+        condition: service_healthy
+
+  oh-myimage-dev-postgres:
+    image: postgres:16
+    container_name: oh-myimage-dev-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: oh_myimage_dev
+      POSTGRES_USER: oh_myimage
+      POSTGRES_PASSWORD: ${OH_MYIMAGE_POSTGRES_PASSWORD:?set OH_MYIMAGE_POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:15433:5432"
+    volumes:
+      - oh-myimage-dev-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oh_myimage -d oh_myimage_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  oh-myimage-dev-redis:
+    image: redis:7
+    container_name: oh-myimage-dev-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:16380:6379"
+    volumes:
+      - oh-myimage-dev-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  oh-myimage-dev-postgres-data:
+  oh-myimage-dev-redis-data:

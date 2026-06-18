@@ -70,7 +70,20 @@ function previewMode(): string | null {
     window.localStorage.setItem(previewStorageKey, mode);
     return mode;
   }
-  return window.localStorage.getItem(previewStorageKey) ?? (window.location.hostname === "dev-gen.fourj.space" ? "history" : null);
+  return previewModeFromInputs(window.location.search, window.localStorage.getItem(previewStorageKey), window.location.hostname);
+}
+
+export function previewModeFromInputs(search: string, storedMode: string | null, hostname: string): string | null {
+  const params = new URLSearchParams(search);
+  const value = params.get("preview");
+  if (value === "off") {
+    return null;
+  }
+  if (value !== null) {
+    return value.trim() || "empty";
+  }
+  void hostname;
+  return storedMode ?? null;
 }
 
 async function handlePreviewApi(request: Request, url: URL): Promise<unknown> {
@@ -167,6 +180,7 @@ export interface PreviewGenerationInput {
   quality: string;
   quantity: number;
   outputFormat: string;
+  conversationId?: string;
   sourceImageId?: string;
   referenceImages?: GenerationReferenceImage[];
 }
@@ -175,19 +189,22 @@ export async function previewGenerationInputFromRequest(request: Request): Promi
   const contentType = request.headers.get("content-type") ?? "";
   let body: Record<string, unknown>;
   let referenceImages: GenerationReferenceImage[] = [];
+  let maskImage: GenerationReferenceImage | undefined;
   if (contentType.includes("multipart/form-data")) {
     const form = await request.formData().catch(() => null);
     body = formDataObject(form);
     referenceImages = formDataReferenceImages(form);
+    maskImage = formDataMaskImage(form);
   } else {
     body = objectBody(await request.json().catch(() => ({})));
   }
-  return previewGenerationInputFromBody(body, referenceImages);
+  return previewGenerationInputFromBody(body, referenceImages, maskImage);
 }
 
 export function previewGenerationInputFromBody(
   body: Record<string, unknown>,
   uploadedReferenceImages: GenerationReferenceImage[] = [],
+  uploadedMaskImage?: GenerationReferenceImage,
 ): PreviewGenerationInput {
   const aspectRatio = typeof body.aspectRatio === "string" && body.aspectRatio.trim() ? body.aspectRatio.trim() : "9:16";
   const ratioSize = previewRatioSizes[aspectRatio] ?? [previewDemoImageWidth, previewDemoImageHeight];
@@ -197,7 +214,10 @@ export function previewGenerationInputFromBody(
   const referenceImages = uploadedReferenceImages.length > 0
     ? uploadedReferenceImages
     : sourceImageId
-      ? [previewReferenceImage("参考图 1")]
+      ? [
+        previewReferenceImage(uploadedMaskImage ? "局部重绘" : "参考图 1"),
+        ...(uploadedMaskImage ? [previewReferenceImage("局部重绘遮罩", uploadedMaskImage.mimeType, uploadedMaskImage.byteSize)] : []),
+      ]
       : [];
   return {
     prompt: typeof body.prompt === "string" ? body.prompt.trim() : "",
@@ -207,6 +227,7 @@ export function previewGenerationInputFromBody(
     quality: typeof body.quality === "string" && body.quality.trim() ? body.quality.trim() : "auto",
     quantity: clampPreviewQuantity(toPreviewInt(body.quantity, 1)),
     outputFormat: typeof body.outputFormat === "string" && body.outputFormat.trim() ? body.outputFormat.trim() : "png",
+    conversationId: typeof body.conversationId === "string" && body.conversationId.trim() ? body.conversationId.trim() : undefined,
     sourceImageId,
     referenceImages,
   };
@@ -227,6 +248,13 @@ function formDataReferenceImages(form: FormData | null): GenerationReferenceImag
   return form.getAll("referenceImage")
     .filter((value): value is File => value instanceof File)
     .map((file, index) => previewReferenceImage(file.name || `参考图 ${index + 1}`, file.type || "image/png", file.size));
+}
+
+function formDataMaskImage(form: FormData | null): GenerationReferenceImage | undefined {
+  if (!form) return undefined;
+  const value = form.get("maskImage");
+  if (!(value instanceof File)) return undefined;
+  return previewReferenceImage(value.name || "局部重绘遮罩", value.type || "image/png", value.size);
 }
 
 function objectBody(value: unknown): Record<string, unknown> {
@@ -260,12 +288,22 @@ function recordsForMode(mode: string): GenerationRecord[] {
   ];
 }
 
-function createRecord(
+export function createPreviewRecord(
   prompt: string,
   status: GenerationJob["status"],
-  id = `preview_job_${Date.now()}`,
-  createdAt = new Date().toISOString(),
   input: Partial<PreviewGenerationInput> = {},
+  sourceJob?: Pick<GenerationJob, "id" | "conversation_id">,
+): GenerationRecord {
+  return buildPreviewRecord(prompt, status, `preview_job_${Date.now()}`, new Date().toISOString(), input, sourceJob);
+}
+
+function buildPreviewRecord(
+  prompt: string,
+  status: GenerationJob["status"],
+  id: string,
+  createdAt: string,
+  input: Partial<PreviewGenerationInput> = {},
+  sourceJob?: Pick<GenerationJob, "id" | "conversation_id">,
 ): GenerationRecord {
   const aspectRatio = input.aspectRatio ?? "9:16";
   const [fallbackWidth, fallbackHeight] = previewRatioSizes[aspectRatio] ?? [previewDemoImageWidth, previewDemoImageHeight];
@@ -274,8 +312,10 @@ function createRecord(
   const quantity = clampPreviewQuantity(input.quantity ?? 1);
   const outputFormat = input.outputFormat ?? "png";
   const quality = input.quality ?? "auto";
+  const conversationId = normalizePreviewConversationId(input.conversationId) ?? normalizePreviewConversationId(sourceJob?.conversation_id) ?? sourceJob?.id ?? id;
   const job: GenerationJob = {
     id,
+    conversation_id: conversationId,
     status,
     stage: status === "running" ? "waiting_provider" : "completed",
     progress_current: status === "running" ? 0 : quantity,
@@ -301,6 +341,17 @@ function createRecord(
     images: status === "running" ? [] : previewImages(job, createdAt),
     elapsedSeconds: status === "running" ? null : 18.4,
   };
+}
+
+function createRecord(
+  prompt: string,
+  status: GenerationJob["status"],
+  id = `preview_job_${Date.now()}`,
+  createdAt = new Date().toISOString(),
+  input: Partial<PreviewGenerationInput> = {},
+  sourceJob?: Pick<GenerationJob, "id" | "conversation_id">,
+): GenerationRecord {
+  return buildPreviewRecord(prompt, status, id, createdAt, input, sourceJob);
 }
 
 function completeRecord(record: GenerationRecord): GenerationRecord {
@@ -329,8 +380,15 @@ function settingsFromJob(job?: GenerationJob): Partial<PreviewGenerationInput> {
     quality: job.quality,
     quantity: job.quantity,
     outputFormat: job.output_format,
+    conversationId: normalizePreviewConversationId(job.conversation_id) ?? job.id,
     referenceImages: job.referenceImages,
   };
+}
+
+function normalizePreviewConversationId(value: string | null | undefined): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized || undefined;
 }
 
 function previewImages(job: GenerationJob, createdAt: string): ImageItem[] {

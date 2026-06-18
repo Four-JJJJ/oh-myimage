@@ -63,8 +63,14 @@ const MAX_PROVIDER_IMAGE_CONCURRENCY = 4;
 const DEFAULT_RESPONSES_MODEL = "gpt-5.5";
 const DEFAULT_PROMPT_OPTIMIZER_MODEL = DEFAULT_RESPONSES_MODEL;
 const DEFAULT_PROMPT_OPTIMIZER_TIMEOUT_MS = 45_000;
+const IMMEDIATE_PROVIDER_TIMEOUT_RETRY_DELAY_MS = 3_000;
+const DEFAULT_PROVIDER_TIMEOUT_RETRY_ATTEMPTS = 0;
+const MAX_PROVIDER_TIMEOUT_RETRY_ATTEMPTS = 3;
+const IMMEDIATE_PROVIDER_TIMEOUT_RETRY_REQUEST_TIMEOUT_MS = 15_000;
 const PROMPT_OPTIMIZER_MODELS = new Set(["gpt-5.5", "gpt-5.4"]);
 const MASKED_IMAGE_EDIT_PROMPT_SUFFIX = [
+  "Treat the user's prompt as the replacement content for that selected area, not as an instruction to add a new object elsewhere in the image.",
+  "Replace the masked content so the selected area matches the user's prompt exactly, including short words, labels, or characters when text is requested.",
   "Only edit the area selected by the alpha mask's transparent pixels.",
   "Preserve every unmasked area of the input image, including composition, objects, lighting, texture, and background, as unchanged as possible.",
 ].join(" ");
@@ -97,6 +103,28 @@ export interface ProcessGenerationOptions {
   throwRetryableErrors?: boolean;
 }
 
+export function providerIdempotencyKey(job: Pick<GenerationJobRecord, "id" | "space_id">, resultIndex: number): string {
+  return `oh-myimage:${job.space_id}:${job.id}:${resultIndex}`;
+}
+
+export function shouldImmediatelyRetryImageGeneration(error: ProviderError): boolean {
+  return error.code === "provider_timeout";
+}
+
+export function shouldPersistFailedResult(error: ProviderError): boolean {
+  return !error.retryable;
+}
+
+export function resolveProviderTimeoutRetryAttempts(value: string | undefined): number {
+  return Math.min(Math.max(Math.trunc(envNumber(value, DEFAULT_PROVIDER_TIMEOUT_RETRY_ATTEMPTS)), 0), MAX_PROVIDER_TIMEOUT_RETRY_ATTEMPTS);
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 export async function testProvider(baseURL: string, apiKey: string, timeoutMs = 15000): Promise<{ ok: boolean; status: number; message: string }> {
   const endpoint = buildProviderEndpoint(baseURL, "/models");
   const controller = new AbortController();
@@ -118,11 +146,14 @@ export async function testProvider(baseURL: string, apiKey: string, timeoutMs = 
 
 export async function optimizePrompt(
   input: PromptOptimizationInput,
-  credential: CredentialRecord,
+  provider: Pick<CredentialRecord, "prompt_base_url" | "prompt_optimizer_model">,
   apiKey: string,
   env: Env,
 ): Promise<string> {
-  const endpoint = buildProviderEndpoint(credential.base_url, "/responses");
+  if (!provider.prompt_base_url) {
+    throw new ProviderError("provider_missing", "请先在设置中配置提示词 Provider 的 baseURL 和 API Key。");
+  }
+  const endpoint = buildProviderEndpoint(provider.prompt_base_url, "/responses");
   const controller = new AbortController();
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -138,7 +169,7 @@ export async function optimizePrompt(
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: resolveResponsesModel(resolvePromptOptimizerModel(credential.prompt_optimizer_model ?? env.PROMPT_OPTIMIZER_MODEL)),
+        model: resolveResponsesModel(resolvePromptOptimizerModel(provider.prompt_optimizer_model ?? env.PROMPT_OPTIMIZER_MODEL)),
         instructions: PROMPT_OPTIMIZER_INSTRUCTIONS,
         input: promptOptimizationInput(input),
       }),
@@ -288,18 +319,20 @@ async function requestGeneration(
       return stored;
     } catch (error) {
       const providerError = normalizeProviderError(error);
-      await upsertGenerationJobResult(env.DB, {
-        id: generationResultId(job.id, resultIndex),
-        space_id: job.space_id,
-        job_id: job.id,
-        result_index: resultIndex,
-        status: "failed",
-        image_asset_id: null,
-        error_code: providerError.code,
-        error_message: providerError.message,
-        started_at: new Date().toISOString(),
-        completed_at: new Date().toISOString(),
-      });
+      if (shouldPersistFailedResult(providerError)) {
+        await upsertGenerationJobResult(env.DB, {
+          id: generationResultId(job.id, resultIndex),
+          space_id: job.space_id,
+          job_id: job.id,
+          result_index: resultIndex,
+          status: "failed",
+          image_asset_id: null,
+          error_code: providerError.code,
+          error_message: providerError.message,
+          started_at: new Date().toISOString(),
+          completed_at: new Date().toISOString(),
+        });
+      }
       throw providerError;
     }
   });
@@ -334,7 +367,8 @@ async function generateAndStoreOneImage(
   const recovered = await recoverStoredImageForResult(job, resultIndex, env);
   if (recovered) return recovered;
 
-  const response = await requestGenerationBatch(job, credential, apiKey, timeoutMs, env);
+  const idempotencyKey = providerIdempotencyKey(job, resultIndex);
+  const response = await requestGenerationBatchWithRecovery(job, credential, apiKey, timeoutMs, env, idempotencyKey);
   const image = response.data?.find((item) => item.b64_json || item.url);
   if (!image) {
     throw new ProviderError("empty_response", "模型服务没有返回图片。");
@@ -350,6 +384,36 @@ async function generateAndStoreOneImage(
     revisedPrompt: image.revised_prompt ?? null,
     usage: response.usage,
   };
+}
+
+export async function requestGenerationBatchWithRecovery(
+  job: GenerationJobRecord,
+  credential: CredentialRecord,
+  apiKey: string,
+  timeoutMs: number,
+  env: Env,
+  idempotencyKey: string,
+): Promise<ProviderGenerationResponse> {
+  try {
+    return await requestGenerationBatch(job, credential, apiKey, timeoutMs, env, idempotencyKey);
+  } catch (error) {
+    const providerError = normalizeProviderError(error);
+    if (!shouldImmediatelyRetryImageGeneration(providerError)) throw providerError;
+
+    const retryAttempts = resolveProviderTimeoutRetryAttempts(env.PROVIDER_TIMEOUT_RETRY_ATTEMPTS);
+    for (let attempt = 0; attempt < retryAttempts; attempt += 1) {
+      await wait(IMMEDIATE_PROVIDER_TIMEOUT_RETRY_DELAY_MS);
+      const retryTimeoutMs = Math.min(timeoutMs, IMMEDIATE_PROVIDER_TIMEOUT_RETRY_REQUEST_TIMEOUT_MS);
+      try {
+        return await requestGenerationBatch(job, credential, apiKey, retryTimeoutMs, env, idempotencyKey);
+      } catch (retryError) {
+        const retryProviderError = normalizeProviderError(retryError);
+        if (!shouldImmediatelyRetryImageGeneration(retryProviderError)) throw retryProviderError;
+      }
+    }
+
+    throw providerError;
+  }
 }
 
 export async function resolveProviderImageBinary(
@@ -496,6 +560,7 @@ async function requestGenerationBatch(
   apiKey: string,
   timeoutMs: number,
   env: Env,
+  idempotencyKey: string,
 ): Promise<ProviderGenerationResponse> {
   const endpoint = buildProviderEndpoint(credential.base_url, imageGenerationEndpointPath(job));
   const controller = new AbortController();
@@ -509,7 +574,7 @@ async function requestGenerationBatch(
 
     const response = await fetch(endpoint, {
       method: "POST",
-      headers: providerRequestHeaders(apiKey, body),
+      headers: providerRequestHeaders(apiKey, body, idempotencyKey),
       body,
       redirect: "manual",
       signal: controller.signal,
@@ -555,9 +620,10 @@ async function providerRequestBody(job: GenerationJobRecord, env: Env): Promise<
   return buildImageGenerationFormData(payload, referenceImages, maskImage);
 }
 
-function providerRequestHeaders(apiKey: string, body: BodyInit): HeadersInit {
+function providerRequestHeaders(apiKey: string, body: BodyInit, idempotencyKey: string): HeadersInit {
   const headers: HeadersInit = {
     Authorization: `Bearer ${apiKey}`,
+    "Idempotency-Key": idempotencyKey,
   };
   if (!(body instanceof FormData)) {
     headers["Content-Type"] = "application/json";

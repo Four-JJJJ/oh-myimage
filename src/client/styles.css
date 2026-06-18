@@ -1,5 +1,4 @@
 @import "tw-animate-css";
-@import "shadcn/tailwind.css";
 @import "@fontsource-variable/inter";
 @tailwind base;
 @tailwind components;
@@ -14,33 +13,33 @@
     --card-foreground: 0 0% 96%;
     --popover: 0 0% 8%;
     --popover-foreground: 0 0% 96%;
-    --primary: 107 92% 58%;
+    --primary: 0 0% 90%;
     --primary-foreground: 0 0% 5%;
     --secondary: 0 0% 14%;
     --secondary-foreground: 0 0% 94%;
     --muted: 0 0% 13%;
     --muted-foreground: 0 0% 62%;
-    --accent: 107 70% 18%;
-    --accent-foreground: 107 92% 72%;
+    --accent: 0 0% 16%;
+    --accent-foreground: 0 0% 90%;
     --destructive: 0 76% 58%;
     --destructive-foreground: 0 0% 98%;
     --border: 0 0% 18%;
     --input: 0 0% 24%;
-    --ring: 107 92% 58%;
+    --ring: 0 0% 90%;
     --radius: 0.5rem;
-    --chart-1: 107 92% 58%;
+    --chart-1: 0 0% 90%;
     --chart-2: 43 90% 60%;
     --chart-3: 174 62% 50%;
     --chart-4: 18 82% 56%;
     --chart-5: 295 55% 62%;
     --sidebar: 0 0% 7%;
     --sidebar-foreground: 0 0% 88%;
-    --sidebar-primary: 107 92% 58%;
+    --sidebar-primary: 0 0% 90%;
     --sidebar-primary-foreground: 0 0% 5%;
     --sidebar-accent: 0 0% 13%;
     --sidebar-accent-foreground: 0 0% 96%;
     --sidebar-border: 0 0% 18%;
-    --sidebar-ring: 107 92% 58%;
+    --sidebar-ring: 0 0% 90%;
   }
 
   * {
@@ -123,11 +122,26 @@
   }
 
   .ohm-textarea-scrollbar {
-    scrollbar-width: none;
+    scrollbar-width: thin;
+    scrollbar-color: rgb(255 255 255 / 0.28) transparent;
   }
 
   .ohm-textarea-scrollbar::-webkit-scrollbar {
-    display: none;
+    width: 6px;
+    height: 0;
+  }
+
+  .ohm-textarea-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .ohm-textarea-scrollbar::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgb(255 255 255 / 0.28);
+  }
+
+  .ohm-textarea-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgb(255 255 255 / 0.42);
   }
 
   .ohm-loading-status {
@@ -140,11 +154,29 @@
   .ohm-loading-status-track {
     display: flex;
     flex-direction: column;
-    animation: ohm-loading-status-slot 5.4s cubic-bezier(0.7, 0, 0.2, 1) infinite;
+    animation: ohm-loading-status-slot 24.48s cubic-bezier(0.7, 0, 0.2, 1) infinite;
   }
 
   .ohm-loading-status-line {
     height: 22px;
+    white-space: nowrap;
+  }
+
+  .entry-status-loading-copy {
+    display: inline-block;
+    height: 28px;
+    overflow: hidden;
+    vertical-align: top;
+  }
+
+  .entry-status-loading-track {
+    display: flex;
+    flex-direction: column;
+    animation: entry-status-loading-slot 15.3s cubic-bezier(0.7, 0, 0.2, 1) infinite;
+  }
+
+  .entry-status-loading-line {
+    height: 28px;
     white-space: nowrap;
   }
 
@@ -219,16 +251,16 @@
       linear-gradient(#191919, #191919) padding-box,
       conic-gradient(
           from var(--record-border-angle),
-          rgb(110 255 48 / 0.14),
-          rgb(110 255 48 / 0.82),
+          rgb(255 255 255 / 0.14),
+          rgb(255 255 255 / 0.82),
           rgb(255 255 255 / 0.26),
-          rgb(110 255 48 / 0.42),
-          rgb(110 255 48 / 0.14)
+          rgb(255 255 255 / 0.42),
+          rgb(255 255 255 / 0.14)
         )
         border-box;
     box-shadow:
-      0 0 0 1px rgb(110 255 48 / 0.08),
-      0 0 32px rgb(110 255 48 / 0.08);
+      0 0 0 1px rgb(255 255 255 / 0.08),
+      0 0 32px rgb(255 255 255 / 0.08);
     animation: record-border-flow 2.4s linear infinite;
   }
 
@@ -285,6 +317,12 @@
     --tw-ring-offset-width: 0px;
   }
 
+  .figma-prompt-textarea::placeholder {
+    font: inherit;
+    letter-spacing: inherit;
+    line-height: inherit;
+  }
+
   .figma-settings-input,
   .figma-settings-input:focus,
   .figma-settings-input:focus-visible {
@@ -319,7 +357,7 @@
   }
 
   .figma-generate-button:hover:not(:disabled) {
-    background: rgb(110 255 48 / 0.1);
+    background: rgb(255 255 255 / 0.1);
   }
 
   .figma-icon-action {
@@ -332,7 +370,7 @@
   }
 
   .figma-icon-action:hover {
-    color: #6eff30;
+    color: rgb(255 255 255 / 0.95);
   }
 
   .image-preview-panel {
@@ -355,6 +393,7 @@
   }
 
   .image-preview-stage {
+    position: relative;
     position: absolute;
     top: var(--preview-image-inset);
     right: var(--preview-image-inset);
@@ -365,7 +404,13 @@
     place-items: center;
     border: 1px solid rgb(255 255 255 / 0.1);
     border-radius: 6px;
-    background: rgb(255 255 255 / 0.1);
+    background: rgb(255 255 255 / 0.08);
+  }
+
+  .generation-preview-beam {
+    display: block;
+    width: fit-content;
+    max-width: 100%;
   }
 
   .image-preview-stage-selection {
@@ -388,8 +433,8 @@
   .image-preview-actions {
     position: absolute;
     z-index: 1;
-    top: var(--preview-control-inset);
-    left: var(--preview-control-inset);
+    right: var(--preview-control-inset);
+    bottom: var(--preview-control-inset);
     display: flex;
     align-items: center;
     gap: 20px;
@@ -408,10 +453,6 @@
 
   .image-preview-panel-edit {
     --preview-stage-left: calc(var(--preview-editor-width) + var(--preview-image-inset));
-  }
-
-  .image-preview-panel-edit .image-preview-actions {
-    left: calc(var(--preview-editor-width) + var(--preview-control-inset));
   }
 
   .image-preview-editor {
@@ -442,7 +483,7 @@
   .image-preview-action:focus-visible,
   .image-preview-close:hover,
   .image-preview-close:focus-visible {
-    color: #6eff30;
+    color: rgb(255 255 255 / 0.95);
   }
 
   .image-preview-action:disabled,
@@ -599,22 +640,78 @@
 
 @keyframes ohm-loading-status-slot {
   0%,
-  23% {
+  11.111% {
     transform: translateY(0);
   }
 
-  33%,
-  56% {
+  12.5%,
+  23.611% {
     transform: translateY(-22px);
   }
 
-  66%,
-  89% {
+  25%,
+  36.111% {
     transform: translateY(-44px);
   }
 
+  37.5%,
+  48.611% {
+    transform: translateY(-66px);
+  }
+
+  50%,
+  61.111% {
+    transform: translateY(-88px);
+  }
+
+  62.5%,
+  73.611% {
+    transform: translateY(-110px);
+  }
+
+  75%,
+  86.111% {
+    transform: translateY(-132px);
+  }
+
+  87.5%,
+  98.611% {
+    transform: translateY(-154px);
+  }
+
   100% {
+    transform: translateY(-176px);
+  }
+}
+
+@keyframes entry-status-loading-slot {
+  0%,
+  16.667% {
     transform: translateY(0);
+  }
+
+  20%,
+  36.667% {
+    transform: translateY(-28px);
+  }
+
+  40%,
+  56.667% {
+    transform: translateY(-56px);
+  }
+
+  60%,
+  76.667% {
+    transform: translateY(-84px);
+  }
+
+  80%,
+  96.667% {
+    transform: translateY(-112px);
+  }
+
+  100% {
+    transform: translateY(-140px);
   }
 }
 
@@ -645,6 +742,10 @@
   }
 
   .ohm-loading-status-track {
+    animation: none !important;
+  }
+
+  .entry-status-loading-track {
     animation: none !important;
   }
 }
