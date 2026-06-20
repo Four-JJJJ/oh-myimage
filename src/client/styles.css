@@ -1,5 +1,30 @@
-@import "tw-animate-css";
-@import "@fontsource-variable/inter";
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("@fontsource-variable/inter/files/inter-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range:
+    U+0000-00FF,
+    U+0131,
+    U+0152-0153,
+    U+02BB-02BC,
+    U+02C6,
+    U+02DA,
+    U+02DC,
+    U+0304,
+    U+0308,
+    U+0329,
+    U+2000-206F,
+    U+20AC,
+    U+2122,
+    U+2191,
+    U+2193,
+    U+2212,
+    U+2215,
+    U+FEFF,
+    U+FFFD;
+}
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -106,19 +131,19 @@
   }
 
   .ohm-smooth-card {
-    border-radius: 10px;
+    border-radius: 12px;
   }
 
   .ohm-smooth-control {
-    border-radius: 10px;
+    border-radius: 12px;
   }
 
   .ohm-smooth-chip {
-    border-radius: 10px;
+    border-radius: 12px;
   }
 
   .ohm-smooth-nav {
-    border-radius: 12.5px;
+    border-radius: 12px;
   }
 
   .ohm-textarea-scrollbar {
@@ -144,6 +169,27 @@
     background: rgb(255 255 255 / 0.42);
   }
 
+  .ohm-composer-prompt-textarea,
+  .ohm-composer-prompt-textarea:focus,
+  .ohm-composer-prompt-textarea:focus-visible {
+    display: block;
+    appearance: none;
+    -webkit-appearance: none;
+    font-size: 15px;
+    line-height: 21px;
+    letter-spacing: 0;
+    vertical-align: top;
+    outline: none !important;
+    --tw-ring-color: transparent;
+    --tw-ring-offset-width: 0px;
+  }
+
+  .ohm-composer-prompt-textarea::placeholder {
+    font: inherit;
+    line-height: inherit;
+    letter-spacing: inherit;
+  }
+
   .ohm-loading-status {
     display: inline-block;
     height: 22px;
@@ -162,22 +208,9 @@
     white-space: nowrap;
   }
 
-  .entry-status-loading-copy {
-    display: inline-block;
-    height: 28px;
-    overflow: hidden;
-    vertical-align: top;
-  }
-
-  .entry-status-loading-track {
-    display: flex;
-    flex-direction: column;
-    animation: entry-status-loading-slot 15.3s cubic-bezier(0.7, 0, 0.2, 1) infinite;
-  }
-
-  .entry-status-loading-line {
-    height: 28px;
-    white-space: nowrap;
+  .ohm-conversation-list-item {
+    content-visibility: auto;
+    contain-intrinsic-size: 40px;
   }
 
   .ohm-loaders-wtf-status {
@@ -684,37 +717,6 @@
   }
 }
 
-@keyframes entry-status-loading-slot {
-  0%,
-  16.667% {
-    transform: translateY(0);
-  }
-
-  20%,
-  36.667% {
-    transform: translateY(-28px);
-  }
-
-  40%,
-  56.667% {
-    transform: translateY(-56px);
-  }
-
-  60%,
-  76.667% {
-    transform: translateY(-84px);
-  }
-
-  80%,
-  96.667% {
-    transform: translateY(-112px);
-  }
-
-  100% {
-    transform: translateY(-140px);
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -745,7 +747,4 @@
     animation: none !important;
   }
 
-  .entry-status-loading-track {
-    animation: none !important;
-  }
 }

@@ -1,6 +1,7 @@
 .git
 node_modules
 dist
+dist-node
 .wrangler
 .playwright-cli
 output

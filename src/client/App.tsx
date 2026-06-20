@@ -2,6 +2,7 @@ import {
   AlertCircle,
   CheckCircle2,
   CloudDownload,
+  CalendarIcon,
   Copy,
   Download,
   Edit3,
@@ -14,6 +15,7 @@ import {
   Undo2,
   X,
 } from "lucide-react";
+import { format } from "date-fns";
 import {
   ChangeEvent,
   ClipboardEvent,
@@ -31,23 +33,29 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import type { DateRange } from "react-day-picker";
 import { BorderBeam } from "border-beam";
 import { Alert, AlertDescription } from "./components/ui/alert";
 import { Button } from "./components/ui/button";
+import { Calendar } from "./components/ui/calendar";
 import { Input, type InputProps } from "./components/ui/input";
+import { Popover, PopoverPopup, PopoverTrigger } from "./components/ui/popover";
 import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem, ProviderSettings, SettingsProviders } from "./api";
 import { EntryField, EntryFormSection, EntryNoticeStack, EntryShell, EntryStatusScreen } from "./features/auth/EntryScreens";
-import { GenerateMenuView, HoverImageActionBar, imagePreviewActionKeys, type HoverImageAction } from "./features/generate-menu/GenerateMenuView";
+import { GenerateMenuView, HoverImageActionBar, type HoverImageAction } from "./features/generate-menu/GenerateMenuView";
 import { AppShell } from "./features/generate-shell/AppShell";
 import { GenerationFormFooter, ParameterSection, PromptPlaceholderThumbnail, PromptSection } from "./features/shared/generation-form-sections";
 import { GenerationDotMatrixLoader, generationDotMatrixColumns, generationDotMatrixRows } from "./features/shared/generation-loading";
 import { CossBadge, CossButton, CossInput, CossSelect, CossSeparator } from "./features/shared/coss";
+import { buildGalleryGroups, galleryHasHiddenDefaultRangeItems, normalizeGalleryDateFilter, type GalleryDateFilter } from "./gallery-utils";
 import { isTerminalGenerationJobStatus, mergePolledJobState } from "./generation-state";
 import addIcon from "./assets/figma/add.svg";
 import figmaLogo from "./assets/figma/logo.png";
 import generationContinueIcon from "./assets/figma/generation-continue.svg";
 import generationCopyIcon from "./assets/figma/generation-copy.svg";
+import generationDeleteIcon from "./assets/figma/generation-delete.svg";
 import generationDownloadIcon from "./assets/figma/generation-download.svg";
+import generationJumpMessageIcon from "./assets/figma/generation-jump-message.svg";
 import generationLocalEditIcon from "./assets/figma/generation-local-edit.svg";
 import generationRegenerateIcon from "./assets/figma/generation-regenerate.svg";
 import openaiIcon from "./assets/figma/openai.svg";
@@ -119,9 +127,23 @@ const FAST_REFERENCE_IMAGE_EDGE = 2048;
 const PROMPT_TEXTAREA_MAX_HEIGHT = 400;
 const MAX_IMAGE_EDGE = 3840;
 const MAX_IMAGE_PIXELS = 8_294_400;
+const galleryImageActionOrder = ["continue", "local-edit", "jump-to-message", "regenerate", "copy", "download", "delete"] as const;
+export const loginEntryGuidanceCopy = {
+  description: "第一次使用？输入一个新的空间名字，并设置至少 8 位空间密码，点击进入空间后会自动创建。",
+  spaceNameHint: "已有空间填写原空间名；新空间填写你想创建的名字。",
+  passwordHint: "新空间密码至少 8 位。空间名和密码目前无法找回，请妥善保存。",
+} as const;
 
 export function galleryImageActionKeys() {
-  return imagePreviewActionKeys();
+  return [...galleryImageActionOrder];
+}
+
+export function galleryEmptyStateContract(_dateFilterActive: boolean) {
+  return {
+    text: "暂无作品",
+    card: false,
+    icon: false,
+  };
 }
 
 const resolutionLongEdge: Record<string, number> = {
@@ -427,9 +449,9 @@ function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Pr
 
   return (
     <EntryShell eyebrow="Workspace Access" title="进入你的创作空间" description="使用空间名称和密码进入创作台。新空间会自动创建，旧的登录布局与按钮体系已统一替换为新的 coss surface。">
-      <EntryFormSection title="空间登录">
+      <EntryFormSection title="空间登录" description={loginEntryGuidanceCopy.description}>
         <form className="grid gap-5" onSubmit={submit}>
-          <EntryField label="空间名字" htmlFor="space-name">
+          <EntryField label="空间名字" htmlFor="space-name" hint={loginEntryGuidanceCopy.spaceNameHint}>
             <Input
               id="space-name"
               type="text"
@@ -438,12 +460,12 @@ function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Pr
               minLength={2}
               autoComplete="username"
               placeholder="请输入空间名称"
-              className="rounded-[10px] bg-[#1c1c1c]"
+              className="rounded-[12px] bg-[#1c1c1c]"
               required
             />
           </EntryField>
 
-          <EntryField label="空间密码" htmlFor="space-password" hint="忘记空间名或密码目前无法找回，请妥善保存。">
+          <EntryField label="空间密码" htmlFor="space-password" hint={loginEntryGuidanceCopy.passwordHint}>
             <Input
               id="space-password"
               value={password}
@@ -451,7 +473,7 @@ function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Pr
               type="password"
               autoComplete="current-password"
               placeholder="请输入空间密码"
-              className="rounded-[10px] bg-[#1c1c1c]"
+              className="rounded-[12px] bg-[#1c1c1c]"
               required
             />
           </EntryField>
@@ -460,7 +482,7 @@ function LoginScreen({ config, onLogin }: { config: AppConfig; onLogin: () => Pr
             type="submit"
             size="lg"
             loading={loading}
-            className="mt-1 w-full justify-center rounded-[10px] border-white/10 bg-white/90 text-[#181818] shadow-none hover:bg-white/80"
+            className="mt-1 w-full justify-center rounded-[12px] border-white/10 bg-white/90 text-[#181818] shadow-none hover:bg-white/80"
           >
             {loading ? "进入中" : "进入空间"}
           </Button>
@@ -897,8 +919,8 @@ function GenerateView({
     <div className="entry-fade flex h-[calc(100dvh-64px)] min-h-0 overflow-hidden">
       <form className="figma-composer flex h-full w-full shrink-0 flex-col border-r lg:w-[400px]" onSubmit={submit}>
         <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-4 pt-4">
-          <div className="flex h-10 items-center gap-2 overflow-hidden rounded-[10px] border border-white/15 p-2">
-            <div className="grid size-6 shrink-0 place-items-center rounded bg-white/10">
+          <div className="flex h-10 items-center gap-2 overflow-hidden rounded-[12px] border border-white/15 p-2">
+            <div className="grid size-6 shrink-0 place-items-center rounded-[6px] bg-white/10">
               <img src={openaiIcon} alt="" className="size-4" />
             </div>
             <p className="min-w-0 flex-1 truncate text-xs font-semibold leading-none text-white">{config.model || "gpt-image-2"}</p>
@@ -948,7 +970,7 @@ function GenerateView({
                           type="button"
                           variant="secondary"
                           size="icon-xs"
-                          className="absolute right-1 top-1 z-10 grid size-4 place-items-center overflow-hidden rounded bg-black/80 p-0 hover:bg-black/80"
+                          className="absolute right-1 top-1 z-10 grid size-4 place-items-center overflow-hidden rounded-[6px] bg-black/80 p-0 hover:bg-black/80"
                           aria-label="删除参考图"
                           title="删除参考图"
                           onClick={() => clearReferenceImage(index)}
@@ -1001,7 +1023,7 @@ function GenerateView({
         <div className="mx-auto flex w-[800px] max-w-full flex-col gap-3">
           {recordsError && <Notice tone="error" text={recordsError} />}
           {!loading && records.length === 0 && (
-            <div className="figma-record-card grid min-h-[188px] place-items-center rounded-[10px] border border-white/15 p-6 text-center">
+            <div className="figma-record-card grid min-h-[188px] place-items-center rounded-[12px] border border-white/15 p-6 text-center">
               <div className="flex flex-col items-center gap-3 text-white/40">
                 <Images className="size-7" />
                 <span className="text-xs">生成记录会出现在这里</span>
@@ -1030,7 +1052,7 @@ function GenerateView({
             />
           ))}
           {nextCursor && (
-            <CossButton type="button" variant="outline" className="mx-auto mb-2 h-8 rounded-md border border-white/15 bg-transparent px-4 text-xs text-white/60 hover:bg-white/10 hover:text-white/80" onClick={() => void loadRecords(nextCursor)}>
+            <CossButton type="button" variant="outline" className="mx-auto mb-2 h-8 rounded-[8px] border border-white/15 bg-transparent px-4 text-xs text-white/60 hover:bg-white/10 hover:text-white/80" onClick={() => void loadRecords(nextCursor)}>
               加载更多
             </CossButton>
           )}
@@ -1078,7 +1100,7 @@ function GenerationRecordCard({
   return (
     <article
       className={cn(
-        "figma-record-card flex w-full flex-col gap-3 overflow-hidden rounded-[10px] border p-3",
+        "figma-record-card flex w-full flex-col gap-3 overflow-hidden rounded-[12px] border p-3",
         isGenerating ? "figma-record-card-generating" : "border-white/15",
       )}
     >
@@ -1116,7 +1138,7 @@ function GenerationRecordCard({
       <div className="flex min-h-5 items-center gap-10">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
           {chips.map((chip) => (
-            <span key={chip} className="rounded-md bg-white/10 px-2 py-1 text-xs leading-none text-white/60">
+            <span key={chip} className="rounded-[6px] bg-white/10 px-2 py-1 text-xs leading-none text-white/60">
               {chip}
             </span>
           ))}
@@ -1207,7 +1229,7 @@ function GenerationPlaceholderThumbnail({
 }) {
   const size = thumbnailSize(job.width, job.height);
   const idleClassName = cn(
-    "grid size-full place-items-center overflow-hidden rounded-md border border-transparent bg-white/10 text-white/40",
+    "grid size-full place-items-center overflow-hidden rounded-[6px] border border-transparent bg-white/10 text-white/40",
     failed && "bg-destructive/10 text-destructive/80",
   );
   const idleThumbnail = (
@@ -1257,7 +1279,7 @@ function GenerationPlaceholderThumbnail({
     >
       <div
         className={cn(
-          "grid size-full place-items-center overflow-hidden rounded-md border border-transparent bg-white/10 text-white/40",
+          "grid size-full place-items-center overflow-hidden rounded-[6px] border border-transparent bg-white/10 text-white/40",
           loading && "generation-loading-thumbnail",
         )}
         style={
@@ -1278,7 +1300,7 @@ function GenerationSlotStatusBadge({ status, title }: { status: "succeeded" | "f
   return (
     <span
       className={cn(
-        "pointer-events-none absolute bottom-1 right-1 rounded bg-black/70 px-1.5 py-0.5 text-[10px] leading-none",
+        "pointer-events-none absolute bottom-1 right-1 rounded-[6px] bg-black/70 px-1.5 py-0.5 text-[10px] leading-none",
         status === "failed" ? "text-destructive" : "text-white/60",
       )}
       title={title}
@@ -1293,7 +1315,7 @@ function GenerationReferenceSnapshots({ job }: { job: GenerationJob }) {
   if (references.length === 0) return null;
   return (
     <div className="flex min-w-0 items-center gap-2">
-      <span className="shrink-0 rounded-md bg-white/10 px-2 py-1 text-xs leading-none text-white/45">参考图</span>
+      <span className="shrink-0 rounded-[6px] bg-white/10 px-2 py-1 text-xs leading-none text-white/45">参考图</span>
       <div className="thin-scrollbar flex min-w-0 gap-2 overflow-x-auto">
         {references.map((reference, index) => (
           <img
@@ -1329,7 +1351,7 @@ function GenerationTaskTimeline({ job }: { job: GenerationJob }) {
           {index < items.length - 1 && <span className="text-white/20">/</span>}
         </Fragment>
       ))}
-      <span className="rounded-md bg-white/10 px-2 py-1 leading-none text-white/45">
+      <span className="rounded-[6px] bg-white/10 px-2 py-1 leading-none text-white/45">
         {Math.min(progressCurrent, progressTotal)}/{progressTotal}
       </span>
     </div>
@@ -1359,7 +1381,7 @@ function GenerationThumbnail({ image, onOpen }: { image: ImageItem; onOpen: () =
     <CossButton
       type="button"
       variant="ghost"
-      className="block shrink-0 overflow-hidden rounded-md border border-white/10 bg-white/10 p-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/70 hover:bg-white/10"
+      className="block shrink-0 overflow-hidden rounded-[6px] border border-white/10 bg-white/10 p-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/70 hover:bg-white/10"
       style={{ width: size.width, height: size.height }}
       aria-label="查看大图"
       onClick={onOpen}
@@ -1836,6 +1858,8 @@ function GalleryView({
   const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
   const [previewItem, setPreviewItem] = useState<{ image: ImageItem; job: GenerationJob } | null>(null);
   const [error, setError] = useState("");
+  const [dateRange, setDateRange] = useState<DateRange | undefined>();
+  const [showOlderThanDefaultRange, setShowOlderThanDefaultRange] = useState(false);
 
   const availableRatios = useMemo(
     () => FIGMA_RATIOS.filter((ratio) => config.ratios.includes(ratio) || fallbackConfig.ratios.includes(ratio)),
@@ -1852,7 +1876,26 @@ function GalleryView({
   const refreshUsage = useCallback(() => {
     void onUsageChanged().catch(() => undefined);
   }, [onUsageChanged]);
-  const galleryGroups = useMemo(() => buildGalleryGroups(records, activeJob, activeImages, elapsedSeconds), [records, activeImages, activeJob, elapsedSeconds]);
+  const dateFilter = useMemo(() => dateRangeToGalleryFilter(dateRange), [dateRange]);
+  const normalizedDateFilter = useMemo(() => normalizeGalleryDateFilter(dateFilter), [dateFilter]);
+  const dateRangeLabel = useMemo(() => formatGalleryDateRangeLabel(dateRange), [dateRange]);
+  const galleryGroups = useMemo(
+    () =>
+      buildGalleryGroups(records, activeJob, activeImages, elapsedSeconds, {
+        dateFilter,
+        showOlderThanDefaultRange,
+      }),
+    [records, activeImages, activeJob, elapsedSeconds, dateFilter, showOlderThanDefaultRange],
+  );
+  const hasHiddenDefaultRangeItems = useMemo(
+    () => !normalizedDateFilter.active && galleryHasHiddenDefaultRangeItems(records, activeJob, activeImages),
+    [records, activeJob, activeImages, normalizedDateFilter.active],
+  );
+  const canLoadMoreGalleryItems = (!normalizedDateFilter.active && hasHiddenDefaultRangeItems && !showOlderThanDefaultRange) || Boolean(nextCursor);
+
+  useEffect(() => {
+    setShowOlderThanDefaultRange(false);
+  }, [dateRange]);
 
   const upsertRecord = useCallback((nextJob: GenerationJob, nextImages: ImageItem[]) => {
     setRecords((current) => {
@@ -2005,15 +2048,41 @@ function GalleryView({
   return (
     <section className="entry-fade thin-scrollbar h-full flex-1 overflow-y-auto px-5 py-5">
       <div className="mx-auto w-full max-w-[1680px]">
+        <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <Popover>
+              <PopoverTrigger
+                render={
+                  <CossButton
+                    type="button"
+                    variant="outline"
+                    className="h-9 min-w-[224px] justify-start rounded-[12px] border-white/15 bg-white/[0.04] px-3 text-xs font-medium text-white/72 hover:bg-white/[0.08] hover:text-white"
+                  />
+                }
+              >
+                <CalendarIcon aria-hidden="true" className="size-4 text-white/54" />
+                <span className={cn("truncate", !normalizedDateFilter.active && "text-white/42")}>{dateRangeLabel}</span>
+              </PopoverTrigger>
+              <PopoverPopup className="w-auto p-3" sideOffset={10}>
+                <Calendar defaultMonth={dateRange?.from} mode="range" selected={dateRange} onSelect={setDateRange} />
+              </PopoverPopup>
+            </Popover>
+            {normalizedDateFilter.active && (
+              <CossButton
+                type="button"
+                variant="ghost"
+                className="h-9 rounded-[8px] px-3 text-xs text-white/50 hover:bg-white/10 hover:text-white/78"
+                onClick={() => setDateRange(undefined)}
+              >
+                清除
+              </CossButton>
+            )}
+          </div>
+        </div>
         {recordsError && <Notice tone="error" text={recordsError} />}
         {error && <Notice tone="error" text={error} />}
         {galleryGroups.length === 0 && (
-          <div className="grid min-h-[240px] place-items-center rounded-[18px] border border-white/10 bg-white/[0.03] p-6 text-center">
-            <div className="flex flex-col items-center gap-3 text-white/40">
-              <Images className="size-7" />
-              <span className="text-sm">生成成功的图片会出现在这里</span>
-            </div>
-          </div>
+          <p className="py-10 text-center text-sm text-white/40">{galleryEmptyStateContract(normalizedDateFilter.active).text}</p>
         )}
         <div className="flex flex-col gap-8">
           {galleryGroups.map((group) => (
@@ -2030,6 +2099,7 @@ function GalleryView({
                     onOpen={() => setPreviewItem({ image: item.image, job: item.job })}
                     onEditImage={() => onEditImage(item.image, generationFormFromJob(item.job))}
                     onEditPrompt={() => onEditPrompt(generationFormFromJob(item.job))}
+                    onJumpToConversation={() => onJumpToConversation({ conversationId: item.job.conversation_id?.trim() || item.job.id, jobId: item.job.id })}
                     onRegenerate={() => void regenerateRecord({ job: item.job, images: item.recordImages, elapsedSeconds: item.elapsedSeconds })}
                     onDelete={() => void deleteRecord({ job: item.job, images: item.recordImages, elapsedSeconds: item.elapsedSeconds })}
                   />
@@ -2038,8 +2108,19 @@ function GalleryView({
             </section>
           ))}
         </div>
-        {nextCursor && (
-          <CossButton type="button" variant="outline" className="mx-auto mt-8 block h-9 rounded-md border border-white/15 bg-transparent px-4 text-xs text-white/60 hover:bg-white/10 hover:text-white/80" onClick={() => void loadRecords(nextCursor)}>
+        {canLoadMoreGalleryItems && (
+          <CossButton
+            type="button"
+            variant="outline"
+            className="mx-auto mt-8 block h-9 rounded-[8px] border border-white/15 bg-transparent px-4 text-xs text-white/60 hover:bg-white/10 hover:text-white/80"
+            onClick={() => {
+              if (!normalizedDateFilter.active && hasHiddenDefaultRangeItems && !showOlderThanDefaultRange) {
+                setShowOlderThanDefaultRange(true);
+                return;
+              }
+              if (nextCursor) void loadRecords(nextCursor);
+            }}
+          >
             加载更多
           </CossButton>
         )}
@@ -2069,66 +2150,22 @@ function GalleryView({
   );
 }
 
-function buildGalleryGroups(records: GenerationRecord[], activeJob: GenerationJob | null, activeImages: ImageItem[], elapsedSeconds: number) {
-  const normalizedRecords = records.map((record) =>
-    record.job.id === activeJob?.id
-      ? { ...record, job: activeJob, images: activeImages, elapsedSeconds: elapsedSeconds || record.elapsedSeconds }
-      : record,
-  );
-  const grouped = new Map<
-    string,
-    {
-      label: string;
-      items: Array<{ key: string; image: ImageItem; job: GenerationJob; recordImages: ImageItem[]; elapsedSeconds: number | null }>;
-    }
-  >();
-
-  for (const record of normalizedRecords) {
-    for (const image of record.images) {
-      const dateKey = galleryDayKey(image.createdAt || record.job.created_at);
-      const bucket = grouped.get(dateKey) ?? { label: formatGalleryGroupLabel(dateKey), items: [] };
-      bucket.items.push({
-        key: image.id,
-        image,
-        job: record.job,
-        recordImages: record.images,
-        elapsedSeconds: record.elapsedSeconds,
-      });
-      grouped.set(dateKey, bucket);
-    }
-  }
-
-  return Array.from(grouped.entries())
-    .sort(([left], [right]) => (left < right ? 1 : -1))
-    .map(([key, value]) => ({
-      key,
-      label: value.label,
-      items: value.items.sort((left, right) => (left.image.createdAt < right.image.createdAt ? 1 : -1)),
-    }));
+function dateRangeToGalleryFilter(dateRange: DateRange | undefined): GalleryDateFilter {
+  if (!dateRange?.from) return { from: "", to: "" };
+  return {
+    from: format(dateRange.from, "yyyy-MM-dd"),
+    to: dateRange.to ? format(dateRange.to, "yyyy-MM-dd") : "",
+  };
 }
 
-function galleryDayKey(value: string): string {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "older";
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
+function formatGalleryDateRangeLabel(dateRange: DateRange | undefined): string {
+  if (!dateRange?.from) return "选择日期范围";
+  const from = format(dateRange.from, "yyyy/MM/dd");
+  if (!dateRange.to || isSameGalleryDate(dateRange.from, dateRange.to)) return from;
+  return `${from} - ${format(dateRange.to, "yyyy/MM/dd")}`;
 }
 
-function formatGalleryGroupLabel(key: string): string {
-  if (key === "older") return "较早";
-  const date = new Date(`${key}T00:00:00`);
-  if (Number.isNaN(date.getTime())) return "较早";
-  const now = new Date();
-  if (isSameLocalDay(date, now)) return "今天";
-  const yesterday = new Date(now);
-  yesterday.setDate(now.getDate() - 1);
-  if (isSameLocalDay(date, yesterday)) return "昨天";
-  return `${date.getMonth() + 1}月${date.getDate()}日`;
-}
-
-function isSameLocalDay(left: Date, right: Date): boolean {
+function isSameGalleryDate(left: Date, right: Date): boolean {
   return left.getFullYear() === right.getFullYear() && left.getMonth() === right.getMonth() && left.getDate() === right.getDate();
 }
 
@@ -2140,19 +2177,21 @@ function buildGalleryImageActions(
   item: { image: ImageItem; job: GenerationJob },
   onEditImage: () => void,
   onEditPrompt: () => void,
+  onJumpToConversation: () => void,
   onRegenerate: () => void,
   onDelete: () => void,
 ): HoverImageAction[] {
   return [
     { key: "continue", label: "基于这张图片继续创作", icon: <GalleryHoverActionIcon src={generationContinueIcon} />, onSelect: onEditPrompt },
     { key: "local-edit", label: "局部编辑", icon: <GalleryHoverActionIcon src={generationLocalEditIcon} />, onSelect: onEditImage },
+    { key: "jump-to-message", label: "跳转到对应消息", icon: <GalleryHoverActionIcon src={generationJumpMessageIcon} />, onSelect: onJumpToConversation },
     { key: "regenerate", label: "重新生成", icon: <GalleryHoverActionIcon src={generationRegenerateIcon} />, onSelect: onRegenerate },
     { key: "copy", label: "复制提示词", icon: <GalleryHoverActionIcon src={generationCopyIcon} />, onSelect: () => void copyPrompt(item.job.prompt) },
     { key: "download", label: "下载这张图片", icon: <GalleryHoverActionIcon src={generationDownloadIcon} />, href: imageDownloadUrl(item.image) },
     {
       key: "delete",
       label: "删除这次生成",
-      icon: <GalleryHoverActionIcon src={referenceDeleteIcon} />,
+      icon: <GalleryHoverActionIcon src={generationDeleteIcon} />,
       onSelect: onDelete,
       confirm: {
         title: "删除这次生成？",
@@ -2168,6 +2207,7 @@ function GalleryImageCard({
   onOpen,
   onEditImage,
   onEditPrompt,
+  onJumpToConversation,
   onRegenerate,
   onDelete,
 }: {
@@ -2175,18 +2215,19 @@ function GalleryImageCard({
   onOpen: () => void;
   onEditImage: () => void;
   onEditPrompt: () => void;
+  onJumpToConversation: () => void;
   onRegenerate: () => void;
   onDelete: () => void;
 }) {
-  const actions = buildGalleryImageActions(item, onEditImage, onEditPrompt, onRegenerate, onDelete);
+  const actions = buildGalleryImageActions(item, onEditImage, onEditPrompt, onJumpToConversation, onRegenerate, onDelete);
 
   return (
-    <div className="group relative overflow-hidden rounded-[16px] border border-white/10 bg-white/[0.04]">
+    <div data-image-action-host className="group relative overflow-hidden rounded-[24px] border border-white/10 bg-white/[0.04]">
       <CossButton type="button" variant="ghost" className="block aspect-square h-auto w-full rounded-none border-0 bg-transparent p-0 hover:bg-transparent" onClick={onOpen}>
         <img src={item.image.url} alt={item.job.prompt || "生成图片"} className="h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]" />
       </CossButton>
       <div className="pointer-events-none absolute bottom-3 right-3 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
-        <HoverImageActionBar actions={actions} maxInlineActions={actions.length} />
+        <HoverImageActionBar actions={actions} />
       </div>
     </div>
   );
@@ -2195,7 +2236,7 @@ function GalleryImageCard({
 function InspirationPlaceholderView() {
   return (
     <section className="entry-fade grid h-full flex-1 place-items-center px-6">
-      <div className="rounded-[22px] border border-white/10 bg-white/[0.04] px-8 py-10 text-center">
+      <div className="rounded-[24px] border border-white/10 bg-white/[0.04] px-8 py-10 text-center">
         <p className="text-base font-medium text-white/90">灵感页正在完善·····</p>
       </div>
     </section>
@@ -2398,7 +2439,7 @@ function SettingsProviderSection({
         <div className="min-w-0">
           <h2 className="text-sm font-semibold text-white/90">{title}</h2>
         </div>
-        <span className="grid size-8 place-items-center rounded-[10px] bg-white/10">
+        <span className="grid size-8 place-items-center rounded-[12px] bg-white/10">
           <img src={openaiIcon} alt="" className="size-4" />
         </span>
       </div>
@@ -2481,7 +2522,7 @@ function SettingsSelectField({
   return (
     <label className="flex flex-col gap-2">
       <span className="text-xs leading-none text-white/60">{label}</span>
-      <CossSelect value={value} onChange={(event) => onChange(event.target.value)} className="h-10 justify-start rounded-[10px] border-white/15 bg-transparent px-4 text-sm font-semibold text-white/90">
+      <CossSelect value={value} onChange={(event) => onChange(event.target.value)} className="h-10 justify-start rounded-[12px] border-white/15 bg-transparent px-4 text-sm font-semibold text-white/90">
         {values.map((item) => (
           <option key={item} value={item} className="bg-[#191919] text-white">
             {item}
@@ -2499,7 +2540,7 @@ function optionOrFallback<T extends readonly string[]>(value: string | undefined
 
 function EmptyState({ icon, title, text }: { icon: ReactNode; title: string; text: string }) {
   return (
-    <div className="empty-state grid min-h-[520px] place-items-center rounded-lg border bg-card/70 p-6 text-center">
+    <div className="empty-state grid min-h-[520px] place-items-center rounded-[8px] border bg-card/70 p-6 text-center">
       <div className="grid max-w-sm justify-items-center gap-3">
         <div className="grid size-16 place-items-center rounded-full border bg-background text-muted-foreground">{icon}</div>
         <strong className="text-lg font-semibold">{title}</strong>

@@ -15,6 +15,7 @@ import {
   getImage,
   getSession,
   getSpaceByKey,
+  GENERATION_JOB_PAGE_SIZE,
   insertRateLimitEvent,
   listGenerationResultsForJob,
   listGenerationResultsForJobs,
@@ -24,6 +25,7 @@ import {
   listImagesForJobs,
   markCredentialTested,
   StoredReferenceImage,
+  updateJobStatus,
   upsertCredential,
 } from "./db";
 import { apiKeyHint, decryptSecret, encryptSecret, hashPassword, makeSessionToken, sha256Hex, verifyPassword } from "./crypto";
@@ -67,8 +69,8 @@ export const app = new Hono<AppBindings>();
 app.use("/api/*", cors({ origin: [], credentials: true }));
 
 app.onError((error, c) => {
-  console.error(error);
   if ("res" in error && error.res instanceof Response) return error.res;
+  console.error(error);
   return c.json({ ok: false, error: { code: "internal_error", message: "服务暂时不可用。" } }, 500);
 });
 
@@ -505,9 +507,11 @@ app.use("/api/*", async (c, next) => {
 
 app.get("/api/me", async (c) => {
   const space = c.get("space");
-  const credential = await getCredential(c.env.DB, space.id);
   const dailyLimit = dailyImageLimit(c.env);
-  const usage = await countDailyImageUsage(c.env.DB, space.id);
+  const [credential, usage] = await Promise.all([
+    getCredential(c.env.DB, space.id),
+    countDailyImageUsage(c.env.DB, space.id),
+  ]);
   return c.json({
     ok: true,
     space: { id: space.id, name: space.space_name },
@@ -733,14 +737,15 @@ app.post("/api/generations", async (c) => {
     jobId,
     await resolveConversationId(c.env.DB, space.id, requestedConversationId),
   );
-  await c.env.GENERATION_QUEUE.send({ jobId, spaceId: space.id });
+  await enqueueGenerationJob(c.env, jobId, space.id, parsed.input.quantity);
   return c.json({ ok: true, jobId, status: "queued" });
 });
 
 app.get("/api/generations", async (c) => {
   const spaceId = c.get("space").id;
   const jobs = await listGenerationJobs(c.env.DB, spaceId, c.req.query("cursor"));
-  const jobIds = jobs.map((job) => job.id);
+  const visibleJobs = jobs.slice(0, GENERATION_JOB_PAGE_SIZE);
+  const jobIds = visibleJobs.map((job) => job.id);
   const images = await listImagesForJobs(c.env.DB, spaceId, jobIds);
   const results = await listGenerationResultsForJobs(c.env.DB, spaceId, jobIds);
   const imagesByJob = new Map<string, typeof images>();
@@ -758,12 +763,15 @@ app.get("/api/generations", async (c) => {
 
   return c.json({
     ok: true,
-    records: jobs.map((job) => ({
-      job: serializeGenerationJob(job, resultsByJob.get(job.id) ?? []),
-      elapsedSeconds: generationElapsedSeconds(job),
-      images: (imagesByJob.get(job.id) ?? []).map((image) => serializeImage(image)),
-    })),
-    nextCursor: jobs.length === 30 ? jobs[jobs.length - 1]?.created_at : null,
+    records: visibleJobs.map((job) => {
+      const jobImages = imagesByJob.get(job.id) ?? [];
+      return {
+        job: serializeGenerationJob(job, resultsByJob.get(job.id) ?? []),
+        elapsedSeconds: generationElapsedSeconds(job),
+        images: jobImages.map((image) => serializeImage(image)),
+      };
+    }),
+    nextCursor: jobs.length > GENERATION_JOB_PAGE_SIZE ? visibleJobs.at(-1)?.created_at : null,
   });
 });
 
@@ -839,7 +847,7 @@ app.post("/api/generations/:jobId/regenerate", async (c) => {
     jobId,
     sourceJob.conversation_id ?? sourceJob.id,
   );
-  await c.env.GENERATION_QUEUE.send({ jobId, spaceId: space.id });
+  await enqueueGenerationJob(c.env, jobId, space.id, sourceJob.quantity);
   return c.json({ ok: true, jobId, status: "queued" });
 });
 
@@ -1028,6 +1036,24 @@ function providerHttpStatus(error: ProviderError): number {
   if (error.code === "provider_timeout") return 504;
   if (error.code === "provider_auth_failed") return 502;
   return 502;
+}
+
+async function enqueueGenerationJob(env: Env, jobId: string, spaceId: string, quantity: number): Promise<void> {
+  try {
+    await env.GENERATION_QUEUE.send({ jobId, spaceId });
+  } catch (error) {
+    const message = "生图任务进入队列失败，请稍后重试。";
+    try {
+      await updateJobStatus(env.DB, jobId, "failed", "queue_enqueue_failed", message, {
+        stage: "failed",
+        progressCurrent: 0,
+        progressTotal: quantity,
+      });
+    } catch (updateError) {
+      console.error("generation queue enqueue compensation failed", updateError);
+    }
+    throw jsonError(503, "queue_enqueue_failed", message);
+  }
 }
 
 function serializeGenerationJob(job: GenerationJobRecord, results: Awaited<ReturnType<typeof listGenerationResultsForJob>>) {

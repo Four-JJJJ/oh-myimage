@@ -1,5 +1,7 @@
-import { readFile, stat } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
 import { createServer, Server } from "node:http";
+import { Readable } from "node:stream";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { serve } from "@hono/node-server";
 import { app } from "../worker/index";
@@ -59,7 +61,7 @@ async function serveStaticAsset(request: Request, root: string): Promise<Respons
     "Cache-Control": target.endsWith("index.html") ? "no-cache" : "public, max-age=31536000, immutable",
   });
   if (request.method === "HEAD") return new Response(null, { headers });
-  return new Response(await readFile(target), { headers });
+  return new Response(Readable.toWeb(createReadStream(target)) as ReadableStream, { headers });
 }
 
 async function resolveStaticTarget(root: string, pathname: string): Promise<string | null> {

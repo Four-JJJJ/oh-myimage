@@ -97,7 +97,7 @@ npm exec vitest run <target-test-files>
 
 ```bash
 tar -czf oh-myimage-dev-release.tar.gz \
-  dist src migrations deploy package.json package-lock.json
+  dist dist-node src migrations deploy package.json package-lock.json
 ```
 
 远端准备目录并上传：

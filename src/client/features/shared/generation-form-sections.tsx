@@ -44,7 +44,7 @@ export function PromptSection({
           {optimizing ? "优化中" : "提示词优化"}
         </CossButton>
       </div>
-      <div className="figma-prompt-box flex min-h-[200px] flex-col gap-3 overflow-hidden rounded-[10px] border border-white/15 p-3">
+      <div className="figma-prompt-box flex min-h-[200px] flex-col gap-3 overflow-hidden rounded-[12px] border border-white/15 p-3">
         <CossTextarea
           ref={textareaRef}
           value={value}
@@ -108,7 +108,7 @@ export function ParameterSection({
   return (
     <section className="mt-4 pb-4">
       <Label className="mb-2 block text-xs font-semibold leading-[18px] text-white">参数</Label>
-      <div className="figma-param-panel flex flex-col gap-4 rounded-[10px] border border-white/15 p-3">
+      <div className="figma-param-panel flex flex-col gap-4 rounded-[12px] border border-white/15 p-3">
         <OptionGroup label="比例">
           {aspectRatios.map((ratio) => (
             <SegmentButton key={ratio} active={selectedAspectRatio === ratio} onClick={() => onAspectRatioChange(ratio)}>
@@ -167,7 +167,7 @@ export function GenerationFormFooter({
         <CossButton
           type="submit"
           variant="outline"
-          className="figma-generate-button flex h-[34px] w-[120px] shrink-0 items-center justify-center rounded-[10px] border border-white/28 bg-transparent px-0 text-xs font-semibold leading-none text-white/90 hover:bg-transparent hover:text-white disabled:cursor-not-allowed disabled:opacity-55"
+          className="figma-generate-button flex h-[34px] w-[120px] shrink-0 items-center justify-center rounded-[12px] border border-white/28 bg-transparent px-0 text-xs font-semibold leading-none text-white/90 hover:bg-transparent hover:text-white disabled:cursor-not-allowed disabled:opacity-55"
           loading={loading}
         >
           {loading ? "生成中" : idleLabel}
@@ -202,7 +202,7 @@ function SegmentButton({
       type="button"
       variant="outline"
       className={cn(
-        "figma-segment h-[28px] rounded-md px-2 text-center text-xs font-semibold leading-[18px] text-white/90",
+        "figma-segment h-[28px] rounded-[6px] px-2 text-center text-xs font-semibold leading-[18px] text-white/90",
         grow ? "min-w-0 flex-1" : "w-[44px] shrink-0",
         active ? "border-white/90 bg-white/10 hover:bg-white/10" : "border-white/10 bg-transparent hover:bg-transparent",
       )}

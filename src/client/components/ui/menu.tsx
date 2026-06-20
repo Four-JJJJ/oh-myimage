@@ -21,7 +21,7 @@ function MenuPopup({
         <MenuPrimitive.Popup
           data-slot="menu-popup"
           className={cn(
-            "z-40 min-w-[180px] overflow-hidden rounded-[18px] border border-white/12 bg-[#202020]/96 p-1 text-white shadow-[0_18px_44px_rgb(0_0_0/0.42)] outline-none backdrop-blur-xl",
+            "z-40 min-w-[180px] overflow-hidden rounded-[16px] border border-white/12 bg-[#202020]/96 p-1 text-white shadow-[0_18px_44px_rgb(0_0_0/0.42)] outline-none backdrop-blur-xl",
             className,
           )}
           {...props}
@@ -52,7 +52,7 @@ function MenuItem({
       className={cn(
         "flex cursor-default items-center gap-3 rounded-[12px] px-3 py-2.5 text-sm leading-5 text-white/88 outline-none transition data-[highlighted]:bg-white/10 data-[highlighted]:text-white data-[disabled]:pointer-events-none data-[disabled]:opacity-40",
         inset && "pl-9",
-        variant === "destructive" && "text-[#ff8c8c] data-[highlighted]:bg-[#ff4f4f]/14 data-[highlighted]:text-[#ffb3b3]",
+        variant === "destructive" && "text-[#ff4050] data-[highlighted]:bg-[#ff4f4f]/14 data-[highlighted]:text-[#ff4050]",
         className,
       )}
       {...props}

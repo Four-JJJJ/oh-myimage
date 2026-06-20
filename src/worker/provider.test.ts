@@ -48,8 +48,8 @@ describe("provider generation batching", () => {
     expect(resolveProviderImageConcurrency("10")).toBe(4);
   });
 
-  it("defaults to no immediate provider timeout retries", () => {
-    expect(resolveProviderTimeoutRetryAttempts(undefined)).toBe(0);
+  it("defaults to one immediate provider timeout retry", () => {
+    expect(resolveProviderTimeoutRetryAttempts(undefined)).toBe(1);
     expect(resolveProviderTimeoutRetryAttempts("1")).toBe(1);
     expect(resolveProviderTimeoutRetryAttempts("99")).toBe(3);
   });
@@ -121,7 +121,59 @@ describe("provider image result compatibility", () => {
     expect(result.mimeType).toBe("image/png");
   });
 
-  it("does not retry timed out generation requests by default", async () => {
+  it("rejects non-HTTPS provider image URLs before fetching", async () => {
+    vi.stubGlobal("fetch", vi.fn());
+
+    await expect(resolveProviderImageBinary({ url: "http://img.example.com/final.png" }, "png", 10_000)).rejects.toMatchObject({
+      code: "provider_image_download_blocked",
+    });
+
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects private provider image URL hosts before fetching", async () => {
+    vi.stubGlobal("fetch", vi.fn());
+
+    await expect(resolveProviderImageBinary({ url: "https://127.0.0.1/final.png" }, "png", 10_000)).rejects.toMatchObject({
+      code: "provider_image_download_blocked",
+    });
+
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects provider image downloads with non-image content types", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response("<html>not an image</html>", {
+          status: 200,
+          headers: { "Content-Type": "text/html" },
+        }),
+      ),
+    );
+
+    await expect(resolveProviderImageBinary({ url: "https://img.example.com/final.png" }, "png", 10_000)).rejects.toMatchObject({
+      code: "provider_image_download_invalid_content_type",
+    });
+  });
+
+  it("rejects provider image downloads that declare excessive content length", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response("tiny", {
+          status: 200,
+          headers: { "Content-Type": "image/png", "Content-Length": String(26 * 1024 * 1024) },
+        }),
+      ),
+    );
+
+    await expect(resolveProviderImageBinary({ url: "https://img.example.com/final.png" }, "png", 10_000)).rejects.toMatchObject({
+      code: "provider_image_download_too_large",
+    });
+  });
+
+  it("does not retry timed out generation requests when immediate retries are disabled", async () => {
     vi.stubGlobal(
       "fetch",
       vi
@@ -164,6 +216,7 @@ describe("provider image result compatibility", () => {
         {
           DB: new RecordingDatabase(),
           IMAGES: new MemoryObjectStore({}),
+          PROVIDER_TIMEOUT_RETRY_ATTEMPTS: "0",
         } as never,
         "idem-1",
       ),

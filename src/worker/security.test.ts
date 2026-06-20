@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { buildProviderEndpoint, isTokenFourjBaseURL, validateBaseURL } from "./security";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { buildProviderEndpoint, isTokenFourjBaseURL, validateBaseURL, verifyTurnstile } from "./security";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe("baseURL safety", () => {
   it("accepts public HTTPS provider URLs", () => {
@@ -27,5 +32,31 @@ describe("baseURL safety", () => {
     expect(isTokenFourjBaseURL("https://image.fourj.space/v1")).toBe(true);
     expect(isTokenFourjBaseURL("https://api.openai.com/v1")).toBe(false);
     expect(isTokenFourjBaseURL("https://not-token.fourj.space/v1")).toBe(false);
+  });
+});
+
+describe("Turnstile verification", () => {
+  it("uses an abort signal for Cloudflare verification requests", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      verifyTurnstile("turnstile-token", new Request("https://local.test/api/auth/space-login"), {
+        TURNSTILE_SECRET_KEY: "secret",
+      } as never),
+    ).resolves.toBe(true);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+      expect.objectContaining({
+        method: "POST",
+        signal: expect.any(AbortSignal),
+      }),
+    );
   });
 });

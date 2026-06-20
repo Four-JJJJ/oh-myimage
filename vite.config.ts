@@ -11,5 +11,14 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("/react-day-picker/") || id.includes("/date-fns/")) return "calendar-vendor";
+          return "vendor";
+        },
+      },
+    },
   },
 });

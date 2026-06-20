@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { hashPassword } from "./crypto";
 import { app, hasUnlimitedDailyImageQuota, resolveProviderRetryAttempts } from "./index";
 import type { AppDatabase, AppObject, AppObjectStore, AppObjectStorePutOptions, AppPreparedStatement, Env, ImageAssetRecord, SpaceRecord } from "./types";
@@ -40,6 +40,95 @@ describe("image downloads", () => {
 
     expect(response.status).toBe(200);
     expect(json.records[0]?.images[0]?.url).toBe("/api/images/img_1/download?raw=1");
+  });
+
+  it("returns generation records in pages of 40 and only exposes a cursor when more exist", async () => {
+    const db = new FakeRouteDatabase();
+    db.imageRecords.clear();
+    for (let index = 0; index < 41; index += 1) {
+      const padded = String(index).padStart(2, "0");
+      db.jobRecords.set(
+        `job_${padded}`,
+        makeJobRecord({
+          id: `job_${padded}`,
+          conversation_id: `job_${padded}`,
+          created_at: `2026-05-15T00:${String(40 - index).padStart(2, "0")}:00.000Z`,
+        }),
+      );
+    }
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        headers: { Cookie: "image2_session=test-token" },
+      },
+      testEnv({ db, images: new FakeObjectStore() }),
+    );
+    const json = (await response.json()) as { records: Array<{ job: { id: string; created_at: string } }>; nextCursor: string | null };
+
+    expect(response.status).toBe(200);
+    expect(json.records).toHaveLength(40);
+    expect(json.records.at(-1)?.job.id).toBe("job_39");
+    expect(json.nextCursor).toBe("2026-05-15T00:01:00.000Z");
+  });
+
+  it("does not mutate active generation jobs while reading details", async () => {
+    const db = new FakeRouteDatabase();
+    db.jobRecords.set(
+      "job_1",
+      makeJobRecord({
+        status: "running",
+        stage: "waiting_provider",
+        progress_current: 0,
+        completed_at: null,
+      }),
+    );
+    db.imageRecords.set("img_1", makeImageRecord({ job_id: "job_1" }));
+
+    const response = await app.request(
+      "http://local.test/api/generations/job_1",
+      {
+        headers: { Cookie: "image2_session=test-token" },
+      },
+      testEnv({ db, images: new FakeObjectStore() }),
+    );
+    const json = (await response.json()) as { job: { status: string; stage: string; progress_current: number }; images: unknown[] };
+
+    expect(response.status).toBe(200);
+    expect(json.job.status).toBe("running");
+    expect(json.job.stage).toBe("waiting_provider");
+    expect(json.job.progress_current).toBe(0);
+    expect(json.images).toHaveLength(1);
+    expect(db.completedJobUpdates).toEqual([]);
+  });
+
+  it("does not mutate active generation jobs while reading the list", async () => {
+    const db = new FakeRouteDatabase();
+    db.jobRecords.set(
+      "job_1",
+      makeJobRecord({
+        status: "running",
+        stage: "waiting_provider",
+        progress_current: 0,
+        completed_at: null,
+      }),
+    );
+    db.imageRecords.set("img_1", makeImageRecord({ job_id: "job_1" }));
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        headers: { Cookie: "image2_session=test-token" },
+      },
+      testEnv({ db, images: new FakeObjectStore() }),
+    );
+    const json = (await response.json()) as { records: Array<{ job: { status: string; stage: string; progress_current: number } }> };
+
+    expect(response.status).toBe(200);
+    expect(json.records[0]?.job.status).toBe("running");
+    expect(json.records[0]?.job.stage).toBe("waiting_provider");
+    expect(json.records[0]?.job.progress_current).toBe(0);
+    expect(db.completedJobUpdates).toEqual([]);
   });
 
   it("returns same-origin original image bytes for explicit downloads", async () => {
@@ -293,6 +382,41 @@ describe("generation creation", () => {
     );
   });
 
+  it("marks a newly-created job failed when queue enqueue fails", async () => {
+    const db = new FakeRouteDatabase();
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: "queue failure should not leave a stuck job",
+          aspectRatio: "1:1",
+          width: 1024,
+          height: 1024,
+          quality: "auto",
+          quantity: 1,
+          outputFormat: "png",
+          compression: 100,
+        }),
+      },
+      testEnv({ db, images: new FakeObjectStore(), generationQueue: new FailingQueue() }),
+    );
+    const json = (await response.json()) as { error: { code: string } };
+
+    expect(response.status).toBe(503);
+    expect(json.error.code).toBe("queue_enqueue_failed");
+    expect(db.generationJobInserts).toHaveLength(1);
+    expect(db.statusUpdates).toEqual([
+      expect.objectContaining({
+        jobId: expect.stringMatching(/^job_/),
+        status: "failed",
+        errorCode: "queue_enqueue_failed",
+        stage: "failed",
+      }),
+    ]);
+  });
+
   it("stores masks while copying source images for selected-area edits", async () => {
     const db = new FakeRouteDatabase();
     const images = new FakeObjectStore();
@@ -457,6 +581,53 @@ describe("generation regenerate", () => {
       ]),
     );
   });
+
+  it("marks regenerated jobs failed when queue enqueue fails", async () => {
+    const db = new FakeRouteDatabase();
+    db.jobRecords.set("job_source", makeJobRecord({ id: "job_source", prompt: "原始创作", conversation_id: "job_root" }));
+
+    const response = await app.request(
+      "http://local.test/api/generations/job_source/regenerate",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token" },
+      },
+      testEnv({ db, images: new FakeObjectStore(), generationQueue: new FailingQueue() }),
+    );
+    const json = (await response.json()) as { error: { code: string } };
+
+    expect(response.status).toBe(503);
+    expect(json.error.code).toBe("queue_enqueue_failed");
+    expect(db.generationJobInserts).toHaveLength(1);
+    expect(db.statusUpdates).toEqual([
+      expect.objectContaining({
+        jobId: expect.stringMatching(/^job_/),
+        status: "failed",
+        errorCode: "queue_enqueue_failed",
+        stage: "failed",
+      }),
+    ]);
+  });
+});
+
+describe("api error logging", () => {
+  it("does not log expected HTTP errors such as missing sessions", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const response = await app.request(
+        "http://local.test/api/me",
+        {
+          headers: {},
+        },
+        testEnv({ images: new FakeObjectStore() }),
+      );
+
+      expect(response.status).toBe(401);
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 });
 
 describe("space login", () => {
@@ -533,6 +704,8 @@ function disabledQueue() {
 
 class FakeRouteDatabase implements AppDatabase {
   readonly generationJobInserts: unknown[][] = [];
+  readonly completedJobUpdates: string[] = [];
+  readonly statusUpdates: Array<{ jobId: string; status: string; errorCode: string | null; errorMessage: string | null; stage: string }> = [];
   readonly imageRecords = new Map<string, ImageAssetRecord>([["img_1", makeImageRecord()]]);
   readonly jobRecords = new Map<string, Record<string, unknown>>();
 
@@ -661,6 +834,12 @@ class FakeRoutePreparedStatement implements AppPreparedStatement {
         results: Array.from(this.db.jobRecords.values()) as T[],
       };
     }
+    if (this.query.includes("FROM image_assets") && this.query.includes("WHERE job_id = ? AND space_id = ?")) {
+      const [jobId, spaceId] = this.values;
+      return {
+        results: Array.from(this.db.imageRecords.values()).filter((image) => image.job_id === jobId && image.space_id === spaceId) as T[],
+      };
+    }
     if (this.query.includes("FROM image_assets") && this.query.includes("job_id IN")) {
       const jobIds = new Set(this.values.slice(1).map(String));
       return {
@@ -673,6 +852,18 @@ class FakeRoutePreparedStatement implements AppPreparedStatement {
   async run(): Promise<unknown> {
     if (this.query.includes("INSERT INTO generation_jobs")) {
       this.db.generationJobInserts.push([...this.values]);
+    }
+    if (this.query.includes("UPDATE generation_jobs") && this.query.includes("stage = 'completed'")) {
+      this.db.completedJobUpdates.push(String(this.values.at(-1)));
+    }
+    if (this.query.includes("UPDATE generation_jobs") && this.query.includes("stage = ?")) {
+      this.db.statusUpdates.push({
+        status: String(this.values[0] ?? ""),
+        errorCode: this.values[1] === null ? null : String(this.values[1]),
+        errorMessage: this.values[2] === null ? null : String(this.values[2]),
+        stage: String(this.values[4] ?? ""),
+        jobId: String(this.values.at(-1) ?? ""),
+      });
     }
     return { success: true };
   }
@@ -796,5 +987,11 @@ class RecordingQueue {
 
   async send(message: { jobId: string; spaceId: string }): Promise<void> {
     this.messages.push(message);
+  }
+}
+
+class FailingQueue {
+  async send(): Promise<void> {
+    throw new Error("queue unavailable");
   }
 }

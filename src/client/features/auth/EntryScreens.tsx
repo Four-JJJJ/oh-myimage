@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import ohmioWordmark from "../../assets/figma/ohmio-wordmark.svg";
+import { LoadersWtfStatusIcon, LoadingStatusText } from "../shared/generation-loading";
 import { cn } from "../../lib/utils";
 
 export const entrySurfaceContract = {
@@ -12,89 +13,49 @@ export const entrySurfaceContract = {
   showDescription: false,
   cardMaxWidth: "560px",
   cardShadow: "none",
-  controlRadius: "10px",
+  controlRadius: "12px",
   inputBackground: "#1c1c1c",
   primaryButtonBackground: "rgba(255,255,255,0.9)",
 } as const;
 
 export const entryStatusLoadingLines = [
-  "正在加载会话消息",
-  "正在读取会话记录",
-  "正在恢复生成状态",
-  "正在准备 coss 工作区",
-  "正在同步空间信息",
+  "正在读取会话",
+  "正在同步记录",
+  "正在恢复画布",
+  "正在准备空间",
+  "正在连接工作区",
+  "正在整理生成状态",
+  "正在载入历史图片",
+  "正在校准页面",
 ] as const;
 export const entryStatusLoadingLoopLines = [...entryStatusLoadingLines, entryStatusLoadingLines[0]] as const;
-export const entryStatusLoadingAnimationDurationMs = 15_300;
+export const entryStatusLoadingAnimationDurationMs = 24_480;
+export const entryStatusSurfaceContract = {
+  card: false,
+  iconSize: "14px",
+  lineHeight: "22px",
+  textSize: "14px",
+  reusedGenerationStatus: true,
+} as const;
 
 export function EntryStatusScreen({ label, detail }: { label: string; detail?: string }) {
   return (
     <main className="app-shell relative grid min-h-screen place-items-center overflow-hidden px-6">
       <EntryBackdrop />
-      <div className="entry-fade relative z-10 flex w-full max-w-[420px] items-center gap-4 rounded-[22px] border border-white/12 bg-[#171717]/92 px-7 py-6 shadow-[0_24px_80px_rgba(0,0,0,0.45)] backdrop-blur-xl">
-        <EntryStatusDotLoader />
-        <div className="min-w-0 text-[22px] font-semibold leading-7 tracking-[0.01em] text-white">
-          <span className="sr-only">{label}</span>
-          {detail ? <span className="sr-only">{detail}</span> : null}
-          <EntryStatusLoadingText />
-        </div>
+      <div className="entry-fade relative z-10 flex items-center gap-2 text-sm leading-[22px] text-white">
+        <span className="inline-flex size-[14px] items-center justify-center">
+          <LoadersWtfStatusIcon />
+        </span>
+        <span className="sr-only">{label}</span>
+        {detail ? <span className="sr-only">{detail}</span> : null}
+        <LoadingStatusText
+          ariaLabel={entryStatusLoadingLines[0]}
+          lines={entryStatusLoadingLines}
+          loopLines={entryStatusLoadingLoopLines}
+          animationDurationMs={entryStatusLoadingAnimationDurationMs}
+        />
       </div>
     </main>
-  );
-}
-
-function EntryStatusDotLoader() {
-  const opacityFrames = [
-    "1;0.7667;0.5333;0;0;0;0;0",
-    "0;1;0.7667;0.5333;0;0;0;0",
-    "0;0;1;0.7667;0.5333;0;0;0",
-    "0.7667;0.5333;0;0;0;0;0;1",
-    "0;0;0;0;0;0;0;0",
-    "0;0;0;1;0.7667;0.5333;0;0",
-    "0.5333;0;0;0;0;0;1;0.7667",
-    "0;0;0;0;0;1;0.7667;0.5333",
-    "0;0;0;0;1;0.7667;0.5333;0",
-  ];
-  const cells = Array.from({ length: 9 }, (_, index) => index);
-  return (
-    <svg aria-hidden="true" className="ohm-loaders-wtf-status size-[30px] shrink-0" viewBox="0 0 91 91" fill="none">
-      <g>
-        {cells.map((index) => {
-          const row = Math.floor(index / 3);
-          const column = index % 3;
-          return <circle key={`off-${index}`} cx={column * 32 + 13.5} cy={row * 32 + 13.5} r="13.5" fill="#383737" />;
-        })}
-      </g>
-      <g>
-        {cells.map((index) => {
-          const row = Math.floor(index / 3);
-          const column = index % 3;
-          return (
-            <circle key={`on-${index}`} cx={column * 32 + 13.5} cy={row * 32 + 13.5} r="13.5" fill="#FFFFFFE6">
-              <animate attributeName="opacity" values={opacityFrames[index]} dur="1s" calcMode="discrete" repeatCount="indefinite" />
-            </circle>
-          );
-        })}
-      </g>
-    </svg>
-  );
-}
-
-function EntryStatusLoadingText() {
-  return (
-    <span className="entry-status-loading-copy" aria-label={entryStatusLoadingLines[0]}>
-      <span
-        className="entry-status-loading-track"
-        aria-hidden="true"
-        style={{ animationDuration: `${entryStatusLoadingAnimationDurationMs}ms` }}
-      >
-        {entryStatusLoadingLoopLines.map((line, index) => (
-          <span key={`${line}-${index}`} className="entry-status-loading-line">
-            {line}
-          </span>
-        ))}
-      </span>
-    </span>
   );
 }
 
@@ -110,11 +71,11 @@ export function EntryShell({
     <main className="app-shell relative min-h-dvh overflow-hidden text-white">
       <EntryBackdrop />
       <div className="relative z-10 grid min-h-dvh px-6 py-10">
-        <section className="entry-fade m-auto w-full max-w-[560px] rounded-[30px] border border-white/10 bg-[#1c1c1c] p-6 shadow-none md:p-8">
+        <section className="entry-fade m-auto w-full max-w-[560px] rounded-[24px] border border-white/10 bg-[#1c1c1c] p-6 shadow-none md:p-8">
           <div className="mb-6 flex items-center gap-3">
             <div className="flex min-w-0 items-center gap-2">
               <img src={ohmioWordmark} alt="Ohmio" className="h-4 w-[50px] shrink-0 select-none" draggable={false} />
-              <span className="rounded-[10px] border border-white/12 px-2 py-0.5 text-[11px] font-medium uppercase leading-4 text-white/52">
+              <span className="rounded-full border border-white/12 px-2 py-0.5 text-[11px] font-medium uppercase leading-4 text-white/52">
                 beta
               </span>
             </div>

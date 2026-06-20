@@ -64,9 +64,11 @@ const DEFAULT_RESPONSES_MODEL = "gpt-5.5";
 const DEFAULT_PROMPT_OPTIMIZER_MODEL = DEFAULT_RESPONSES_MODEL;
 const DEFAULT_PROMPT_OPTIMIZER_TIMEOUT_MS = 45_000;
 const IMMEDIATE_PROVIDER_TIMEOUT_RETRY_DELAY_MS = 3_000;
-const DEFAULT_PROVIDER_TIMEOUT_RETRY_ATTEMPTS = 0;
+const DEFAULT_PROVIDER_TIMEOUT_RETRY_ATTEMPTS = 1;
 const MAX_PROVIDER_TIMEOUT_RETRY_ATTEMPTS = 3;
 const IMMEDIATE_PROVIDER_TIMEOUT_RETRY_REQUEST_TIMEOUT_MS = 15_000;
+const MAX_PROVIDER_IMAGE_DOWNLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_PROVIDER_IMAGE_REDIRECTS = 3;
 const PROMPT_OPTIMIZER_MODELS = new Set(["gpt-5.5", "gpt-5.4"]);
 const MASKED_IMAGE_EDIT_PROMPT_SUFFIX = [
   "Treat the user's prompt as the replacement content for that selected area, not as an instruction to add a new object elsewhere in the image.",
@@ -434,13 +436,11 @@ export async function resolveProviderImageBinary(
     throw new ProviderError("empty_response", "模型服务没有返回图片。");
   }
 
+  const initialUrl = validateProviderImageUrl(image.url);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort("timeout"), Math.max(1_000, timeoutMs));
   try {
-    const response = await fetch(image.url, {
-      redirect: "follow",
-      signal: controller.signal,
-    });
+    const { response, finalUrl } = await fetchProviderImageUrl(initialUrl, controller.signal);
     if (!response.ok) {
       throw new ProviderError(
         "provider_image_download_failed",
@@ -449,9 +449,17 @@ export async function resolveProviderImageBinary(
       );
     }
 
-    const bytes = new Uint8Array(await response.arrayBuffer());
     const contentType = normalizeProviderContentType(response.headers.get("content-type"));
-    const format = providerImageFormatFromResponse(contentType, image.url, fallbackFormat);
+    if (contentType && !formatFromMimeType(contentType)) {
+      throw new ProviderError("provider_image_download_invalid_content_type", "模型已返回图片链接，但响应不是支持的图片格式。");
+    }
+    const declaredLength = contentLength(response.headers.get("content-length"));
+    if (declaredLength !== null && declaredLength > MAX_PROVIDER_IMAGE_DOWNLOAD_BYTES) {
+      throw new ProviderError("provider_image_download_too_large", "模型已返回图片链接，但图片文件超过 25MB。");
+    }
+
+    const bytes = await responseBytesWithLimit(response, MAX_PROVIDER_IMAGE_DOWNLOAD_BYTES);
+    const format = providerImageFormatFromResponse(contentType, finalUrl.toString(), fallbackFormat);
     return {
       bytes,
       format,
@@ -470,6 +478,107 @@ export async function resolveProviderImageBinary(
   } finally {
     clearTimeout(timer);
   }
+}
+
+function validateProviderImageUrl(rawUrl: string): URL {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new ProviderError("provider_image_download_blocked", "模型返回的图片链接不是有效 URL。");
+  }
+  if (url.protocol !== "https:") {
+    throw new ProviderError("provider_image_download_blocked", "模型返回的图片链接必须使用 HTTPS。");
+  }
+  if (url.username || url.password || isBlockedProviderImageHost(url.hostname)) {
+    throw new ProviderError("provider_image_download_blocked", "模型返回的图片链接不允许指向本机或内网地址。");
+  }
+  return url;
+}
+
+async function fetchProviderImageUrl(initialUrl: URL, signal: AbortSignal): Promise<{ response: Response; finalUrl: URL }> {
+  let currentUrl = initialUrl;
+  for (let redirectCount = 0; redirectCount <= MAX_PROVIDER_IMAGE_REDIRECTS; redirectCount += 1) {
+    const response = await fetch(currentUrl.toString(), {
+      redirect: "manual",
+      signal,
+    });
+    if (!isRedirectStatus(response.status)) return { response, finalUrl: currentUrl };
+
+    const location = response.headers.get("location");
+    if (!location) return { response, finalUrl: currentUrl };
+    currentUrl = validateProviderImageUrl(new URL(location, currentUrl).toString());
+  }
+  throw new ProviderError("provider_image_download_blocked", "模型返回的图片链接重定向次数过多。");
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+function isBlockedProviderImageHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "").replace(/\.$/, "");
+  if (!host || host === "localhost" || host.endsWith(".localhost")) return true;
+  if (host.includes(":")) return isBlockedIpv6Host(host);
+  const octets = host.split(".");
+  if (octets.length !== 4 || !octets.every((octet) => /^\d+$/.test(octet))) return false;
+  const values = octets.map(Number);
+  if (!values.every((value) => Number.isInteger(value) && value >= 0 && value <= 255)) return false;
+  const [a, b] = values;
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 198 && (b === 18 || b === 19)) return true;
+  return a >= 224;
+}
+
+function isBlockedIpv6Host(host: string): boolean {
+  return host === "::" || host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:");
+}
+
+function contentLength(value: string | null): number | null {
+  if (!value) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+async function responseBytesWithLimit(response: Response, maxBytes: number): Promise<Uint8Array> {
+  if (!response.body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > maxBytes) {
+      throw new ProviderError("provider_image_download_too_large", "模型已返回图片链接，但图片文件超过 25MB。");
+    }
+    return bytes;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new ProviderError("provider_image_download_too_large", "模型已返回图片链接，但图片文件超过 25MB。");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 export async function recoverStoredImageForResult(job: GenerationJobRecord, resultIndex: number, env: Env): Promise<StoredGenerationImage | null> {

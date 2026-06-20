@@ -7,6 +7,11 @@ import {
   conversationCanvasBottomPadding,
   conversationComposerGapPx,
   conversationFlowGapPx,
+  conversationHorizontalPaddingPx,
+  conversationMessageWidthClassName,
+  conversationPanelMaxWidthPx,
+  conversationPanelWidthClassName,
+  conversationViewportPaddingPx,
   conversationTopPaddingPx,
   emptyStateCopyToComposerGapPx,
   emptyFirstComposerTopPercent,
@@ -22,6 +27,15 @@ describe("generate menu layout helpers", () => {
     expect(conversationTopPaddingPx).toBe(40);
     expect(generationModuleGapPx).toBe(24);
     expect(conversationFlowGapPx).toBe(64);
+  });
+
+  it("keeps conversation messages aligned to the composer width", () => {
+    expect(conversationPanelMaxWidthPx).toBe(840);
+    expect(conversationViewportPaddingPx).toBe(16);
+    expect(conversationHorizontalPaddingPx).toBe(0);
+    expect(conversationPanelWidthClassName).toContain("840px");
+    expect(conversationPanelWidthClassName).toContain("100vw-32px");
+    expect(conversationMessageWidthClassName).toBe("w-full");
   });
 
   it("reserves enough canvas bottom space for the floating composer", () => {

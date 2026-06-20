@@ -1,5 +1,9 @@
 export const conversationTopPaddingPx = 40;
-export const conversationHorizontalPaddingPx = 152;
+export const conversationPanelMaxWidthPx = 840;
+export const conversationViewportPaddingPx = 16;
+export const conversationPanelWidthClassName = "w-[min(840px,calc(100vw-32px))] max-w-[calc(100vw-32px)]";
+export const conversationHorizontalPaddingPx = 0;
+export const conversationMessageWidthClassName = "w-full";
 export const conversationComposerGapPx = 40;
 export const conversationComposerBottomOffsetPx = 24;
 export const generationModuleGapPx = 24;

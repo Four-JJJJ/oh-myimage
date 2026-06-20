@@ -4,11 +4,18 @@ import {
   imagePreviewToolbarPositionClassName,
   imagePreviewActionKeys,
   generationRequestBody,
+  composerOptimizeBeamClassName,
+  composerOptimizeBeamProps,
   resolveConversationAutoScrollBehavior,
   resolveComposerPanelMode,
+  resolveGenerationPollIntervalMs,
   loadingStatusAnimationDurationMs,
   loadingStatusLines,
   loadingStatusLoopLines,
+  resolveHoverImageInlineActionCount,
+  shouldCloseHoverImageOverflowOnSelect,
+  shouldPollGeneration,
+  shouldShowComposerOptimizeBeam,
   updateGenerateForm,
 } from "./GenerateMenuView";
 import { claimGenerationSubmitLock, mergePolledJobState } from "../../generation-state";
@@ -34,10 +41,22 @@ describe("generate menu form helpers", () => {
   });
 
   it("keeps placeholder and typed text on the same typography metrics", () => {
+    expect(composerPromptTextareaClassName).toContain("ohm-composer-prompt-textarea");
     expect(composerPromptTextareaClassName).toContain("text-[15px]");
     expect(composerPromptTextareaClassName).toContain("leading-[21px]");
     expect(composerPromptTextareaClassName).toContain("placeholder:text-[15px]");
     expect(composerPromptTextareaClassName).toContain("placeholder:leading-[21px]");
+  });
+
+  it("wraps the prompt optimizer action in a contained colorful beam only while optimizing", () => {
+    expect(shouldShowComposerOptimizeBeam(true)).toBe(true);
+    expect(shouldShowComposerOptimizeBeam(false)).toBe(false);
+    expect(composerOptimizeBeamProps).toEqual({
+      size: "pulse-inner",
+      colorVariant: "colorful",
+      strength: 0.7,
+    });
+    expect(composerOptimizeBeamClassName).toContain("inline-flex");
   });
 
   it("exposes eight in-progress loading lines without start or finish phrasing", () => {
@@ -172,8 +191,26 @@ describe("generate menu form helpers", () => {
     expect(mergePolledJobState(staleRunningJob, finishedJob)).toEqual(finishedJob);
   });
 
+  it("backs off active generation polling as a job ages and skips hidden tabs", () => {
+    const createdAt = "2026-06-18T05:00:00.000Z";
+    expect(resolveGenerationPollIntervalMs(createdAt, Date.parse("2026-06-18T05:00:10.000Z"))).toBe(2000);
+    expect(resolveGenerationPollIntervalMs(createdAt, Date.parse("2026-06-18T05:00:45.000Z"))).toBe(5000);
+    expect(resolveGenerationPollIntervalMs(createdAt, Date.parse("2026-06-18T05:02:30.000Z"))).toBe(10000);
+    expect(shouldPollGeneration("visible")).toBe(true);
+    expect(shouldPollGeneration("hidden")).toBe(false);
+  });
+
   it("keeps the large-image preview toolbar aligned with the inline image actions", () => {
     expect(imagePreviewActionKeys()).toEqual(["continue", "local-edit", "regenerate", "copy", "download", "delete"]);
+  });
+
+  it("moves trailing image actions into more when the card cannot fit every button", () => {
+    expect(resolveHoverImageInlineActionCount({ actionCount: 6, availableWidth: 132 })).toBe(3);
+  });
+
+  it("lets destructive overflow menus close before opening their external confirm dialog", () => {
+    expect(shouldCloseHoverImageOverflowOnSelect({ confirm: { title: "删除？", description: "确认删除", confirmLabel: "删除" } })).toBe(true);
+    expect(shouldCloseHoverImageOverflowOnSelect({})).toBe(true);
   });
 
   it("places the large-image preview toolbar in the bottom-right corner", () => {

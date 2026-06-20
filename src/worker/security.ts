@@ -12,6 +12,7 @@ const BLOCKED_HOSTS = new Set([
   "metadata",
   "169.254.169.254",
 ]);
+const TURNSTILE_VERIFY_TIMEOUT_MS = 5_000;
 
 export function normalizeSpaceName(spaceName: string): { displayName: string; key: string } {
   const displayName = spaceName.trim().replace(/\s+/g, " ");
@@ -86,11 +87,20 @@ export async function verifyTurnstile(token: string | undefined, request: Reques
   const ip = request.headers.get("CF-Connecting-IP");
   if (ip) form.append("remoteip", ip);
 
-  const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-    method: "POST",
-    body: form,
-  });
-  if (!response.ok) return false;
-  const result = (await response.json()) as { success?: boolean };
-  return result.success === true;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort("timeout"), TURNSTILE_VERIFY_TIMEOUT_MS);
+  try {
+    const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      body: form,
+      signal: controller.signal,
+    });
+    if (!response.ok) return false;
+    const result = (await response.json()) as { success?: boolean };
+    return result.success === true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }

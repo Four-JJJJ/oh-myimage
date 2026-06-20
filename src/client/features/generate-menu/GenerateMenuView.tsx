@@ -1,16 +1,18 @@
-import { ClipboardEvent, ChangeEvent, Dispatch, FormEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ClipboardEvent, ChangeEvent, Dispatch, FormEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { BorderBeam } from "border-beam";
 import {
-  IconChevronDownSmall,
-  IconCircleDotsCenter2,
-  IconCrossSmall,
-  IconMagicWand2,
-  IconSparkle,
-} from "@central-icons-react/round-filled-radius-2-stroke-1.5";
-import { Redo2, Undo2 } from "lucide-react";
+  ChevronDown,
+  CircleEllipsis,
+  Sparkle,
+  WandSparkles,
+  X,
+  Redo2,
+  Undo2,
+} from "lucide-react";
 import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem } from "../../api";
 import generationContinueIcon from "../../assets/figma/generation-continue.svg";
 import generationCopyIcon from "../../assets/figma/generation-copy.svg";
+import generationDeleteIcon from "../../assets/figma/generation-delete.svg";
 import generationDownloadIcon from "../../assets/figma/generation-download.svg";
 import generationLocalEditIcon from "../../assets/figma/generation-local-edit.svg";
 import generationReferenceSourceIcon from "../../assets/figma/generation-reference-source.svg";
@@ -18,6 +20,16 @@ import generationRegenerateIcon from "../../assets/figma/generation-regenerate.s
 import referenceDeleteIcon from "../../assets/figma/reference-delete.svg";
 import sidebarAdd from "../../assets/figma/sidebar-add.svg";
 import { claimGenerationSubmitLock, isTerminalGenerationJobStatus, mergePolledJobState, releaseGenerationSubmitLock } from "../../generation-state";
+import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "../../components/ui/alert-dialog";
+import { Button } from "../../components/ui/button";
 import { Dialog, DialogDescription, DialogFooter, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "../../components/ui/dialog";
 import { cn } from "../../lib/utils";
 import { Group } from "../../components/ui/group";
@@ -27,11 +39,15 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../components/ui/ta
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../../components/ui/tooltip";
 import { AppShell } from "../generate-shell/AppShell";
 import { CossButton, CossTextarea } from "../shared/coss";
+import { LoadersWtfStatusIcon, LoadingStatusText as SharedLoadingStatusText } from "../shared/generation-loading";
 import {
   collapsedPromptMaxHeightPx,
   conversationCanvasBottomPadding,
   conversationFlowGapPx,
   conversationHorizontalPaddingPx,
+  conversationMessageWidthClassName,
+  conversationPanelMaxWidthPx,
+  conversationPanelWidthClassName,
   conversationTopPaddingPx,
   emptyStateCopyToComposerGapPx,
   emptyFirstComposerTopPercent,
@@ -56,7 +72,7 @@ import {
 } from "./mappers";
 import { formatGenerationSettingsSummary, formatLabels, formatOptions, generationSettingsSummaryParts, qualityLabels, qualityOptions, ratioLabels, ratioOptions, resolutionOptions } from "./options";
 
-const generationStageMaxWidthPx = 840;
+const generationStageMaxWidthPx = conversationPanelMaxWidthPx;
 const generationStageMaxHeightPx = 360;
 
 interface GenerateMenuViewProps {
@@ -249,7 +265,11 @@ function ComposerQualityIcon({ className }: { className?: string }) {
   );
 }
 
-const pollIntervalMs = 2000;
+const fastPollIntervalMs = 2000;
+const standardPollIntervalMs = 5000;
+const slowPollIntervalMs = 10000;
+const standardPollAfterMs = 30_000;
+const slowPollAfterMs = 120_000;
 const maxReferenceImages = 8;
 const referenceImageMaxBytes = 10 * 1024 * 1024;
 const referenceImageMimeTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
@@ -275,10 +295,22 @@ export const loadingStatusLines = [
 ] as const;
 export const loadingStatusLoopLines = [...loadingStatusLines, loadingStatusLines[0]] as const;
 export const composerPromptTextareaClassName =
-  `ohm-textarea-scrollbar relative z-[1] min-h-[42px] max-h-[252px] resize-none overflow-x-hidden overflow-y-auto border-0 p-0 ${composerPromptTextMetricsClassName} text-white/90 placeholder:text-[15px] placeholder:leading-[21px] placeholder:text-white/30 focus-visible:ring-0`;
+  `ohm-composer-prompt-textarea ohm-textarea-scrollbar relative z-[1] min-h-[42px] max-h-[252px] resize-none overflow-x-hidden overflow-y-auto border-0 p-0 ${composerPromptTextMetricsClassName} text-white/90 placeholder:text-[15px] placeholder:leading-[21px] placeholder:text-white/30 focus-visible:ring-0`;
+const composerActionButtonClassName =
+  "h-8 w-auto gap-1 border-transparent bg-white/10 px-3 py-1 text-sm font-normal leading-[22px] text-white hover:bg-white/12";
+export const composerOptimizeBeamClassName = "inline-flex shrink-0 rounded-[12px]";
+export const composerOptimizeBeamProps = {
+  size: "pulse-inner",
+  colorVariant: "colorful",
+  strength: 0.7,
+} as const;
 
 export function imagePreviewActionKeys() {
   return [...imagePreviewActionOrder];
+}
+
+export function shouldShowComposerOptimizeBeam(optimizing: boolean): boolean {
+  return optimizing;
 }
 
 export function resolveConversationAutoScrollBehavior({
@@ -300,6 +332,18 @@ export function resolveConversationAutoScrollBehavior({
 
 export function resolveComposerPanelMode(flowCount: number): ComposerLayoutMode {
   return resolveComposerLayoutMode(flowCount);
+}
+
+export function resolveGenerationPollIntervalMs(createdAt: string, now = Date.now()): number {
+  const createdAtMs = parseUtcTimestamp(createdAt);
+  const elapsedMs = Number.isFinite(createdAtMs) ? Math.max(0, now - createdAtMs) : 0;
+  if (elapsedMs >= slowPollAfterMs) return slowPollIntervalMs;
+  if (elapsedMs >= standardPollAfterMs) return standardPollIntervalMs;
+  return fastPollIntervalMs;
+}
+
+export function shouldPollGeneration(visibilityState: Document["visibilityState"] | undefined): boolean {
+  return visibilityState !== "hidden";
 }
 
 export function GenerateMenuView({
@@ -429,14 +473,33 @@ export function GenerateMenuView({
 
   useEffect(() => {
     if (!activeJob || isTerminalJobStatus(activeJob.status)) return;
-    const timer = window.setInterval(async () => {
-      if (pollInFlightRef.current) return;
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const schedulePoll = () => {
+      if (cancelled) return;
+      const currentJob = activeJobRef.current;
+      if (!currentJob || isTerminalJobStatus(currentJob.status)) return;
+      timer = window.setTimeout(pollJob, resolveGenerationPollIntervalMs(currentJob.created_at));
+    };
+
+    const pollJob = async () => {
+      if (cancelled) return;
+      if (!shouldPollGeneration(document.visibilityState)) {
+        schedulePoll();
+        return;
+      }
+      if (pollInFlightRef.current) {
+        schedulePoll();
+        return;
+      }
       pollInFlightRef.current = true;
       try {
         const result = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${activeJob.id}`);
         const fallbackReferenceImages = submittedReferenceImagesByJobId[activeJob.id] ?? activeJob.referenceImages;
         const mergedReferenceJob = mergeJobReferenceImages(result.job, fallbackReferenceImages ? { ...result.job, referenceImages: fallbackReferenceImages } : activeJob);
         const nextJob = mergePolledJobState(activeJobRef.current, mergedReferenceJob);
+        activeJobRef.current = nextJob;
         setActiveJob(nextJob);
         setActiveImages(result.images);
         upsertRecord(setRecords, nextJob, result.images);
@@ -449,11 +512,15 @@ export function GenerateMenuView({
         setError(err instanceof Error ? err.message : "刷新任务状态失败。");
       } finally {
         pollInFlightRef.current = false;
+        schedulePoll();
       }
-    }, pollIntervalMs);
+    };
+
+    schedulePoll();
     return () => {
+      cancelled = true;
       pollInFlightRef.current = false;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [activeJob?.id, activeJob?.status, activeJob?.referenceImages, loadRecords, onUsageChanged, setRecords, submittedReferenceImagesByJobId]);
 
@@ -905,7 +972,7 @@ function ConversationSidebar({
           if (showGroup) groupIndex += 1;
           lastGroup = conversation.groupLabel;
           return (
-            <div key={conversation.id}>
+            <div key={conversation.id} className="ohm-conversation-list-item">
               {showGroup && <p className={cn("mb-2 text-xs font-semibold leading-5 text-white/30", groupClassName)}>{conversation.groupLabel}</p>}
               <CossButton
                 type="button"
@@ -917,7 +984,7 @@ function ConversationSidebar({
                 onClick={() => onSelect(conversation.id)}
               >
                 <span className="grid size-8 shrink-0 place-items-center overflow-hidden rounded-[8px] bg-white/10">
-                  {conversation.previewImage ? <img src={conversation.previewImage} alt="" loading="lazy" decoding="async" className="size-full object-cover" /> : <IconSparkle ariaHidden size={16} className="text-white/45" />}
+                  {conversation.previewImage ? <img src={conversation.previewImage} alt="" loading="lazy" decoding="async" className="size-full object-cover" /> : <Sparkle aria-hidden size={16} className="text-white/45" />}
                 </span>
                 <span className="block min-w-0 flex-1 truncate pr-3">{conversation.title}</span>
               </CossButton>
@@ -976,7 +1043,7 @@ function GenerationCanvas({
         onScrollStickyChange(isScrollNearBottom(target.scrollTop, target.clientHeight, target.scrollHeight));
       }}
     >
-      <div className="mx-auto flex max-w-[840px] flex-col" style={{ gap: conversationFlowGapPx }}>
+      <div className={cn("relative left-1/2 flex -translate-x-1/2 flex-col", conversationPanelWidthClassName)} style={{ gap: conversationFlowGapPx }}>
         {error && <div className="ohm-smooth-card border border-red-400/20 bg-red-500/10 px-3 py-2 text-sm text-red-100">{error}</div>}
         {flows.map((flow) => (
           <GenerationCard
@@ -1044,7 +1111,7 @@ function GenerationCard({
   return (
     <article className="relative text-white/90" data-generation-job-id={flow.job.id}>
       {referenceImages.length > 0 && (
-        <div className="mb-2 flex min-h-8 w-full items-start gap-2">
+        <div className={cn("mb-2 flex min-h-8 items-start gap-2", conversationMessageWidthClassName)}>
           <span className="mt-2 grid size-4 shrink-0 place-items-center text-white/90">
             <SentReferenceIcon className="size-4 text-white/90" />
           </span>
@@ -1069,7 +1136,7 @@ function GenerationCard({
                     ],
                   })}
               >
-                <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[5px] border border-transparent bg-white/10">
+                <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[6px] border border-transparent bg-white/10">
                   <img src={image.url} alt={image.name || `参考图 ${index + 1}`} loading="lazy" decoding="async" className="size-full object-cover" />
                 </span>
                 <span className="whitespace-nowrap">{image.name || `参考图 ${index + 1}`}</span>
@@ -1078,7 +1145,7 @@ function GenerationCard({
           </div>
         </div>
       )}
-      <div className="max-w-[840px]">
+      <div className={conversationMessageWidthClassName}>
         <p
           ref={promptRef}
           className={cn(
@@ -1090,7 +1157,7 @@ function GenerationCard({
         </p>
       </div>
 
-      <div className="mt-2 flex max-w-[840px] items-center gap-2">
+      <div className={cn("mt-2 flex items-center gap-2", conversationMessageWidthClassName)}>
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
           {chips.map((chip) => (
             <span key={chip} className="rounded-[6px] bg-white/10 px-2 py-1 text-xs leading-none text-white/60">
@@ -1110,7 +1177,7 @@ function GenerationCard({
       </div>
 
       {showStatusRow && (
-        <div className="flex items-center gap-2 text-sm leading-[22px] text-white" style={{ marginTop: generationModuleGapPx }}>
+        <div className={cn("flex items-center gap-2 text-sm leading-[22px] text-white", conversationMessageWidthClassName)} style={{ marginTop: generationModuleGapPx }}>
           <span className="inline-flex size-[14px] items-center justify-center">
             <LoadersWtfStatusIcon />
           </span>
@@ -1187,30 +1254,11 @@ function GenerationStageImageCell({
   onDelete: (record: GenerationRecord) => void;
   onCopyPrompt: (prompt: string) => void;
 }) {
-  const rootRef = useRef<HTMLDivElement | null>(null);
   const [isPinnedOpen, setIsPinnedOpen] = useState(false);
-  const [maxInlineActions, setMaxInlineActions] = useState(3);
   const actions = buildGeneratedImageActions(image, prompt, record, onContinue, onLocalEdit, onRegenerate, onDelete, onCopyPrompt);
 
-  useEffect(() => {
-    if (!rootRef.current) return;
-    const element = rootRef.current;
-    const updateCount = () => {
-      const width = element.getBoundingClientRect().width;
-      if (width >= 164) setMaxInlineActions(5);
-      else if (width >= 132) setMaxInlineActions(4);
-      else if (width >= 100) setMaxInlineActions(3);
-      else setMaxInlineActions(2);
-    };
-
-    updateCount();
-    const observer = new ResizeObserver(updateCount);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-
   return (
-    <div ref={rootRef} className={cn("group/image relative h-full min-w-0 flex-1 overflow-hidden bg-[#222]", showDivider && "border-l border-white/20")}>
+    <div data-image-action-host className={cn("group/image relative h-full min-w-0 flex-1 overflow-hidden bg-[#222]", showDivider && "border-l border-white/20")}>
       <CossButton type="button" variant="ghost" className="block h-full w-full rounded-none border-0 bg-transparent p-0 hover:bg-transparent" onClick={() => onPreview({ url: image.url, prompt: image.prompt ?? prompt, actions })}>
         <img src={image.url} alt={image.prompt ?? "生成图片"} decoding="async" className="h-full w-full object-cover" />
       </CossButton>
@@ -1220,7 +1268,7 @@ function GenerationStageImageCell({
           isPinnedOpen && "pointer-events-auto opacity-100",
         )}
       >
-        <HoverImageActionBar actions={actions} maxInlineActions={maxInlineActions} onMoreOpenChange={setIsPinnedOpen} />
+        <HoverImageActionBar actions={actions} onMoreOpenChange={setIsPinnedOpen} />
       </div>
     </div>
   );
@@ -1245,7 +1293,7 @@ function buildGeneratedImageActions(
     {
       key: "delete",
       label: "删除这次生成",
-      icon: <ToolbarActionIcon src={referenceDeleteIcon} />,
+      icon: <ToolbarActionIcon src={generationDeleteIcon} />,
       onSelect: () => onDelete(record),
       confirm: {
         title: "删除这次生成？",
@@ -1262,12 +1310,41 @@ export function HoverImageActionBar({
   onMoreOpenChange,
 }: {
   actions: HoverImageAction[];
-  maxInlineActions: number;
+  maxInlineActions?: number;
   onMoreOpenChange?: (open: boolean) => void;
 }) {
-  const inlineActions = actions.slice(0, maxInlineActions);
-  const overflowActions = actions.slice(maxInlineActions);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [inlineActionCount, setInlineActionCount] = useState(() => Math.min(actions.length, maxInlineActions ?? actions.length));
+  const [confirmAction, setConfirmAction] = useState<HoverImageAction | null>(null);
+  const inlineActions = actions.slice(0, inlineActionCount);
+  const overflowActions = actions.slice(inlineActionCount);
   const moreTriggerRef = useRef<HTMLButtonElement | null>(null);
+
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    const host = root?.closest("[data-image-action-host]") ?? root?.parentElement?.parentElement ?? root?.parentElement ?? root;
+    if (!host) {
+      setInlineActionCount(Math.min(actions.length, maxInlineActions ?? actions.length));
+      return;
+    }
+
+    const updateInlineActionCount = () => {
+      const width = host.getBoundingClientRect().width - hoverImageActionBarHorizontalInsetPx;
+      setInlineActionCount(
+        resolveHoverImageInlineActionCount({
+          actionCount: actions.length,
+          availableWidth: width,
+          maxInlineActions,
+        }),
+      );
+    };
+
+    updateInlineActionCount();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(updateInlineActionCount);
+    observer.observe(host);
+    return () => observer.disconnect();
+  }, [actions.length, maxInlineActions]);
 
   function handleMoreOpenChange(open: boolean) {
     onMoreOpenChange?.(open);
@@ -1278,48 +1355,99 @@ export function HoverImageActionBar({
 
   return (
     <TooltipProvider delay={120}>
-      <Group className="pointer-events-auto rounded-[16px] border border-white/[0.08] bg-[#121212] p-0.5 shadow-[0_18px_40px_rgb(0_0_0/0.46)]">
-        {inlineActions.map((action) => (
-          <ActionGroupEntry key={action.key} action={action} />
-        ))}
-        {overflowActions.length > 0 && (
-          <Tooltip>
-            <Menu onOpenChange={handleMoreOpenChange}>
-              <TooltipTrigger
-                render={
-                  <MenuTrigger
-                    ref={moreTriggerRef}
-                    aria-label="更多操作"
-                    className="ohm-smooth-control inline-flex size-8 shrink-0 items-center justify-center rounded-[12px] border border-transparent bg-transparent text-white/72 outline-none transition hover:bg-white/[0.08] hover:text-white data-[popup-open]:bg-white/[0.08] data-[popup-open]:text-white"
-                  >
-                    <IconCircleDotsCenter2 ariaHidden size={16} />
-                  </MenuTrigger>
-                }
-              />
-              <MenuPopup className="border-white/[0.08] bg-[#121212] shadow-[0_18px_44px_rgb(0_0_0/0.46)]">
-                <MenuGroup>
-                  {overflowActions.map((action) => (
-                    <OverflowMenuItem key={action.key} action={action} />
-                  ))}
-                </MenuGroup>
-              </MenuPopup>
-            </Menu>
-            <TooltipContent side="top">更多操作</TooltipContent>
-          </Tooltip>
-        )}
-      </Group>
+      <div ref={rootRef} className="pointer-events-auto inline-flex">
+        <Group className="rounded-[16px] border border-white/[0.08] bg-[#121212] p-0.5 shadow-[0_18px_40px_rgb(0_0_0/0.46)]">
+          {inlineActions.map((action) => (
+            <ActionGroupEntry key={action.key} action={action} onConfirmAction={setConfirmAction} />
+          ))}
+          {overflowActions.length > 0 && (
+            <Tooltip>
+              <Menu onOpenChange={handleMoreOpenChange}>
+                <TooltipTrigger
+                  render={
+                    <MenuTrigger
+                      ref={moreTriggerRef}
+                      aria-label="更多操作"
+                      className="ohm-smooth-control inline-flex size-8 shrink-0 items-center justify-center rounded-[12px] border border-transparent bg-transparent text-white/72 outline-none transition hover:bg-white/[0.08] hover:text-white data-[popup-open]:bg-white/[0.08] data-[popup-open]:text-white"
+                    >
+                      <CircleEllipsis aria-hidden size={16} />
+                    </MenuTrigger>
+                  }
+                />
+                <MenuPopup className="border-white/[0.08] bg-[#121212] shadow-[0_18px_44px_rgb(0_0_0/0.46)]">
+                  <MenuGroup>
+                    {overflowActions.map((action) => (
+                      <OverflowMenuItem key={action.key} action={action} onConfirmAction={setConfirmAction} />
+                    ))}
+                  </MenuGroup>
+                </MenuPopup>
+              </Menu>
+              <TooltipContent side="top">更多操作</TooltipContent>
+            </Tooltip>
+          )}
+        </Group>
+      </div>
+      {confirmAction?.confirm && (
+        <ConfirmImageActionDialog
+          action={confirmAction}
+          open
+          onOpenChange={(nextOpen) => {
+            if (!nextOpen) setConfirmAction(null);
+          }}
+        />
+      )}
     </TooltipProvider>
   );
 }
 
-function ActionGroupEntry({ action }: { action: HoverImageAction }) {
+export function resolveHoverImageInlineActionCount({
+  actionCount,
+  availableWidth,
+  maxInlineActions = actionCount,
+}: {
+  actionCount: number;
+  availableWidth: number;
+  maxInlineActions?: number;
+}) {
+  const cappedActionCount = Math.max(0, Math.min(actionCount, maxInlineActions));
+  if (cappedActionCount === 0) return 0;
+  if (availableWidth <= 0) return cappedActionCount;
+
+  const groupHorizontalPaddingPx = 4;
+  const actionButtonWidthPx = 32;
+  const moreButtonWidthPx = 32;
+  const allActionsWidth = groupHorizontalPaddingPx + actionCount * actionButtonWidthPx;
+  if (cappedActionCount >= actionCount && allActionsWidth <= availableWidth) return actionCount;
+
+  const inlineWithMore = Math.floor((availableWidth - groupHorizontalPaddingPx - moreButtonWidthPx) / actionButtonWidthPx);
+  return Math.max(0, Math.min(cappedActionCount, actionCount - 1, inlineWithMore));
+}
+
+const hoverImageActionBarHorizontalInsetPx = 24;
+
+export function shouldCloseHoverImageOverflowOnSelect(action: Pick<HoverImageAction, "confirm">): boolean {
+  return true;
+}
+
+function ActionGroupEntry({
+  action,
+  onConfirmAction,
+}: {
+  action: HoverImageAction;
+  onConfirmAction: (action: HoverImageAction) => void;
+}) {
   return (
-    <HoverActionButton action={action} />
+    <HoverActionButton action={action} onConfirmAction={onConfirmAction} />
   );
 }
 
-function HoverActionButton({ action }: { action: HoverImageAction }) {
-  const [confirmOpen, setConfirmOpen] = useState(false);
+function HoverActionButton({
+  action,
+  onConfirmAction,
+}: {
+  action: HoverImageAction;
+  onConfirmAction: (action: HoverImageAction) => void;
+}) {
   const commonClassName =
     "ohm-smooth-control inline-flex size-8 shrink-0 items-center justify-center rounded-[12px] border border-transparent bg-transparent text-white/72 transition hover:bg-white/[0.08] hover:text-white focus-visible:ring-2 focus-visible:ring-white/20";
 
@@ -1343,7 +1471,7 @@ function HoverActionButton({ action }: { action: HoverImageAction }) {
               size="icon-sm"
               aria-label={action.label}
               className={commonClassName}
-              onClick={action.confirm ? () => setConfirmOpen(true) : action.onSelect}
+              onClick={action.confirm ? () => onConfirmAction(action) : action.onSelect}
             >
               {action.icon}
             </CossButton>
@@ -1351,20 +1479,17 @@ function HoverActionButton({ action }: { action: HoverImageAction }) {
         />
         <TooltipContent side="top">{action.label}</TooltipContent>
       </Tooltip>
-      {action.confirm && (
-        <ConfirmImageActionDialog
-          action={action}
-          open={confirmOpen}
-          onOpenChange={setConfirmOpen}
-        />
-      )}
     </>
   );
 }
 
-function OverflowMenuItem({ action }: { action: HoverImageAction }) {
-  const [confirmOpen, setConfirmOpen] = useState(false);
-
+function OverflowMenuItem({
+  action,
+  onConfirmAction,
+}: {
+  action: HoverImageAction;
+  onConfirmAction: (action: HoverImageAction) => void;
+}) {
   if (action.href) {
     return (
       <MenuItem
@@ -1382,21 +1507,14 @@ function OverflowMenuItem({ action }: { action: HoverImageAction }) {
   return (
     <>
       <MenuItem
-        closeOnClick
-        onClick={action.confirm ? () => setConfirmOpen(true) : action.onSelect}
+        closeOnClick={shouldCloseHoverImageOverflowOnSelect(action)}
+        onClick={action.confirm ? () => onConfirmAction(action) : action.onSelect}
         variant={action.confirm ? "destructive" : "default"}
         className={!action.confirm ? "text-white/90 data-[highlighted]:bg-white/[0.08]" : undefined}
       >
         <span className="grid size-4 shrink-0 place-items-center text-white/80">{action.icon}</span>
         <span>{action.label}</span>
       </MenuItem>
-      {action.confirm && (
-        <ConfirmImageActionDialog
-          action={action}
-          open={confirmOpen}
-          onOpenChange={setConfirmOpen}
-        />
-      )}
     </>
   );
 }
@@ -1413,87 +1531,41 @@ function ConfirmImageActionDialog({
   if (!action.confirm) return null;
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup className="max-w-[420px] rounded-[20px] bg-[#121212]">
-        <DialogHeader className="border-b-0 pb-2">
-          <div className="grid size-10 shrink-0 place-items-center rounded-[14px] border border-[#ff6b6b]/18 bg-[#ff4f4f]/10 text-[#ffb3b3]">
-            {action.icon}
-          </div>
-          <div className="min-w-0 flex-1">
-            <DialogTitle className="text-base font-medium leading-6 text-white">{action.confirm.title}</DialogTitle>
-            <DialogDescription className="mt-1 text-sm leading-5 text-white/52">{action.confirm.description}</DialogDescription>
-          </div>
-        </DialogHeader>
-        <DialogPanel className="hidden p-0" />
-        <DialogFooter className="border-t-0 pt-2">
-          <CossButton type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogPopup>
+        <AlertDialogHeader>
+          <AlertDialogTitle className="text-[20px] font-semibold leading-6 text-white">{action.confirm.title}</AlertDialogTitle>
+          <AlertDialogDescription className="text-[16px] leading-7 text-white/55">{action.confirm.description}</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogClose render={<Button variant="ghost" className="h-8 border-transparent text-white shadow-none hover:bg-white/[0.08] focus-visible:ring-0" />}>
             取消
-          </CossButton>
-          <CossButton
-            type="button"
-            variant="destructive"
-            onClick={() => {
-              onOpenChange(false);
-              action.onSelect?.();
-            }}
+          </AlertDialogClose>
+          <AlertDialogClose
+            render={
+              <Button
+                variant="destructive"
+                className="h-8 min-w-[88px]"
+                onClick={() => action.onSelect?.()}
+              />
+            }
           >
             {action.confirm.confirmLabel}
-          </CossButton>
-        </DialogFooter>
-      </DialogPopup>
-    </Dialog>
-  );
-}
-
-function LoadersWtfStatusIcon() {
-  const opacityFrames = [
-    "1;0.7667;0.5333;0;0;0;0;0",
-    "0;1;0.7667;0.5333;0;0;0;0",
-    "0;0;1;0.7667;0.5333;0;0;0",
-    "0.7667;0.5333;0;0;0;0;0;1",
-    "0;0;0;0;0;0;0;0",
-    "0;0;0;1;0.7667;0.5333;0;0",
-    "0.5333;0;0;0;0;0;1;0.7667",
-    "0;0;0;0;0;1;0.7667;0.5333",
-    "0;0;0;0;1;0.7667;0.5333;0",
-  ];
-  const cells = Array.from({ length: 9 }, (_, index) => index);
-  return (
-    <svg aria-hidden="true" className="ohm-loaders-wtf-status size-[14px] shrink-0" viewBox="0 0 91 91" fill="none">
-      <g>
-        {cells.map((index) => {
-          const row = Math.floor(index / 3);
-          const column = index % 3;
-          return <circle key={`off-${index}`} cx={column * 32 + 13.5} cy={row * 32 + 13.5} r="13.5" fill="#383737" />;
-        })}
-      </g>
-      <g>
-        {cells.map((index) => {
-          const row = Math.floor(index / 3);
-          const column = index % 3;
-          return (
-            <circle key={`on-${index}`} cx={column * 32 + 13.5} cy={row * 32 + 13.5} r="13.5" fill="#FFFFFFE6">
-              <animate attributeName="opacity" values={opacityFrames[index]} dur="1s" calcMode="discrete" repeatCount="indefinite" />
-            </circle>
-          );
-        })}
-      </g>
-    </svg>
+          </AlertDialogClose>
+        </AlertDialogFooter>
+      </AlertDialogPopup>
+    </AlertDialog>
   );
 }
 
 function LoadingStatusText() {
   return (
-    <span className="ohm-loading-status" aria-label="正在生成图片">
-      <span className="sr-only">正在生成图片</span>
-      <span className="ohm-loading-status-track" aria-hidden="true" style={{ animationDuration: `${loadingStatusAnimationDurationMs}ms` }}>
-        {loadingStatusLoopLines.map((line, index) => (
-          <span key={`${line}-${index}`} className="ohm-loading-status-line">
-            {line}
-          </span>
-        ))}
-      </span>
-    </span>
+    <SharedLoadingStatusText
+      ariaLabel="正在生成图片"
+      lines={loadingStatusLines}
+      loopLines={loadingStatusLoopLines}
+      animationDurationMs={loadingStatusAnimationDurationMs}
+    />
   );
 }
 
@@ -1582,10 +1654,10 @@ function ComposerChoiceMenu({
           >
             {icon && <span className="grid size-4 shrink-0 place-items-center text-white/90">{icon}</span>}
             <span className="whitespace-nowrap">{selected.label}</span>
-            <IconChevronDownSmall ariaHidden size={20} className={cn("shrink-0 text-white/60 transition-transform", open && "rotate-180")} />
+            <ChevronDown aria-hidden size={20} className={cn("shrink-0 text-white/60 transition-transform", open && "rotate-180")} />
           </CossButton>
       {open && (
-        <div className="absolute left-0 top-[calc(100%+8px)] z-30 w-max min-w-full overflow-hidden rounded-[10px] border border-white/15 bg-[#121212] p-1 shadow-[0_12px_32px_rgb(0_0_0/0.32)]">
+        <div className="absolute left-0 top-[calc(100%+8px)] z-30 w-max min-w-full overflow-hidden rounded-[8px] border border-white/15 bg-[#121212] p-1 shadow-[0_12px_32px_rgb(0_0_0/0.32)]">
           <div role="listbox" aria-label={label} className="flex w-max min-w-full flex-col gap-1">
             {options.map((option) => (
               <CossButton
@@ -1649,10 +1721,10 @@ function ComposerGenerationSettingsMenu({
             </span>
           ))}
         </span>
-        <IconChevronDownSmall ariaHidden size={20} className={cn("shrink-0 text-white/60 transition-transform", open && "rotate-180")} />
+        <ChevronDown aria-hidden size={20} className={cn("shrink-0 text-white/60 transition-transform", open && "rotate-180")} />
       </CossButton>
       {open && (
-        <div className="absolute bottom-[calc(100%+8px)] left-0 z-40 w-[480px] rounded-[18px] border border-white/15 bg-[#121212] p-4 shadow-[0_18px_48px_rgb(0_0_0/0.38)]">
+        <div className="absolute bottom-[calc(100%+8px)] left-0 z-40 w-[480px] rounded-[16px] border border-white/15 bg-[#121212] p-4 shadow-[0_18px_48px_rgb(0_0_0/0.38)]">
           <div className="flex flex-col gap-6">
             <div>
               <SettingsOptionTabs
@@ -1748,7 +1820,7 @@ function CustomSizeInputs({
   return (
     <div className="flex items-center gap-2">
       <SizeInput ariaLabel="自定义长度" value={width} onChange={onWidthChange} />
-      <IconCrossSmall ariaHidden size={12} className="shrink-0 text-white/30" />
+      <X aria-hidden size={12} className="shrink-0 text-white/30" />
       <SizeInput ariaLabel="自定义宽度" value={height} onChange={onHeightChange} />
     </div>
   );
@@ -1824,13 +1896,20 @@ function ComposerPanel({
   const modelName = modelOptions.includes(form.model) ? form.model : modelOptions[0];
   const submitDisabled = !providerConfigured || !form.prompt.trim() || (config.turnstileRequired && config.turnstileSiteKey ? !turnstileToken : false);
   const referenceCount = referenceImages.length + (sourceImagePreview ? 1 : 0);
+  const optimizeButton = (
+    <CossButton type="button" variant="outline" size="sm" loading={optimizing} className={composerActionButtonClassName} onClick={onOptimize}>
+      <ComposerOptimizeIcon className="size-4 shrink-0 text-white" />
+      {optimizing ? "优化中" : "优化提示词"}
+    </CossButton>
+  );
 
   return (
     <form
       ref={formRef}
       data-composer-layout-mode={layoutMode}
       className={cn(
-        "ohm-smooth-panel ohm-composer-panel absolute left-1/2 flex min-h-[170px] w-[min(840px,calc(100vw-32px))] max-w-[calc(100vw-32px)] -translate-x-1/2 flex-col items-start gap-4 overflow-visible border p-4",
+        "ohm-smooth-panel ohm-composer-panel absolute left-1/2 flex min-h-[170px] -translate-x-1/2 flex-col items-start gap-4 overflow-visible border p-4",
+        conversationPanelWidthClassName,
         layoutMode === "conversation" ? "bottom-6" : "",
       )}
       style={layoutMode === "empty-first-message" ? { top: `${emptyFirstComposerTopPercent}%` } : undefined}
@@ -1848,7 +1927,7 @@ function ComposerPanel({
       <div className="flex min-h-8 w-full flex-wrap items-center gap-x-2 gap-y-2">
         {sourceImagePreview && (
           <span className="ohm-smooth-control inline-flex h-8 min-w-0 max-w-full shrink items-center gap-2 overflow-hidden border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white">
-            <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[5px] border border-transparent bg-white/10">
+            <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[6px] border border-transparent bg-white/10">
               <img src={localEditPreviewUrl ?? sourceImagePreview.url} alt={sourceImagePreview.name} loading="lazy" decoding="async" className="size-full object-cover" />
             </span>
             <span className="min-w-0 truncate whitespace-nowrap">{sourceImagePreview.name}</span>
@@ -1859,7 +1938,7 @@ function ComposerPanel({
         )}
         {referenceImages.map((image, index) => (
           <span key={image.url} className="ohm-smooth-control inline-flex h-8 min-w-0 max-w-full shrink items-center gap-2 overflow-hidden border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white">
-            <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[5px] border border-transparent bg-white/10">
+            <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[6px] border border-transparent bg-white/10">
               <img src={image.url} alt={image.name} loading="lazy" decoding="async" className="size-full object-cover" />
             </span>
             <span className="min-w-0 truncate whitespace-nowrap">参考图 {index + 1}</span>
@@ -1873,7 +1952,7 @@ function ComposerPanel({
             type="button"
             variant="outline"
             size="sm"
-            className="h-8 min-w-[114px] justify-center gap-2 border-transparent bg-white/10 px-3 py-1 text-sm font-normal leading-[22px] text-white hover:bg-white/12"
+            className={composerActionButtonClassName}
             onClick={onPickReference}
           >
             <ComposerReferenceIcon className="size-4 shrink-0 text-white/90" />
@@ -1899,10 +1978,13 @@ function ComposerPanel({
       </div>
       <div className="flex w-full items-center justify-between gap-20">
         <div className="flex min-w-0 items-center gap-2">
-          <CossButton type="button" variant="outline" size="sm" loading={optimizing} className="h-8 w-[114px] gap-1 border-transparent bg-white/10 px-3 py-1 text-sm font-normal leading-[22px] text-white hover:bg-white/12" onClick={onOptimize}>
-            <ComposerOptimizeIcon className="size-4 shrink-0 text-white" />
-            {optimizing ? "优化中" : "优化提示词"}
-          </CossButton>
+          {shouldShowComposerOptimizeBeam(optimizing) ? (
+            <BorderBeam {...composerOptimizeBeamProps} className={composerOptimizeBeamClassName}>
+              {optimizeButton}
+            </BorderBeam>
+          ) : (
+            optimizeButton
+          )}
           <ComposerChoiceMenu
             label="模型"
             value={modelName}
@@ -1922,7 +2004,7 @@ function ComposerPanel({
             type="submit"
             loading={loading}
             disabled={submitDisabled}
-            className="h-8 min-w-16 border-transparent bg-white/90 text-black shadow-none hover:bg-white disabled:opacity-100 disabled:bg-white/20 disabled:text-white/40 disabled:hover:bg-white/20 disabled:shadow-none"
+            className="h-8 min-w-16 rounded-[12px] border-transparent bg-white/90 text-black shadow-none hover:bg-white disabled:opacity-100 disabled:bg-white/20 disabled:text-white/40 disabled:hover:bg-white/20 disabled:shadow-none"
           >
             生图
           </CossButton>
@@ -1959,7 +2041,7 @@ function ImagePreview({ image, onClose }: { image: PreviewImage; onClose: () => 
         <img src={image.url} alt="" aria-hidden="true" decoding="async" className="pointer-events-none absolute inset-0 h-full w-full scale-110 object-contain opacity-32 blur-3xl" />
         {image.actions && image.actions.length > 0 && (
           <div className={imagePreviewToolbarPositionClassName}>
-            <HoverImageActionBar actions={image.actions} maxInlineActions={image.actions.length} />
+            <HoverImageActionBar actions={image.actions} />
           </div>
         )}
         <CossButton
@@ -1970,7 +2052,7 @@ function ImagePreview({ image, onClose }: { image: PreviewImage; onClose: () => 
           className="absolute right-4 top-4 z-10 grid size-9 place-items-center rounded-full border-0 bg-white/10 text-white/80 transition hover:bg-white/16 hover:text-white"
           onClick={onClose}
         >
-          <IconCrossSmall ariaHidden size={20} />
+          <X aria-hidden size={20} />
         </CossButton>
       <img
           src={image.url}
@@ -2096,20 +2178,20 @@ function LocalEditDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup showCloseButton className="max-w-[1040px] bg-[#121212]">
-        <DialogHeader>
+      <DialogPopup showCloseButton className="h-[70dvh] max-h-[70dvh] max-w-[70vw] bg-[#121212]">
+        <DialogHeader className="px-5 py-3">
           <div className="min-w-0">
             <DialogTitle className="text-lg font-semibold leading-6 text-white">局部编辑</DialogTitle>
-            <DialogDescription className="mt-1 text-sm leading-6 text-white/56">
+            <DialogDescription className="mt-0.5 text-sm leading-5 text-white/56">
               在图片上直接涂抹需要重绘的区域，确认后会以“局部重绘”带回输入框。
             </DialogDescription>
           </div>
         </DialogHeader>
-        <DialogPanel className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_248px]">
-          <div className="min-w-0">
+        <DialogPanel className="grid min-h-0 gap-3 overflow-hidden px-4 py-4 lg:grid-cols-[minmax(0,1fr)_228px]">
+          <div className="min-h-0 min-w-0">
             <div
               ref={stageRef}
-              className="relative flex h-[min(62vh,680px)] min-h-[360px] items-center justify-center overflow-hidden rounded-[20px] border border-white/[0.08] bg-[#171717]"
+              className="relative flex h-full min-h-0 items-center justify-center overflow-hidden rounded-[16px] border border-white/[0.08] bg-[#171717]"
             >
               {image && (
                 <>
@@ -2128,15 +2210,7 @@ function LocalEditDialog({
             </div>
           </div>
           <div className="flex min-h-0 flex-col gap-3">
-            <div className="rounded-[18px] border border-white/[0.08] bg-white/[0.03] p-4">
-              <div className="text-sm font-medium leading-6 text-white">操作说明</div>
-              <div className="mt-2 space-y-1 text-sm leading-6 text-white/56">
-                <p>直接在图片上涂抹要重绘的区域。</p>
-                <p>绿色覆盖区域会被当成局部重绘蒙版。</p>
-                <p>确认后会自动带回主输入框。</p>
-              </div>
-            </div>
-            <div className="rounded-[18px] border border-white/[0.08] bg-white/[0.03] p-4">
+            <div className="rounded-[16px] border border-white/[0.08] bg-white/[0.03] p-4">
               <div className="flex items-center justify-between gap-3">
                 <span className="text-sm font-medium leading-6 text-white">当前状态</span>
                 <span className="rounded-[999px] bg-white/[0.08] px-2 py-1 text-xs leading-none text-white/60">
@@ -2171,11 +2245,11 @@ function LocalEditDialog({
             </div>
           </div>
         </DialogPanel>
-        <DialogFooter>
+        <DialogFooter className="px-5 py-3">
           <CossButton variant="ghost" className="h-9 px-4 text-white/72 hover:bg-white/[0.08] hover:text-white" onClick={() => onOpenChange(false)}>
             取消
           </CossButton>
-          <CossButton variant="default" loading={submitting} className="h-9 px-4" onClick={() => void confirmSelection()}>
+          <CossButton variant="default" loading={submitting} className="h-9 px-4 shadow-none disabled:shadow-none" onClick={() => void confirmSelection()}>
             带入输入框
           </CossButton>
         </DialogFooter>
@@ -2489,4 +2563,8 @@ function estimateJobElapsed(job: GenerationJob): number | null {
   const end = job.completed_at ? Date.parse(job.completed_at) : Date.now();
   if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
   return Math.max(0, Math.round((end - start) / 100) / 10);
+}
+
+function parseUtcTimestamp(value: string): number {
+  return /[zZ]|[+-]\d{2}:\d{2}$/.test(value) ? Date.parse(value) : Date.parse(`${value.replace(" ", "T")}Z`);
 }

@@ -1,5 +1,4 @@
-import { IconChevronDownSmall } from "@central-icons-react/round-filled-radius-2-stroke-1.5";
-import { Loader2 } from "lucide-react";
+import { ChevronDown, Loader2 } from "lucide-react";
 import type { ReactNode, SelectHTMLAttributes } from "react";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
@@ -39,7 +38,7 @@ export function CossSelect({
       >
         {children}
       </select>
-      {showChevron && <IconChevronDownSmall ariaHidden size={20} className="pointer-events-none absolute right-1.5 text-white/60" />}
+      {showChevron && <ChevronDown aria-hidden size={20} className="pointer-events-none absolute right-1.5 text-white/60" />}
     </label>
   );
 }

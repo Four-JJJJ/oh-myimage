@@ -16,6 +16,7 @@ describe("scripts/push-dev.sh", () => {
     });
 
     expect(output).toContain("tar -czf oh-myimage-dev-release.tar.gz");
+    expect(output).toContain("dist-node");
     expect(output).toContain("mkdir -p /opt/oh-myimage-dev/releases/dev-20260617150000");
     expect(output).toContain("ln -sfn /opt/oh-myimage-dev/releases/dev-20260617150000 /opt/oh-myimage-dev/current");
     expect(output).toContain("npm run db:migrate:postgres");

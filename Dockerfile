@@ -16,6 +16,7 @@ WORKDIR /app
 COPY --from=build /app/package.json /app/package-lock.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/dist-node ./dist-node
 COPY --from=build /app/src ./src
 COPY --from=build /app/migrations ./migrations
 

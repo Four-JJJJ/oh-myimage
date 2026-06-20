@@ -13,7 +13,7 @@ function Group({
       data-orientation={orientation}
       data-slot="group"
       className={cn(
-        "inline-flex items-stretch overflow-hidden rounded-[18px]",
+        "inline-flex items-stretch overflow-hidden rounded-[16px]",
         orientation === "horizontal" ? "flex-row" : "flex-col",
         className,
       )}

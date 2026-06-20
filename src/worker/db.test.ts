@@ -3,8 +3,10 @@ import {
   countDailyGeneratedImages,
   countDailyImageUsage,
   countPendingGenerationImages,
+  GENERATION_JOB_PAGE_SIZE,
   IMAGE_GENERATED_EVENT,
   insertImageUsageEvent,
+  listGenerationJobs,
   listGenerationResultsForJob,
   upsertGenerationJobResult,
 } from "./db";
@@ -88,9 +90,11 @@ describe("daily image usage accounting", () => {
 
     await expect(countPendingGenerationImages(db, "space_1")).resolves.toBe(2);
 
+    expect(db.calls[0]?.query).toContain("WITH active_jobs AS");
     expect(db.calls[0]?.query).toContain("generation_jobs.status IN ('queued', 'running')");
-    expect(db.calls[0]?.query).toContain("generation_jobs.quantity - COALESCE(image_counts.image_count, 0)");
-    expect(db.calls[0]?.values).toEqual(["space_1", "space_1"]);
+    expect(db.calls[0]?.query).toContain("image_assets.job_id = active_jobs.id");
+    expect(db.calls[0]?.query).toContain("active_jobs.quantity - COALESCE(image_counts.image_count, 0)");
+    expect(db.calls[0]?.values).toEqual(["space_1"]);
   });
 
   it("combines generated usage events and pending reservations", async () => {
@@ -112,6 +116,17 @@ describe("daily image usage accounting", () => {
       method: "run",
       values: ["evt_usage_img_abc", "space_1", IMAGE_GENERATED_EVENT],
     });
+  });
+});
+
+describe("generation job pagination", () => {
+  it("loads one extra generation job so callers can detect more than one visible page", async () => {
+    const db = new FakeDatabase();
+
+    await listGenerationJobs(db, "space_1");
+
+    expect(db.calls[0]?.query).toContain(`LIMIT ${GENERATION_JOB_PAGE_SIZE + 1}`);
+    expect(db.calls[0]?.values).toEqual(["space_1"]);
   });
 });
 

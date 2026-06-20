@@ -23,6 +23,7 @@ REMOTE_ARCHIVE_PATH="${RELEASE_DIR}/${ARCHIVE_NAME}"
 
 FILES_TO_PACKAGE=(
   "dist"
+  "dist-node"
   "src"
   "migrations"
   "deploy"
@@ -61,15 +62,15 @@ cleanup() {
 trap cleanup EXIT
 
 require_file "package.json"
-for path in "${FILES_TO_PACKAGE[@]}"; do
-  require_file "$path"
-done
 
 printf 'Preparing dev release: %s\n' "$RELEASE_NAME"
 printf 'Target: %s -> %s\n' "$REMOTE_ALIAS" "$REMOTE_URL"
 
 run git status --short
 run npm run build
+for path in "${FILES_TO_PACKAGE[@]}"; do
+  require_file "$path"
+done
 
 if [[ "$SKIP_TESTS" != "1" && -n "$TEST_ARGS" ]]; then
   run_shell "npm exec vitest run ${TEST_ARGS}"

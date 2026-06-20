@@ -14,6 +14,8 @@ import {
 import { GenerationInput } from "./validation";
 
 export const IMAGE_GENERATED_EVENT = "image_generated";
+export const GENERATION_JOB_PAGE_SIZE = 40;
+const GENERATION_JOB_PAGE_QUERY_LIMIT = GENERATION_JOB_PAGE_SIZE + 1;
 
 export interface StoredReferenceImage {
   storageKey: string;
@@ -259,11 +261,11 @@ export async function listGenerationJobs(db: AppDatabase, spaceId: string, curso
     ? `SELECT * FROM generation_jobs
        WHERE space_id = ? AND created_at < ?
        ORDER BY created_at DESC
-       LIMIT 30`
+       LIMIT ${GENERATION_JOB_PAGE_QUERY_LIMIT}`
     : `SELECT * FROM generation_jobs
        WHERE space_id = ?
        ORDER BY created_at DESC
-       LIMIT 30`;
+       LIMIT ${GENERATION_JOB_PAGE_QUERY_LIMIT}`;
   const statement = cursor ? db.prepare(sql).bind(spaceId, cursor) : db.prepare(sql).bind(spaceId);
   const result = await statement.all<GenerationJobRecord>();
   return result.results ?? [];
@@ -382,31 +384,38 @@ export async function countDailyGeneratedImages(db: AppDatabase, spaceId: string
 export async function countPendingGenerationImages(db: AppDatabase, spaceId: string): Promise<number> {
   const row = await db
     .prepare(
-      `SELECT COALESCE(SUM(
+      `WITH active_jobs AS (
+         SELECT id, quantity
+         FROM generation_jobs
+         WHERE space_id = ?
+           AND generation_jobs.status IN ('queued', 'running')
+       ),
+       image_counts AS (
+         SELECT image_assets.job_id, COUNT(*) AS image_count
+         FROM image_assets
+         INNER JOIN active_jobs ON image_assets.job_id = active_jobs.id
+         GROUP BY image_assets.job_id
+       )
+       SELECT COALESCE(SUM(
          CASE
-           WHEN generation_jobs.quantity > COALESCE(image_counts.image_count, 0)
-           THEN generation_jobs.quantity - COALESCE(image_counts.image_count, 0)
+           WHEN active_jobs.quantity > COALESCE(image_counts.image_count, 0)
+           THEN active_jobs.quantity - COALESCE(image_counts.image_count, 0)
            ELSE 0
          END
        ), 0) AS count
-       FROM generation_jobs
-       LEFT JOIN (
-         SELECT job_id, COUNT(*) AS image_count
-         FROM image_assets
-         WHERE space_id = ?
-         GROUP BY job_id
-       ) image_counts ON image_counts.job_id = generation_jobs.id
-       WHERE generation_jobs.space_id = ?
-         AND generation_jobs.status IN ('queued', 'running')`,
+       FROM active_jobs
+       LEFT JOIN image_counts ON image_counts.job_id = active_jobs.id`,
     )
-    .bind(spaceId, spaceId)
+    .bind(spaceId)
     .first<{ count: number | string }>();
   return dbNumber(row?.count);
 }
 
 export async function countDailyImageUsage(db: AppDatabase, spaceId: string): Promise<DailyImageUsage> {
-  const generated = await countDailyGeneratedImages(db, spaceId);
-  const pending = await countPendingGenerationImages(db, spaceId);
+  const [generated, pending] = await Promise.all([
+    countDailyGeneratedImages(db, spaceId),
+    countPendingGenerationImages(db, spaceId),
+  ]);
   return {
     generated,
     pending,

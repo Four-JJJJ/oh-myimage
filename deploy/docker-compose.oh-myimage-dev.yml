@@ -8,6 +8,7 @@ services:
     command: ["npm", "run", "start:node"]
     volumes:
       - ../dist:/app/dist:ro
+      - ../dist-node:/app/dist-node:ro
       - ../src:/app/src:ro
       - ../migrations:/app/migrations:ro
     ports:
@@ -27,6 +28,7 @@ services:
     command: ["npm", "run", "worker:node"]
     volumes:
       - ../dist:/app/dist:ro
+      - ../dist-node:/app/dist-node:ro
       - ../src:/app/src:ro
       - ../migrations:/app/migrations:ro
     depends_on:

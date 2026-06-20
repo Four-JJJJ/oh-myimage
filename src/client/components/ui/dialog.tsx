@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Dialog as DialogPrimitive } from "@base-ui/react/dialog";
-import { IconCrossSmall } from "@central-icons-react/round-filled-radius-2-stroke-1.5";
+import { X } from "lucide-react";
 import { cn } from "../../lib/utils";
 
 const Dialog = DialogPrimitive.Root;
@@ -30,7 +30,7 @@ function DialogPopup({
         >
           {showCloseButton && (
             <DialogPrimitive.Close className="absolute right-4 top-4 z-10 inline-flex size-8 items-center justify-center rounded-[12px] border border-transparent bg-white/[0.06] text-white/72 transition hover:bg-white/[0.1] hover:text-white">
-              <IconCrossSmall ariaHidden size={16} />
+              <X aria-hidden size={16} />
             </DialogPrimitive.Close>
           )}
           {children}
