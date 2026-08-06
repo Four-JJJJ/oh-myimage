@@ -1,5 +1,8 @@
 services:
   oh-myimage-dev-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
     image: ${OH_MYIMAGE_DEV_IMAGE:-oh-myimage:latest}
     container_name: oh-myimage-dev-api
     restart: unless-stopped

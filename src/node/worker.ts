@@ -2,7 +2,7 @@ import { Worker } from "bullmq";
 import { createNodeRuntime } from "./env";
 import { createRedisConnection, GENERATION_QUEUE_NAME, INSPIRATION_QUEUE_NAME } from "./queue";
 import { processInspirationSourceMessage } from "../worker/inspiration";
-import { resolveProviderRetryAttempts } from "../worker/index";
+import { resolvePostProcessingRetryAttempts, resolveProviderRetryAttempts } from "../worker/index";
 import { processGenerationMessage } from "../worker/provider";
 import type { GenerationMessage, InspirationQueueMessage } from "../worker/types";
 
@@ -10,14 +10,17 @@ const runtime = createNodeRuntime({ queues: false });
 const redisUrl = process.env.REDIS_URL ?? "redis://127.0.0.1:6379";
 const generationConnection = createRedisConnection(redisUrl);
 const inspirationConnection = createRedisConnection(redisUrl);
-const maxRetryAttempts = resolveProviderRetryAttempts(runtime.env.PROVIDER_RETRY_ATTEMPTS);
+const maxProviderRetryAttempts = resolveProviderRetryAttempts(runtime.env.PROVIDER_RETRY_ATTEMPTS);
+const maxPostProcessingRetryAttempts = resolvePostProcessingRetryAttempts(runtime.env.POST_PROCESSING_RETRY_ATTEMPTS);
 const generationConcurrency = Math.max(1, Number(process.env.NODE_GENERATION_WORKER_CONCURRENCY ?? 10));
 
 const generationWorker = new Worker<GenerationMessage>(
   GENERATION_QUEUE_NAME,
   async (job) => {
-    const canRetryProviderError = job.attemptsMade < maxRetryAttempts;
-    await processGenerationMessage(job.data, runtime.env, { throwRetryableErrors: canRetryProviderError });
+    await processGenerationMessage(job.data, runtime.env, {
+      retryProviderErrors: job.attemptsMade < maxProviderRetryAttempts,
+      retryPostProcessingErrors: job.attemptsMade < maxPostProcessingRetryAttempts,
+    });
   },
   {
     connection: generationConnection,
@@ -46,7 +49,10 @@ inspirationWorker.on("failed", (job, error) => {
   console.error("inspiration job failed", JSON.stringify({ id: job?.id, attemptsMade: job?.attemptsMade, error: error.message }));
 });
 
-console.log("oh-myimage workers started", JSON.stringify({ generationConcurrency, maxRetryAttempts }));
+console.log(
+  "oh-myimage workers started",
+  JSON.stringify({ generationConcurrency, maxProviderRetryAttempts, maxPostProcessingRetryAttempts }),
+);
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {

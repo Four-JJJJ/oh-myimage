@@ -81,6 +81,9 @@ describe("prompt optimization validation", () => {
       quality: "high",
       outputFormat: "webp",
       background: "auto",
+      referenceImageCount: 2,
+      hasSourceImage: true,
+      hasMaskImage: true,
     });
     expect(result.error).toBeUndefined();
     expect(result.input).toMatchObject({
@@ -91,6 +94,15 @@ describe("prompt optimization validation", () => {
       quality: "high",
       outputFormat: "webp",
       background: "auto",
+      referenceImageCount: 2,
+      hasSourceImage: true,
+      hasMaskImage: true,
     });
+  });
+
+  it("uses safe defaults for missing reference context", () => {
+    const result = parsePromptOptimizationInput({ prompt: "赛博朋克城市" });
+
+    expect(result.input).toMatchObject({ referenceImageCount: 0, hasSourceImage: false, hasMaskImage: false });
   });
 });

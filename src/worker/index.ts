@@ -31,7 +31,14 @@ import {
 import { apiKeyHint, decryptSecret, encryptSecret, hashPassword, makeSessionToken, sha256Hex, verifyPassword } from "./crypto";
 import { daysFromNow, envNumber, jsonError, randomId } from "./http";
 import { buildProviderEndpoint, normalizeSpaceName, validateBaseURL, verifyTurnstile } from "./security";
-import { optimizePrompt, processGenerationMessage, ProviderError, resolveGenerationTimeoutMs, testProvider } from "./provider";
+import {
+  optimizePrompt,
+  processGenerationMessage,
+  providerResultCheckpointStorageKey,
+  ProviderError,
+  resolveGenerationTimeoutMs,
+  testProvider,
+} from "./provider";
 import {
   getInspirationItem,
   importInspirationUrl,
@@ -49,6 +56,7 @@ import { GenerationInput, parseGenerationInput, parsePromptOptimizationInput, RA
 const SESSION_COOKIE = "image2_session";
 const SESSION_DAYS = 30;
 const SOURCE_IMAGE_ID_FIELD = "sourceImageId";
+const LEGACY_SOURCE_IMAGE_ID_FIELD = "referenceImageId";
 const REFERENCE_IMAGE_FIELD = "referenceImage";
 const MASK_IMAGE_FIELD = "maskImage";
 const REFERENCE_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
@@ -62,6 +70,10 @@ const DEFAULT_PROVIDER_RETRY_ATTEMPTS = 0;
 const MAX_PROVIDER_RETRY_ATTEMPTS = 4;
 const DEFAULT_PROVIDER_RETRY_DELAY_SECONDS = 120;
 const MAX_PROVIDER_RETRY_DELAY_SECONDS = 600;
+const DEFAULT_POST_PROCESSING_RETRY_ATTEMPTS = 2;
+const MAX_POST_PROCESSING_RETRY_ATTEMPTS = 4;
+const DEFAULT_POST_PROCESSING_RETRY_DELAY_SECONDS = 5;
+const MAX_POST_PROCESSING_RETRY_DELAY_SECONDS = 60;
 const IMAGE_CACHE_CONTROL = "private, max-age=31536000, immutable";
 
 export const app = new Hono<AppBindings>();
@@ -132,14 +144,15 @@ async function storeReferenceImage(env: Env, spaceId: string, jobId: string, fil
     mimeType,
     name,
     byteSize: bytes.byteLength,
+    role: "reference",
   };
 }
 
-async function storeReferenceImages(env: Env, spaceId: string, jobId: string, files: File[]): Promise<StoredReferenceImage[]> {
-  if (files.length > MAX_REFERENCE_IMAGES) {
+async function storeReferenceImages(env: Env, spaceId: string, jobId: string, files: File[], startIndex = 0): Promise<StoredReferenceImage[]> {
+  if (files.length + startIndex > MAX_REFERENCE_IMAGES) {
     throw jsonError(400, "too_many_reference_images", `参考图最多 ${MAX_REFERENCE_IMAGES} 张。`);
   }
-  return Promise.all(files.map((file, index) => storeReferenceImage(env, spaceId, jobId, file, index)));
+  return Promise.all(files.map((file, index) => storeReferenceImage(env, spaceId, jobId, file, index + startIndex)));
 }
 
 async function cloneSourceImageAsReference(env: Env, spaceId: string, jobId: string, sourceImageId: string): Promise<StoredReferenceImage> {
@@ -164,7 +177,7 @@ async function cloneSourceImageAsReference(env: Env, spaceId: string, jobId: str
     customMetadata: {
       jobId,
       spaceId,
-      kind: "reference",
+      kind: "source",
       referenceIndex: "1",
     },
   };
@@ -184,6 +197,7 @@ async function cloneSourceImageAsReference(env: Env, spaceId: string, jobId: str
     mimeType,
     name,
     byteSize: sourceImage.byte_size,
+    role: "source",
   };
 }
 
@@ -311,7 +325,7 @@ async function cloneReferenceImage(
       customMetadata: {
         jobId: nextJobId,
         spaceId,
-        kind: "reference",
+        kind: snapshot.role === "source" ? "source" : "reference",
         referenceIndex: String(index + 1),
       },
     });
@@ -321,6 +335,7 @@ async function cloneReferenceImage(
       mimeType,
       name,
       byteSize: bytes.byteLength,
+      ...(snapshot.role ? { role: snapshot.role } : {}),
     });
   }
   return copied;
@@ -361,6 +376,7 @@ function parseReferenceImagesJson(value: string | null | undefined): StoredRefer
           mimeType: typeof record.mimeType === "string" ? record.mimeType : "image/png",
           name: typeof record.name === "string" ? record.name : "reference.png",
           byteSize: typeof record.byteSize === "number" ? record.byteSize : 0,
+          ...(record.role === "source" || record.role === "reference" ? { role: record.role } : {}),
         };
       })
       .filter((item): item is StoredReferenceImage => Boolean(item));
@@ -375,6 +391,13 @@ function conversationIdFromBody(body: Record<string, unknown> | null): string | 
   if (typeof value !== "string") return undefined;
   const normalized = value.trim();
   return normalized || undefined;
+}
+
+function sourceImageIdFromBody(body: Record<string, unknown> | null): string {
+  if (!body) return "";
+  const current = typeof body[SOURCE_IMAGE_ID_FIELD] === "string" ? body[SOURCE_IMAGE_ID_FIELD].trim() : "";
+  if (current) return current;
+  return typeof body[LEGACY_SOURCE_IMAGE_ID_FIELD] === "string" ? body[LEGACY_SOURCE_IMAGE_ID_FIELD].trim() : "";
 }
 
 async function resolveConversationId(db: Env["DB"], spaceId: string, requestedConversationId?: string): Promise<string | undefined> {
@@ -561,21 +584,23 @@ app.post("/api/settings/provider", async (c) => {
   if (imageInput && typeof imageInput.baseURL !== "string") throw jsonError(400, "invalid_base_url", "请输入生图 Provider 的 baseURL。");
   if (promptInput && typeof promptInput.baseURL !== "string") throw jsonError(400, "invalid_prompt_base_url", "请输入提示词 Provider 的 baseURL。");
   if (!imageInput && !hasImageProviderConfigured(existingCredential)) throw jsonError(400, "invalid_image_provider", "请填写生图 Provider。");
-  if (!promptInput && !hasPromptProviderConfigured(existingCredential)) throw jsonError(400, "invalid_prompt_provider", "请填写提示词 Provider。");
   const resolvedImageBaseURL = imageInput?.baseURL ?? existingCredential?.base_url;
   const resolvedPromptBaseURL = promptInput?.baseURL ?? existingCredential?.prompt_base_url;
   if (typeof resolvedImageBaseURL !== "string") throw jsonError(400, "invalid_base_url", "请输入生图 Provider 的 baseURL。");
-  if (typeof resolvedPromptBaseURL !== "string") throw jsonError(400, "invalid_prompt_base_url", "请输入提示词 Provider 的 baseURL。");
   const imageValidation = validateBaseURL(resolvedImageBaseURL);
-  const promptValidation = validateBaseURL(resolvedPromptBaseURL);
+  const promptValidation = typeof resolvedPromptBaseURL === "string" ? validateBaseURL(resolvedPromptBaseURL) : null;
   if (!imageValidation.ok || !imageValidation.normalized) throw jsonError(400, "invalid_base_url", imageValidation.error ?? "生图 Provider 的 baseURL 不合法。");
-  if (!promptValidation.ok || !promptValidation.normalized) throw jsonError(400, "invalid_prompt_base_url", promptValidation.error ?? "提示词 Provider 的 baseURL 不合法。");
+  if (promptInput && (!promptValidation?.ok || !promptValidation.normalized)) {
+    throw jsonError(400, "invalid_prompt_base_url", promptValidation?.error ?? "提示词 Provider 的 baseURL 不合法。");
+  }
   const rawImageApiKey = imageInput && typeof imageInput.apiKey === "string" ? imageInput.apiKey.trim() : "";
   const rawPromptApiKey = promptInput && typeof promptInput.apiKey === "string" ? promptInput.apiKey.trim() : "";
   if (rawImageApiKey && rawImageApiKey.length < 8) throw jsonError(400, "invalid_api_key", "请输入有效的生图 Provider API Key。");
   if (rawPromptApiKey && rawPromptApiKey.length < 8) throw jsonError(400, "invalid_prompt_api_key", "请输入有效的提示词 Provider API Key。");
   if (!rawImageApiKey && !existingCredential?.encrypted_api_key) throw jsonError(400, "invalid_api_key", "请输入有效的生图 Provider API Key。");
-  if (!rawPromptApiKey && !existingCredential?.prompt_encrypted_api_key) throw jsonError(400, "invalid_prompt_api_key", "请输入有效的提示词 Provider API Key。");
+  if (promptInput && !rawPromptApiKey && !existingCredential?.prompt_encrypted_api_key) {
+    throw jsonError(400, "invalid_prompt_api_key", "请输入有效的提示词 Provider API Key。");
+  }
   const selectedImageModel = optionOrFallback(
     imageInput && typeof imageInput.model === "string" ? imageInput.model : existingCredential?.model ?? c.env.DEFAULT_IMAGE_MODEL,
     IMAGE_MODEL_OPTIONS,
@@ -595,7 +620,9 @@ app.post("/api/settings/provider", async (c) => {
     : existingCredential?.prompt_encrypted_api_key;
   const savedPromptApiKeyHint = rawPromptApiKey ? apiKeyHint(rawPromptApiKey) : existingCredential?.prompt_api_key_hint;
   if (!encryptedImageApiKey || !savedImageApiKeyHint) throw jsonError(400, "invalid_api_key", "请输入有效的生图 Provider API Key。");
-  if (!encryptedPromptApiKey || !savedPromptApiKeyHint) throw jsonError(400, "invalid_prompt_api_key", "请输入有效的提示词 Provider API Key。");
+  if (promptInput && (!encryptedPromptApiKey || !savedPromptApiKeyHint)) {
+    throw jsonError(400, "invalid_prompt_api_key", "请输入有效的提示词 Provider API Key。");
+  }
 
   await upsertCredential(
     c.env.DB,
@@ -605,10 +632,10 @@ app.post("/api/settings/provider", async (c) => {
       imageModel: selectedImageModel,
       imageEncryptedApiKey: encryptedImageApiKey,
       imageApiKeyHint: savedImageApiKeyHint,
-      promptBaseURL: promptValidation.normalized,
+      promptBaseURL: promptValidation?.normalized ?? null,
       promptModel: selectedPromptOptimizerModel,
-      promptEncryptedApiKey: encryptedPromptApiKey,
-      promptApiKeyHint: savedPromptApiKeyHint,
+      promptEncryptedApiKey: encryptedPromptApiKey ?? null,
+      promptApiKeyHint: savedPromptApiKeyHint ?? null,
     },
   );
   return c.json({
@@ -620,13 +647,15 @@ app.post("/api/settings/provider", async (c) => {
       lastTestOk: false,
       lastTestedAt: null,
     },
-    promptProvider: {
-      baseURL: promptValidation.normalized,
-      model: selectedPromptOptimizerModel,
-      apiKeyHint: savedPromptApiKeyHint,
-      lastTestOk: false,
-      lastTestedAt: null,
-    },
+    promptProvider: promptValidation?.normalized && savedPromptApiKeyHint
+      ? {
+          baseURL: promptValidation.normalized,
+          model: selectedPromptOptimizerModel,
+          apiKeyHint: savedPromptApiKeyHint,
+          lastTestOk: false,
+          lastTestedAt: null,
+        }
+      : null,
   });
 });
 
@@ -699,8 +728,7 @@ app.post("/api/generations", async (c) => {
   const requestPayload = await parseGenerationRequest(c.req.raw);
   const parsed = parseGenerationInput(requestPayload.body, c.env.MAX_IMAGES_PER_REQUEST);
   if (!parsed.input) throw jsonError(400, "invalid_generation_input", parsed.error ?? "生图参数不正确。");
-  const sourceImageId =
-    typeof requestPayload.body?.[SOURCE_IMAGE_ID_FIELD] === "string" ? requestPayload.body[SOURCE_IMAGE_ID_FIELD].trim() : "";
+  const sourceImageId = sourceImageIdFromBody(requestPayload.body);
   const requestedConversationId = conversationIdFromBody(requestPayload.body);
 
   const turnstileOk = await verifyTurnstile(parsed.input.turnstileToken, c.req.raw, c.env);
@@ -711,19 +739,18 @@ app.post("/api/generations", async (c) => {
   if (!hasImageProviderConfigured(credential)) throw jsonError(400, "provider_missing", "请先在设置中配置生图 Provider。");
   await assertGenerationLimitsForRequest(c.env, space.id, parsed.input.quantity);
 
-  if (requestPayload.referenceImages.length > 0 && sourceImageId) {
-    throw jsonError(400, "reference_source_conflict", "参考图上传和源图片编辑不能同时使用。");
+  const sourceImageCount = sourceImageId ? 1 : 0;
+  if (requestPayload.referenceImages.length + sourceImageCount > MAX_REFERENCE_IMAGES) {
+    throw jsonError(400, "too_many_reference_images", `参考图最多 ${MAX_REFERENCE_IMAGES} 张。`);
   }
   if (requestPayload.maskImage && requestPayload.referenceImages.length === 0 && !sourceImageId) {
     throw jsonError(400, "mask_requires_reference_image", "选区遮罩需要和参考图一起提交。");
   }
 
   const jobId = randomId("job");
-  const referenceImages = requestPayload.referenceImages.length > 0
-    ? await storeReferenceImages(c.env, space.id, jobId, requestPayload.referenceImages)
-    : sourceImageId
-      ? [await cloneSourceImageAsReference(c.env, space.id, jobId, sourceImageId)]
-      : [];
+  const sourceImage = sourceImageId ? await cloneSourceImageAsReference(c.env, space.id, jobId, sourceImageId) : null;
+  const uploadedReferences = await storeReferenceImages(c.env, space.id, jobId, requestPayload.referenceImages, sourceImage ? 1 : 0);
+  const referenceImages = sourceImage ? [sourceImage, ...uploadedReferences] : uploadedReferences;
   const maskImage = requestPayload.maskImage ? await storeMaskImage(c.env, space.id, jobId, requestPayload.maskImage) : undefined;
 
   await createGenerationJob(
@@ -796,13 +823,15 @@ app.get("/api/generations/:jobId/references/:index", async (c) => {
   if (!Number.isInteger(index) || index < 0 || !reference) {
     throw jsonError(404, "reference_image_not_found", "参考图不存在。");
   }
+  const etag = referenceImageETag(reference.storageKey, reference.byteSize);
+  const headers = imageResponseHeaders(reference.mimeType, `inline; filename="${reference.name}"`, etag);
+  if (matchesIfNoneMatch(c.req.header("If-None-Match"), etag)) {
+    return new Response(null, { status: 304, headers });
+  }
   const object = await c.env.IMAGES.get(reference.storageKey);
   if (!object) throw jsonError(404, "reference_image_missing", "参考图文件不存在。");
   return new Response(object.body, {
-    headers: {
-      "Content-Type": reference.mimeType,
-      "Content-Disposition": `inline; filename="${reference.name}"`,
-    },
+    headers,
   });
 });
 
@@ -810,13 +839,26 @@ app.delete("/api/generations/:jobId", async (c) => {
   const spaceId = c.get("space").id;
   const job = await getGenerationJob(c.env.DB, spaceId, c.req.param("jobId"));
   if (!job) throw jsonError(404, "job_not_found", "任务不存在。");
+  if (job.status === "queued" || job.status === "running") {
+    throw jsonError(409, "job_active", "任务仍在生成中，暂时不能删除。请等待任务结束，避免上游已计费但结果被提前移除。");
+  }
 
   const images = await listImagesForJob(c.env.DB, spaceId, job.id);
-  const storageKeys = [
+  const recoveryKeys = Array.from({ length: job.quantity }, (_, resultIndex) => {
+    const imageId = `img_${job.id}_${resultIndex}`;
+    return [
+      providerResultCheckpointStorageKey(job, resultIndex),
+      ...["png", "jpeg", "webp"].map((format) => `${spaceId}/${job.id}/${imageId}.${format}`),
+      `${spaceId}/${job.id}/thumb_${imageId}.webp`,
+    ];
+  }).flat();
+  const storageKeys = new Set([
     ...images.map((image) => image.storage_key),
+    ...images.map((image) => image.thumbnail_storage_key).filter((key): key is string => Boolean(key)),
     ...referenceImagesFromJob(job).map((reference) => reference.storageKey),
     ...(job.mask_image_storage_key ? [job.mask_image_storage_key] : []),
-  ];
+    ...recoveryKeys,
+  ]);
   for (const storageKey of storageKeys) {
     await c.env.IMAGES.delete(storageKey);
   }
@@ -869,7 +911,7 @@ app.get("/api/images/:imageId/download", async (c) => {
   const rawDownload = c.req.query("raw") === "1";
   const attachmentDownload = c.req.query("download") === "1";
   const etag = imageETag(image.sha256);
-  const cachedHeaders = imageResponseHeaders(image.mime_type, attachmentDownload ? attachmentContentDisposition : inlineContentDisposition, etag);
+  const cachedHeaders = imageResponseHeaders(image.mime_type, attachmentDownload ? attachmentContentDisposition : inlineContentDisposition, etag, image.byte_size);
   if (rawDownload) {
     if (matchesIfNoneMatch(c.req.header("If-None-Match"), etag)) {
       return new Response(null, { status: 304, headers: cachedHeaders });
@@ -891,8 +933,30 @@ app.get("/api/images/:imageId/download", async (c) => {
   const object = await c.env.IMAGES.get(image.storage_key);
   if (!object) throw jsonError(404, "image_file_missing", "图片文件不存在。");
   return new Response(object.body, {
-    headers: imageResponseHeaders(image.mime_type, inlineContentDisposition, etag),
+    headers: imageResponseHeaders(image.mime_type, inlineContentDisposition, etag, image.byte_size),
   });
+});
+
+app.get("/api/images/:imageId/thumbnail", async (c) => {
+  const image = await getImage(c.env.DB, c.get("space").id, c.req.param("imageId"));
+  if (!image) throw jsonError(404, "image_not_found", "图片不存在。");
+  if (!image.thumbnail_storage_key || !image.thumbnail_mime_type || !image.thumbnail_sha256) {
+    throw jsonError(404, "image_thumbnail_missing", "图片缩略图不存在。");
+  }
+  const format = formatFromMimeType(image.thumbnail_mime_type);
+  const etag = imageETag(image.thumbnail_sha256);
+  const headers = imageResponseHeaders(
+    image.thumbnail_mime_type,
+    `inline; filename="${image.id}-thumbnail.${format}"`,
+    etag,
+    image.thumbnail_byte_size ?? undefined,
+  );
+  if (matchesIfNoneMatch(c.req.header("If-None-Match"), etag)) {
+    return new Response(null, { status: 304, headers });
+  }
+  const object = await c.env.IMAGES.get(image.thumbnail_storage_key);
+  if (!object) throw jsonError(404, "image_thumbnail_missing", "图片缩略图文件不存在。");
+  return new Response(object.body, { headers });
 });
 
 app.get("/api/inspirations", async (c) => {
@@ -1008,15 +1072,27 @@ export default {
         continue;
       }
 
-      const canRetryProviderError = message.attempts <= resolveProviderRetryAttempts(env.PROVIDER_RETRY_ATTEMPTS);
+      const retryProviderErrors = message.attempts <= resolveProviderRetryAttempts(env.PROVIDER_RETRY_ATTEMPTS);
+      const retryPostProcessingErrors =
+        message.attempts <= resolvePostProcessingRetryAttempts(env.POST_PROCESSING_RETRY_ATTEMPTS);
       try {
-        await processGenerationMessage(message.body as GenerationMessage, env, { throwRetryableErrors: canRetryProviderError });
+        await processGenerationMessage(message.body as GenerationMessage, env, {
+          retryProviderErrors,
+          retryPostProcessingErrors,
+        });
         message.ack();
       } catch (error) {
-        if (canRetryProviderError && error instanceof ProviderError && error.retryable) {
-          const delaySeconds = resolveProviderRetryDelaySeconds(env.PROVIDER_RETRY_DELAY_SECONDS);
+        const canRetry =
+          error instanceof ProviderError &&
+          error.retryable &&
+          (error.retryScope === "post_processing" ? retryPostProcessingErrors : retryProviderErrors);
+        if (canRetry && error instanceof ProviderError) {
+          const delaySeconds =
+            error.retryScope === "post_processing"
+              ? resolvePostProcessingRetryDelaySeconds(env.POST_PROCESSING_RETRY_DELAY_SECONDS)
+              : resolveProviderRetryDelaySeconds(env.PROVIDER_RETRY_DELAY_SECONDS);
           console.warn(
-            `generation provider retry scheduled after ${delaySeconds}s`,
+            `generation ${error.retryScope} retry scheduled after ${delaySeconds}s`,
             JSON.stringify({ messageId: message.id, attempts: message.attempts, code: error.code }),
           );
           message.retry({ delaySeconds });
@@ -1069,6 +1145,7 @@ function serializeGenerationJob(job: GenerationJobRecord, results: Awaited<Retur
       name: reference.name,
       mimeType: reference.mimeType,
       byteSize: reference.byteSize,
+      role: reference.role ?? "reference",
       url: `/api/generations/${job.id}/references/${index}`,
     })),
   };
@@ -1122,6 +1199,7 @@ function serializeImage(
     height: number;
     format: string;
     byte_size?: number;
+    thumbnail_storage_key?: string | null;
     created_at: string;
     prompt?: string;
     quality?: string;
@@ -1137,6 +1215,7 @@ function serializeImage(
     height: image.height,
     format: image.format,
     byteSize: image.byte_size,
+    thumbnailUrl: image.thumbnail_storage_key ? `/api/images/${image.id}/thumbnail` : null,
     createdAt: image.created_at,
     ...(includeMetadata
       ? {
@@ -1148,17 +1227,31 @@ function serializeImage(
   };
 }
 
-function imageResponseHeaders(contentType: string, contentDisposition: string, etag: string): HeadersInit {
-  return {
+function imageResponseHeaders(contentType: string, contentDisposition: string, etag: string, contentLength?: number | null): HeadersInit {
+  const headers: Record<string, string> = {
     "Content-Type": contentType,
     "Cache-Control": IMAGE_CACHE_CONTROL,
     "Content-Disposition": contentDisposition,
     "ETag": etag,
   };
+  if (typeof contentLength === "number" && Number.isFinite(contentLength) && contentLength >= 0) {
+    headers["Content-Length"] = String(contentLength);
+  }
+  return headers;
 }
 
 function imageETag(sha256: string): string {
   return `"${sha256.replace(/"/g, "")}"`;
+}
+
+function referenceImageETag(storageKey: string, byteSize: number): string {
+  return imageETag(`${storageKey}:${byteSize}`);
+}
+
+function formatFromMimeType(mimeType: string): string {
+  if (mimeType === "image/jpeg") return "jpg";
+  if (mimeType === "image/webp") return "webp";
+  return "png";
 }
 
 function matchesIfNoneMatch(value: string | undefined, etag: string): boolean {
@@ -1192,6 +1285,20 @@ export function resolveProviderRetryAttempts(value: string | undefined): number 
 
 export function resolveProviderRetryDelaySeconds(value: string | undefined): number {
   return Math.min(Math.max(Math.trunc(envNumber(value, DEFAULT_PROVIDER_RETRY_DELAY_SECONDS)), 1), MAX_PROVIDER_RETRY_DELAY_SECONDS);
+}
+
+export function resolvePostProcessingRetryAttempts(value: string | undefined): number {
+  return Math.min(
+    Math.max(Math.trunc(envNumber(value, DEFAULT_POST_PROCESSING_RETRY_ATTEMPTS)), 0),
+    MAX_POST_PROCESSING_RETRY_ATTEMPTS,
+  );
+}
+
+export function resolvePostProcessingRetryDelaySeconds(value: string | undefined): number {
+  return Math.min(
+    Math.max(Math.trunc(envNumber(value, DEFAULT_POST_PROCESSING_RETRY_DELAY_SECONDS)), 1),
+    MAX_POST_PROCESSING_RETRY_DELAY_SECONDS,
+  );
 }
 
 function serializeInspiration(item: Parameters<typeof inspirationItemShape>[0]) {

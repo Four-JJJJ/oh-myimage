@@ -6,6 +6,7 @@ import {
   GENERATION_JOB_PAGE_SIZE,
   IMAGE_GENERATED_EVENT,
   insertImageUsageEvent,
+  insertImageAsset,
   listGenerationJobs,
   listGenerationResultsForJob,
   upsertGenerationJobResult,
@@ -21,7 +22,10 @@ interface DbCall {
 class FakeDatabase implements AppDatabase {
   readonly calls: DbCall[] = [];
 
-  constructor(private readonly firstRows: unknown[] = []) {}
+  constructor(
+    private readonly firstRows: unknown[] = [],
+    private readonly runErrors: Array<unknown | null> = [],
+  ) {}
 
   prepare(query: string): AppPreparedStatement {
     return new FakePreparedStatement(this, query);
@@ -29,6 +33,10 @@ class FakeDatabase implements AppDatabase {
 
   nextFirstRow(): unknown {
     return this.firstRows.shift() ?? null;
+  }
+
+  nextRunError(): unknown | null {
+    return this.runErrors.shift() ?? null;
   }
 }
 
@@ -57,6 +65,8 @@ class FakePreparedStatement implements AppPreparedStatement {
 
   async run(): Promise<unknown> {
     this.db.calls.push({ query: this.query, values: this.values, method: "run" });
+    const error = this.db.nextRunError();
+    if (error) throw error;
     return { success: true };
   }
 }
@@ -116,6 +126,84 @@ describe("daily image usage accounting", () => {
       method: "run",
       values: ["evt_usage_img_abc", "space_1", IMAGE_GENERATED_EVENT],
     });
+    expect(db.calls[0]?.query).toContain("ON CONFLICT (id) DO NOTHING");
+  });
+});
+
+describe("image persistence idempotency", () => {
+  it("upserts a deterministic image asset so local recovery can be replayed safely", async () => {
+    const db = new FakeDatabase();
+
+    await insertImageAsset(db, {
+      id: "img_job_1_0",
+      space_id: "space_1",
+      job_id: "job_1",
+      storage_key: "space_1/job_1/img_job_1_0.png",
+      mime_type: "image/png",
+      format: "png",
+      width: 1024,
+      height: 1024,
+      byte_size: 8,
+      sha256: "sha",
+      thumbnail_storage_key: null,
+      thumbnail_mime_type: null,
+      thumbnail_byte_size: null,
+      thumbnail_sha256: null,
+    });
+
+    expect(db.calls[0]?.query).toContain("ON CONFLICT (id) DO UPDATE");
+    expect(db.calls[0]?.query).toContain("COALESCE(excluded.thumbnail_storage_key");
+  });
+
+  it("falls back to the original-image columns only when the thumbnail migration is temporarily missing", async () => {
+    const db = new FakeDatabase([], [new Error('column "thumbnail_storage_key" of relation "image_assets" does not exist'), null]);
+
+    await insertImageAsset(db, {
+      id: "img_job_1_0",
+      space_id: "space_1",
+      job_id: "job_1",
+      storage_key: "space_1/job_1/img_job_1_0.png",
+      mime_type: "image/png",
+      format: "png",
+      width: 1024,
+      height: 1024,
+      byte_size: 8,
+      sha256: "sha",
+      thumbnail_storage_key: "space_1/job_1/thumb_img_job_1_0.webp",
+      thumbnail_mime_type: "image/webp",
+      thumbnail_byte_size: 4,
+      thumbnail_sha256: "thumb-sha",
+    });
+
+    expect(db.calls).toHaveLength(2);
+    expect(db.calls[0]?.query).toContain("thumbnail_storage_key");
+    expect(db.calls[1]?.query).not.toContain("thumbnail_storage_key");
+    expect(db.calls[1]?.values).toHaveLength(10);
+  });
+
+  it("does not hide unrelated image-asset insert errors", async () => {
+    const error = new Error("database connection lost");
+    const db = new FakeDatabase([], [error]);
+
+    await expect(
+      insertImageAsset(db, {
+        id: "img_job_1_0",
+        space_id: "space_1",
+        job_id: "job_1",
+        storage_key: "space_1/job_1/img_job_1_0.png",
+        mime_type: "image/png",
+        format: "png",
+        width: 1024,
+        height: 1024,
+        byte_size: 8,
+        sha256: "sha",
+        thumbnail_storage_key: null,
+        thumbnail_mime_type: null,
+        thumbnail_byte_size: null,
+        thumbnail_sha256: null,
+      }),
+    ).rejects.toBe(error);
+    expect(db.calls).toHaveLength(1);
   });
 });
 

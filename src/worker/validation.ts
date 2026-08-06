@@ -37,6 +37,9 @@ export interface PromptOptimizationInput {
   quality: string;
   outputFormat: string;
   background: string;
+  referenceImageCount: number;
+  hasSourceImage: boolean;
+  hasMaskImage: boolean;
 }
 
 export function parseGenerationInput(raw: unknown, maxImagesValue?: string): { input?: GenerationInput; error?: string } {
@@ -103,6 +106,9 @@ export function parsePromptOptimizationInput(raw: unknown): { input?: PromptOpti
   const quality = typeof body.quality === "string" && QUALITIES.has(body.quality) ? body.quality : "auto";
   const outputFormat = typeof body.outputFormat === "string" && FORMATS.has(body.outputFormat) ? body.outputFormat : "png";
   const background = typeof body.background === "string" && BACKGROUNDS.has(body.background) ? body.background : "auto";
+  const referenceImageCount = Math.min(Math.max(toInt(body.referenceImageCount, 0), 0), 8);
+  const hasSourceImage = body.hasSourceImage === true;
+  const hasMaskImage = body.hasMaskImage === true;
 
   return {
     input: {
@@ -113,6 +119,9 @@ export function parsePromptOptimizationInput(raw: unknown): { input?: PromptOpti
       quality,
       outputFormat,
       background,
+      referenceImageCount,
+      hasSourceImage,
+      hasMaskImage,
     },
   };
 }

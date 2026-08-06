@@ -85,4 +85,24 @@ describe("generate menu layout helpers", () => {
       columns: 3,
     });
   });
+
+  it("keeps a multi-image generation stage full-width while only some results have arrived", () => {
+    const images = [
+      {
+        id: "img_0",
+        jobId: "job_1",
+        url: "/demo.png",
+        width: 1536,
+        height: 1152,
+        format: "png",
+        createdAt: "2026-06-15T00:00:00.000Z",
+      },
+    ] satisfies ImageItem[];
+
+    expect(generationStageLayout({ width: 1536, height: 1152, quantity: 4 }, images)).toEqual({
+      width: 840,
+      height: 158,
+      columns: 4,
+    });
+  });
 });

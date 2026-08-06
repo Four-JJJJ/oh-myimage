@@ -35,6 +35,7 @@ export interface ImageItem {
   height: number;
   format: string;
   byteSize?: number;
+  thumbnailUrl?: string | null;
   createdAt: string;
   prompt?: string;
   quality?: string;
@@ -103,6 +104,7 @@ export interface GenerationReferenceImage {
   name: string;
   mimeType: string;
   byteSize: number;
+  role?: "source" | "reference";
   url: string;
 }
 

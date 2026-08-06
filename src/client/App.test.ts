@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   currentSpaceId,
@@ -13,6 +15,10 @@ import type { GenerationRecord } from "./api";
 import { entryStatusLoadingLines, entryStatusLoadingLoopLines, entryStatusSurfaceContract, entrySurfaceContract } from "./features/auth/EntryScreens";
 import { navGroupAnchorTop } from "./features/generate-shell/AppShell";
 import { buildGalleryGroups, galleryHasHiddenDefaultRangeItems } from "./gallery-utils";
+
+const appSource = readFileSync(fileURLToPath(new URL("./App.tsx", import.meta.url)), "utf8");
+const generateMenuSource = readFileSync(fileURLToPath(new URL("./features/generate-menu/GenerateMenuView.tsx", import.meta.url)), "utf8");
+const dialogSource = readFileSync(fileURLToPath(new URL("./components/ui/dialog.tsx", import.meta.url)), "utf8");
 
 describe("App safety helpers", () => {
   it("returns undefined when the current space is not ready yet", () => {
@@ -56,6 +62,72 @@ describe("App safety helpers", () => {
     expect(galleryImageActionKeys()).toEqual(["continue", "local-edit", "jump-to-message", "regenerate", "copy", "download", "delete"]);
   });
 
+  it("opens gallery images with the same large-image preview used by generation results", () => {
+    expect(appSource).toContain("ImagePreview");
+    expect(appSource).not.toContain("ImagePreviewDialog");
+    expect(appSource).not.toContain("image-preview-actions");
+    expect(appSource).not.toContain("编辑图片</span>");
+    expect(appSource).not.toContain("下载图片</span>");
+    expect(appSource).toContain("thumbnailUrl: previewItem.image.thumbnailUrl");
+  });
+
+  it("uses generated thumbnails for compact generation record thumbnails when available", () => {
+    const thumbnailSource = appSource.slice(appSource.indexOf("function GenerationThumbnail"), appSource.indexOf("type ImageSelectionMaskFactory"));
+
+    expect(thumbnailSource).toContain("image.thumbnailUrl ?? image.url");
+  });
+
+  it("uses generated thumbnails for gallery cards when available", () => {
+    const galleryCardSource = appSource.slice(appSource.indexOf("function GalleryImageCard"), appSource.indexOf("function InspirationPlaceholderView"));
+
+    expect(galleryCardSource).toContain("item.image.thumbnailUrl ?? item.image.url");
+    expect(galleryCardSource).not.toContain("src={item.image.url}");
+  });
+
+  it("mounts the shared image preview at the document body so it covers the whole app shell", () => {
+    expect(generateMenuSource).toContain("createPortal(");
+    expect(generateMenuSource).toContain("document.body");
+    expect(generateMenuSource).toContain("z-[100]");
+  });
+
+  it("uses the same backdrop surface as the local-edit dialog for image preview", () => {
+    expect(dialogSource).toContain('dialogBackdropSurfaceClassName = "backdrop-blur-sm"');
+    expect(dialogSource).not.toContain("bg-black/72");
+    expect(dialogSource).not.toContain("bg-[rgba(0,0,0,0.72)]");
+    expect(generateMenuSource).toContain("dialogBackdropSurfaceClassName");
+    expect(generateMenuSource).not.toContain("bg-black/72");
+    expect(generateMenuSource).not.toContain("bg-[rgba(0,0,0,0.72)]");
+    expect(generateMenuSource).not.toContain("bg-[rgba(5,5,5,0.92)]");
+  });
+
+  it("keeps image preview free of extra glow, tint, border, and shadow surfaces", () => {
+    expect(generateMenuSource).not.toContain("opacity-32 blur-3xl");
+    expect(generateMenuSource).not.toContain("scale-110 object-contain");
+    expect(generateMenuSource).not.toContain("border border-white/10 bg-white/[0.04]");
+    expect(generateMenuSource).not.toContain("shadow-[0_24px_90px_rgb(0_0_0/0.52)]");
+  });
+
+  it("lets the local-edit dialog grow to the viewport while keeping its current size as the minimum", () => {
+    expect(generateMenuSource).toContain("min-h-[70dvh]");
+    expect(generateMenuSource).toContain("h-[80dvh]");
+    expect(generateMenuSource).toContain("w-[80vw]");
+    expect(generateMenuSource).toContain("!max-w-[80vw]");
+    expect(generateMenuSource).toContain("max-h-[80dvh]");
+    expect(generateMenuSource).toContain("lg:grid-cols-[minmax(0,1fr)_228px]");
+    expect(generateMenuSource).not.toContain("h-[70dvh] max-h-[70dvh] max-w-[70vw]");
+  });
+
+  it("keeps settings provider save buttons and notices matched to the screenshot contract", () => {
+    const noticeSource = appSource.slice(appSource.indexOf("function Notice"), appSource.indexOf("function sizeForRatioResolution"));
+    expect(appSource).toContain("bg-white/90");
+    expect(appSource).toContain("text-[#121212]");
+    expect(appSource).toContain("hover:bg-white/90");
+    expect(noticeSource).toContain("items-center gap-4 rounded-[24px]");
+    expect(noticeSource).toContain("size-5 shrink-0");
+    expect(noticeSource).not.toContain("items-start gap-3");
+    expect(noticeSource).not.toContain("mt-0.5 shrink-0");
+  });
+
   it("renders the empty gallery as one plain text row without a placeholder card", () => {
     expect(galleryEmptyStateContract(false)).toEqual({
       text: "暂无作品",
@@ -84,6 +156,25 @@ describe("App safety helpers", () => {
 
     expect(groups.flatMap((group) => group.items.map((item) => item.image.id))).toEqual(["img_today", "img_ten_days"]);
     expect(galleryHasHiddenDefaultRangeItems(records, null, [], new Date("2026-06-19T12:00:00.000Z"))).toBe(true);
+  });
+
+  it("keeps gallery results visible when a stale active job lags behind a completed record", () => {
+    const completedRecord = generationRecord("job_done", "2026-06-23T10:09:28.474Z");
+    const staleActiveJob = {
+      ...completedRecord.job,
+      status: "queued",
+      stage: "queued",
+      completed_at: null,
+    } as const;
+
+    const groups = buildGalleryGroups([completedRecord], staleActiveJob, [], 0, {
+      now: new Date("2026-06-23T12:00:00.000Z"),
+      showOlderThanDefaultRange: false,
+      dateFilter: { from: "", to: "" },
+    });
+
+    expect(groups.flatMap((group) => group.items.map((item) => item.image.id))).toEqual(["img_done"]);
+    expect(groups[0]?.items[0]?.job.status).toBe("succeeded");
   });
 
   it("reveals older gallery items after loading more", () => {

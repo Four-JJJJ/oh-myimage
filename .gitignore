@@ -10,3 +10,6 @@ dist-node/
 coverage/
 .playwright-cli/
 output/
+
+.DS_Store
+.claude/

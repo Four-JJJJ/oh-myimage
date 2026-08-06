@@ -1,4 +1,5 @@
 import type { GenerationJob, GenerationRecord, ImageItem } from "./api";
+import { resolveGenerationFlowRecord } from "./features/generate-menu/mappers";
 
 export interface GalleryDateFilter {
   from: string;
@@ -87,11 +88,11 @@ export function normalizeGalleryDateFilter(filter?: GalleryDateFilter): Normaliz
 }
 
 function normalizeGalleryRecords(records: GenerationRecord[], activeJob: GenerationJob | null, activeImages: ImageItem[], elapsedSeconds = 0) {
-  return records.map((record) =>
-    record.job.id === activeJob?.id
-      ? { ...record, job: activeJob, images: activeImages, elapsedSeconds: elapsedSeconds || record.elapsedSeconds }
-      : record,
-  );
+  return records.map((record) => {
+    const nextRecord = resolveGenerationFlowRecord(record, activeJob, activeImages);
+    if (nextRecord === record) return record;
+    return { ...nextRecord, elapsedSeconds: elapsedSeconds || record.elapsedSeconds };
+  });
 }
 
 function galleryDefaultStartDateKey(now = new Date()): string {

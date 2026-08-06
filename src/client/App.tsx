@@ -4,15 +4,12 @@ import {
   CloudDownload,
   CalendarIcon,
   Copy,
-  Download,
   Edit3,
   FileText,
   Images,
   LogOut,
-  Redo2,
   RotateCcw,
   Trash2,
-  Undo2,
   X,
 } from "lucide-react";
 import { format } from "date-fns";
@@ -23,7 +20,6 @@ import {
   Dispatch,
   Fragment,
   FormEvent,
-  PointerEvent as ReactPointerEvent,
   ReactNode,
   SetStateAction,
   useCallback,
@@ -32,7 +28,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { createPortal } from "react-dom";
 import type { DateRange } from "react-day-picker";
 import { BorderBeam } from "border-beam";
 import { Alert, AlertDescription } from "./components/ui/alert";
@@ -42,12 +37,13 @@ import { Input, type InputProps } from "./components/ui/input";
 import { Popover, PopoverPopup, PopoverTrigger } from "./components/ui/popover";
 import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem, ProviderSettings, SettingsProviders } from "./api";
 import { EntryField, EntryFormSection, EntryNoticeStack, EntryShell, EntryStatusScreen } from "./features/auth/EntryScreens";
-import { GenerateMenuView, HoverImageActionBar, type HoverImageAction } from "./features/generate-menu/GenerateMenuView";
+import { GenerateMenuView, HoverImageActionBar, ImagePreview, type HoverImageAction } from "./features/generate-menu/GenerateMenuView";
 import { AppShell } from "./features/generate-shell/AppShell";
 import { GenerationFormFooter, ParameterSection, PromptPlaceholderThumbnail, PromptSection } from "./features/shared/generation-form-sections";
 import { GenerationDotMatrixLoader, generationDotMatrixColumns, generationDotMatrixRows } from "./features/shared/generation-loading";
 import { CossBadge, CossButton, CossInput, CossSelect, CossSeparator } from "./features/shared/coss";
 import { buildGalleryGroups, galleryHasHiddenDefaultRangeItems, normalizeGalleryDateFilter, type GalleryDateFilter } from "./gallery-utils";
+import { generationProgressSummary } from "./generation-progress";
 import { isTerminalGenerationJobStatus, mergePolledJobState } from "./generation-state";
 import addIcon from "./assets/figma/add.svg";
 import figmaLogo from "./assets/figma/logo.png";
@@ -1038,17 +1034,6 @@ function GenerateView({
               onRegenerate={() => void regenerateRecord(record)}
               onEditPrompt={() => editRecordPrompt(record)}
               onEditImage={(image) => void loadImageForEditing(image, record.job.prompt)}
-              editOptions={{
-                initialForm: generationFormFromJob(record.job),
-                availableRatios,
-                qualityOptions,
-                formatOptions,
-                maxImagesPerRequest: config.maxImagesPerRequest,
-                turnstileSiteKey: config.turnstileSiteKey,
-                turnstileRequired: config.turnstileRequired,
-                submitting: loading,
-                onSubmit: createEditTaskFromImage,
-              }}
             />
           ))}
           {nextCursor && (
@@ -1068,14 +1053,12 @@ function GenerationRecordCard({
   onRegenerate,
   onEditPrompt,
   onEditImage,
-  editOptions,
 }: {
   record: GenerationRecord;
   onDelete: () => void;
   onRegenerate: () => void;
   onEditPrompt: () => void;
   onEditImage: (image: ImageItem, draft?: GenerateForm, mask?: ImageSelectionMask) => void;
-  editOptions?: ImagePreviewEditOptions;
 }) {
   const [previewImage, setPreviewImage] = useState<ImageItem | null>(null);
   const isGenerating = record.job.status === "queued" || record.job.status === "running";
@@ -1133,7 +1116,7 @@ function GenerationRecordCard({
         {record.job.prompt || statusLabel(record.job.status)}
       </p>
       {recordError && <p className="text-xs leading-[18px] text-destructive">{recordError}</p>}
-      <GenerationTaskTimeline job={record.job} />
+      <GenerationTaskTimeline job={record.job} succeededCount={record.images.length} />
 
       <div className="flex min-h-5 items-center gap-10">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
@@ -1170,14 +1153,14 @@ function GenerationRecordCard({
         </div>
       </div>
       {previewImage && (
-        <ImagePreviewDialog
-          image={previewImage}
-          onClose={() => setPreviewImage(null)}
-          onEdit={(draft, mask) => {
-            onEditImage(previewImage, draft, mask);
-            setPreviewImage(null);
+        <ImagePreview
+          image={{
+            url: previewImage.url,
+            thumbnailUrl: previewImage.thumbnailUrl,
+            prompt: previewImage.prompt ?? record.job.prompt,
+            actions: buildRecordPreviewActions(previewImage, record, onEditImage, onEditPrompt, onRegenerate, onDelete),
           }}
-          editOptions={editOptions}
+          onClose={() => setPreviewImage(null)}
         />
       )}
     </article>
@@ -1331,9 +1314,7 @@ function GenerationReferenceSnapshots({ job }: { job: GenerationJob }) {
   );
 }
 
-function GenerationTaskTimeline({ job }: { job: GenerationJob }) {
-  const progressCurrent = job.progress_current ?? completedResultCount(job);
-  const progressTotal = job.progress_total ?? job.quantity;
+function GenerationTaskTimeline({ job, succeededCount }: { job: GenerationJob; succeededCount: number }) {
   const stage = job.stage ?? stageFromJobStatus(job.status);
   const items = [
     { id: "queued", label: "已提交", active: true },
@@ -1352,7 +1333,7 @@ function GenerationTaskTimeline({ job }: { job: GenerationJob }) {
         </Fragment>
       ))}
       <span className="rounded-[6px] bg-white/10 px-2 py-1 leading-none text-white/45">
-        {Math.min(progressCurrent, progressTotal)}/{progressTotal}
+        {generationProgressSummary(job, succeededCount)}
       </span>
     </div>
   );
@@ -1386,443 +1367,39 @@ function GenerationThumbnail({ image, onOpen }: { image: ImageItem; onOpen: () =
       aria-label="查看大图"
       onClick={onOpen}
     >
-      <img key={image.id} src={image.url} alt={image.prompt ?? "生成图片"} loading="lazy" className="size-full object-cover" />
+      <img key={image.id} src={image.thumbnailUrl ?? image.url} alt={image.prompt ?? "生成图片"} loading="lazy" className="size-full object-cover" />
     </CossButton>
   );
 }
 
-interface ImagePreviewEditOptions {
-  initialForm: GenerateForm;
-  availableRatios: readonly string[];
-  qualityOptions: readonly string[];
-  formatOptions: readonly string[];
-  maxImagesPerRequest: number;
-  turnstileSiteKey: string;
-  turnstileRequired: boolean;
-  submitting: boolean;
-  onSubmit?: (image: ImageItem, draft: GenerateForm, maskFactory: ImageSelectionMaskFactory | undefined, turnstileToken: string) => Promise<void>;
-}
-
 type ImageSelectionMaskFactory = () => Promise<ImageSelectionMask>;
 
-const fallbackImagePreviewEditOptions = {
-  initialForm: defaultForm,
-  availableRatios: FIGMA_RATIOS,
-  qualityOptions: QUALITY_OPTIONS,
-  formatOptions: FORMAT_OPTIONS,
-  maxImagesPerRequest: fallbackConfig.maxImagesPerRequest,
-  turnstileSiteKey: fallbackConfig.turnstileSiteKey,
-  turnstileRequired: fallbackConfig.turnstileRequired,
-  submitting: false,
-} satisfies ImagePreviewEditOptions;
-
-function ImagePreviewDialog({
-  image,
-  onClose,
-  onEdit,
-  editOptions,
-}: {
-  image: ImageItem;
-  onClose: () => void;
-  onEdit: (draft?: GenerateForm, mask?: ImageSelectionMask) => void;
-  editOptions?: ImagePreviewEditOptions;
-}) {
-  const panelOptions = editOptions ?? fallbackImagePreviewEditOptions;
-  const [viewportSize, setViewportSize] = useState(() => currentViewportSize());
-  const [editing, setEditing] = useState(false);
-  const [selectionEditing, setSelectionEditing] = useState(false);
-  const [selectionStrokes, setSelectionStrokes] = useState<ImageSelectionStroke[]>([]);
-  const [redoSelectionStrokes, setRedoSelectionStrokes] = useState<ImageSelectionStroke[]>([]);
-  const [draft, setDraft] = useState<GenerateForm>(() => panelOptions.initialForm);
-  const [turnstileToken, setTurnstileToken] = useState("");
-  const [optimizing, setOptimizing] = useState(false);
-  const [submittingEdit, setSubmittingEdit] = useState(false);
-  const [editError, setEditError] = useState("");
-  const stageRef = useRef<HTMLDivElement | null>(null);
-  const selectionCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const activeSelectionStrokeRef = useRef<ImageSelectionStroke | null>(null);
-  const previewSize = useMemo(
-    () => imagePreviewSize(image.width, image.height, viewportSize.width, viewportSize.height, editing),
-    [editing, image.height, image.width, viewportSize.height, viewportSize.width],
-  );
-  const previewStyle = {
-    "--preview-panel-width": `${previewSize.panelWidth}px`,
-    "--preview-panel-height": `${previewSize.panelHeight}px`,
-    "--preview-editor-width": `${previewSize.editorWidth}px`,
-  } as CSSProperties;
-
-  useEffect(() => {
-    setEditing(false);
-    setSelectionEditing(false);
-    setSelectionStrokes([]);
-    setRedoSelectionStrokes([]);
-    activeSelectionStrokeRef.current = null;
-    setDraft(panelOptions.initialForm);
-    setTurnstileToken("");
-    setSubmittingEdit(false);
-    setEditError("");
-  }, [image.id]);
-
-  useEffect(() => {
-    setTurnstileToken("");
-  }, [panelOptions.turnstileSiteKey]);
-
-  useEffect(() => {
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") onClose();
-    }
-
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
-
-  useEffect(() => {
-    function handleResize() {
-      setViewportSize(currentViewportSize());
-    }
-
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
-  }, []);
-
-  useEffect(() => {
-    if (!selectionEditing) return;
-    drawImageSelectionCanvas(selectionCanvasRef.current, stageRef.current, image, selectionStrokes);
-  }, [image, previewSize.panelHeight, previewSize.panelWidth, selectionEditing, selectionStrokes, viewportSize.height, viewportSize.width]);
-
-  function updateDraft<K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) {
-    setDraft((current) => updateGenerateFormValue(current, key, value));
-  }
-
-  function beginSelectionEdit() {
-    setEditing(true);
-    setSelectionEditing(true);
-    setEditError("");
-  }
-
-  function cancelSelectionEdit() {
-    activeSelectionStrokeRef.current = null;
-    setSelectionEditing(false);
-    setSelectionStrokes([]);
-    setRedoSelectionStrokes([]);
-    setEditError("");
-  }
-
-  function undoSelectionStroke() {
-    setSelectionStrokes((current) => {
-      const next = current.slice(0, -1);
-      const removed = current[current.length - 1];
-      if (removed) setRedoSelectionStrokes((redoCurrent) => [removed, ...redoCurrent]);
-      return next;
-    });
-  }
-
-  function redoSelectionStroke() {
-    setRedoSelectionStrokes((current) => {
-      const [restored, ...nextRedo] = current;
-      if (restored) setSelectionStrokes((strokes) => [...strokes, restored]);
-      return nextRedo;
-    });
-  }
-
-  function startSelectionStroke(event: ReactPointerEvent<HTMLCanvasElement>) {
-    if (!selectionEditing) return;
-    const point = imageSelectionPointFromEvent(event, stageRef.current, image);
-    if (!point) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    const stroke: ImageSelectionStroke = {
-      brushRatio: IMAGE_SELECTION_BRUSH_RATIO,
-      points: [point],
-    };
-    activeSelectionStrokeRef.current = stroke;
-    setRedoSelectionStrokes([]);
-    setSelectionStrokes((current) => [...current, stroke]);
-  }
-
-  function moveSelectionStroke(event: ReactPointerEvent<HTMLCanvasElement>) {
-    const activeStroke = activeSelectionStrokeRef.current;
-    if (!activeStroke || !selectionEditing) return;
-    const point = imageSelectionPointFromEvent(event, stageRef.current, image);
-    if (!point) return;
-    event.preventDefault();
-    event.stopPropagation();
-
-    const previous = activeStroke.points[activeStroke.points.length - 1];
-    const minDistance = 0.003;
-    if (previous && Math.hypot(point.x - previous.x, point.y - previous.y) < minDistance) return;
-
-    const nextStroke = {
-      ...activeStroke,
-      points: [...activeStroke.points, point],
-    };
-    activeSelectionStrokeRef.current = nextStroke;
-    setSelectionStrokes((current) => {
-      if (current.length === 0) return [nextStroke];
-      return [...current.slice(0, -1), nextStroke];
-    });
-  }
-
-  function endSelectionStroke(event: ReactPointerEvent<HTMLCanvasElement>) {
-    if (!activeSelectionStrokeRef.current) return;
-    event.preventDefault();
-    event.stopPropagation();
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    activeSelectionStrokeRef.current = null;
-  }
-
-  async function optimizeDraftPrompt() {
-    if (!draft.prompt.trim()) {
-      setEditError("请输入提示词后再优化。");
-      return;
-    }
-
-    setOptimizing(true);
-    setEditError("");
-    try {
-      const result = await api<{ ok: true; optimizedPrompt: string }>("/api/prompts/optimize", {
-        method: "POST",
-        body: JSON.stringify(promptOptimizationPayload(draft)),
-      });
-      updateDraft("prompt", result.optimizedPrompt.trim());
-    } catch (err) {
-      setEditError(err instanceof Error ? err.message : "提示词优化失败。");
-    } finally {
-      setOptimizing(false);
-    }
-  }
-
-  async function submitEdit(event: FormEvent) {
-    event.preventDefault();
-    if (panelOptions.submitting || submittingEdit) return;
-    setEditError("");
-    if (!draft.prompt.trim()) {
-      setEditError("请输入提示词后再生成。");
-      return;
-    }
-
-    let maskFactory: ImageSelectionMaskFactory | undefined;
-    if (selectionEditing) {
-      if (selectionStrokes.length === 0) {
-        setEditError("请先涂抹要优化的区域。");
-        return;
-      }
-      const maskStrokes = selectionStrokes.map((stroke) => ({
-        ...stroke,
-        points: [...stroke.points],
-      }));
-      maskFactory = () => createSelectionMask(image, maskStrokes);
-    }
-
-    if (!editOptions?.onSubmit) {
-      let selectionMask: ImageSelectionMask | undefined;
-      if (maskFactory) {
-        try {
-          selectionMask = await maskFactory();
-        } catch (err) {
-          setEditError(err instanceof Error ? err.message : "选区遮罩生成失败。");
-          return;
-        }
-      }
-      onEdit(draft, selectionMask);
-      onClose();
-      return;
-    }
-    if (panelOptions.turnstileRequired && !panelOptions.turnstileSiteKey) {
-      setEditError("Turnstile 已启用，请先配置站点 Key。");
-      return;
-    }
-    if (panelOptions.turnstileSiteKey && !turnstileToken) {
-      setEditError("请先完成人机验证。");
-      return;
-    }
-    const submitEditTask = editOptions.onSubmit;
-    setSubmittingEdit(true);
-    onClose();
-    window.setTimeout(() => {
-      try {
-        const submitPromise = submitEditTask(image, draft, maskFactory, turnstileToken);
-        void submitPromise.catch(() => undefined);
-      } catch {
-        // The dialog is already closed; submission handlers surface failures in the parent view.
-      }
-    }, 0);
-  }
-
-  return createPortal(
-    <div className="image-preview-overlay fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6" onClick={onClose}>
-      <div
-        className={cn("image-preview-panel", editing && "image-preview-panel-edit")}
-        role="dialog"
-        aria-modal="true"
-        aria-label={editing ? "图片编辑" : "图片预览"}
-        style={previewStyle}
-        onClick={(event) => event.stopPropagation()}
-      >
-        {editing && (
-          <ImagePreviewEditPanel
-            draft={draft}
-            error={editError}
-            optimizing={optimizing}
-            submitting={panelOptions.submitting || submittingEdit}
-            availableRatios={panelOptions.availableRatios}
-            qualityOptions={panelOptions.qualityOptions}
-            formatOptions={panelOptions.formatOptions}
-            maxImagesPerRequest={panelOptions.maxImagesPerRequest}
-            turnstileSiteKey={panelOptions.turnstileSiteKey}
-            turnstileRequired={panelOptions.turnstileRequired}
-            onDraftChange={updateDraft}
-            onTurnstileToken={setTurnstileToken}
-            onOptimize={() => void optimizeDraftPrompt()}
-            onSubmit={(event) => void submitEdit(event)}
-          />
-        )}
-        {selectionEditing ? (
-          <div className="image-preview-selection-toolbar">
-            <CossButton type="button" variant="ghost" className="image-preview-action" onClick={cancelSelectionEdit}>
-              <X />
-              <span>取消选区编辑</span>
-            </CossButton>
-            <div className="flex items-center gap-5">
-              <CossButton type="button" variant="ghost" className="image-preview-action" disabled={selectionStrokes.length === 0} onClick={undoSelectionStroke}>
-                <Undo2 />
-                <span>上一步</span>
-              </CossButton>
-              <CossButton type="button" variant="ghost" className="image-preview-action" disabled={redoSelectionStrokes.length === 0} onClick={redoSelectionStroke}>
-                <span>下一步</span>
-                <Redo2 />
-              </CossButton>
-            </div>
-            <span aria-hidden="true" />
-          </div>
-        ) : (
-          <div className="image-preview-actions">
-            {editing ? (
-              <CossButton type="button" variant="ghost" className="image-preview-action" onClick={beginSelectionEdit}>
-                <Edit3 />
-                <span>选区编辑</span>
-              </CossButton>
-            ) : (
-              <CossButton type="button" variant="ghost" className="image-preview-action" onClick={() => setEditing(true)}>
-                <Edit3 />
-                <span>编辑图片</span>
-              </CossButton>
-            )}
-            <a className="image-preview-action" href={imageDownloadUrl(image)} download={imageDownloadName(image)}>
-              <Download />
-              <span>下载图片</span>
-            </a>
-          </div>
-        )}
-        <CossButton type="button" variant="ghost" size="icon" className="image-preview-close" aria-label="关闭预览" onClick={onClose}>
-          <X />
-        </CossButton>
-        <div ref={stageRef} className={cn("image-preview-stage", selectionEditing && "image-preview-stage-selection")}>
-          <img src={image.url} alt={image.prompt ?? "生成图片"} />
-          {selectionEditing && (
-            <canvas
-              ref={selectionCanvasRef}
-              className="image-preview-selection-canvas"
-              aria-label="涂抹选区"
-              onPointerDown={startSelectionStroke}
-              onPointerMove={moveSelectionStroke}
-              onPointerUp={endSelectionStroke}
-              onPointerCancel={endSelectionStroke}
-            />
-          )}
-        </div>
-      </div>
-    </div>,
-    document.body,
-  );
-}
-
-function ImagePreviewEditPanel({
-  draft,
-  error,
-  optimizing,
-  submitting,
-  availableRatios,
-  qualityOptions,
-  formatOptions,
-  maxImagesPerRequest,
-  turnstileSiteKey,
-  turnstileRequired,
-  onDraftChange,
-  onTurnstileToken,
-  onOptimize,
-  onSubmit,
-}: {
-  draft: GenerateForm;
-  error: string;
-  optimizing: boolean;
-  submitting: boolean;
-  availableRatios: readonly string[];
-  qualityOptions: readonly string[];
-  formatOptions: readonly string[];
-  maxImagesPerRequest: number;
-  turnstileSiteKey: string;
-  turnstileRequired: boolean;
-  onDraftChange: <K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) => void;
-  onTurnstileToken: (token: string) => void;
-  onOptimize: () => void;
-  onSubmit: (event: FormEvent) => void;
-}) {
-  const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
-
-  useEffect(() => {
-    if (promptTextareaRef.current) resizePromptTextarea(promptTextareaRef.current);
-  }, [draft.prompt]);
-
-  return (
-    <form className="image-preview-editor" onSubmit={onSubmit}>
-      <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-4 pt-4">
-        <PromptSection
-          textareaRef={promptTextareaRef}
-          value={draft.prompt}
-          onChange={(value) => onDraftChange("prompt", value)}
-          placeholder="可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等"
-          required
-          optimizing={optimizing}
-          disabled={submitting}
-          onOptimize={onOptimize}
-          trailingContent={<PromptPlaceholderThumbnail />}
-        />
-
-        <div className="mt-4 pb-4">
-          <ParameterSection
-            aspectRatios={availableRatios}
-            selectedAspectRatio={draft.aspectRatio}
-            onAspectRatioChange={(value) => onDraftChange("aspectRatio", value)}
-            qualityOptions={qualityOptions}
-            selectedQuality={draft.quality}
-            qualityLabels={qualityLabels}
-            onQualityChange={(value) => onDraftChange("quality", value)}
-            resolutions={RESOLUTIONS}
-            selectedResolution={draft.resolution}
-            onResolutionChange={(value) => onDraftChange("resolution", value)}
-            quantities={Array.from({ length: Math.min(maxImagesPerRequest, 4) }, (_, index) => String(index + 1))}
-            selectedQuantity={draft.quantity}
-            onQuantityChange={(value) => onDraftChange("quantity", value)}
-            formatOptions={formatOptions}
-            selectedFormat={draft.outputFormat}
-            formatLabels={formatLabels}
-            onFormatChange={(value) => onDraftChange("outputFormat", value)}
-          />
-          <div className="mt-4 flex flex-col gap-3">
-            {turnstileSiteKey && <Turnstile siteKey={turnstileSiteKey} onToken={onTurnstileToken} />}
-            {turnstileRequired && !turnstileSiteKey && <Notice tone="warn" text="Turnstile 已启用，请配置站点 Key。" />}
-          </div>
-          {error && <div className="mt-3"><Notice tone="error" text={error} /></div>}
-        </div>
-      </div>
-
-      <GenerationFormFooter loading={submitting} idleLabel="生成任务" />
-    </form>
-  );
+function buildRecordPreviewActions(
+  image: ImageItem,
+  record: GenerationRecord,
+  onEditImage: (image: ImageItem, draft?: GenerateForm, mask?: ImageSelectionMask) => void,
+  onEditPrompt: () => void,
+  onRegenerate: () => void,
+  onDelete: () => void,
+): HoverImageAction[] {
+  return [
+    { key: "continue", label: "基于这张图片继续创作", icon: <GalleryHoverActionIcon src={generationContinueIcon} />, onSelect: onEditPrompt },
+    { key: "local-edit", label: "局部编辑", icon: <GalleryHoverActionIcon src={generationLocalEditIcon} />, onSelect: () => onEditImage(image, generationFormFromJob(record.job)) },
+    { key: "regenerate", label: "重新生成", icon: <GalleryHoverActionIcon src={generationRegenerateIcon} />, onSelect: onRegenerate },
+    { key: "copy", label: "复制提示词", icon: <GalleryHoverActionIcon src={generationCopyIcon} />, onSelect: () => void copyPrompt(record.job.prompt) },
+    { key: "download", label: "下载这张图片", icon: <GalleryHoverActionIcon src={generationDownloadIcon} />, href: imageDownloadUrl(image) },
+    {
+      key: "delete",
+      label: "删除这次生成",
+      icon: <GalleryHoverActionIcon src={generationDeleteIcon} />,
+      onSelect: onDelete,
+      confirm: {
+        title: "删除这次生成？",
+        description: "会删除这次生成的图片、参考图、遮罩和生成使用的提示词记录。此操作不能撤销。",
+        confirmLabel: "删除",
+      },
+    },
+  ];
 }
 
 function GalleryView({
@@ -2126,24 +1703,30 @@ function GalleryView({
         )}
       </div>
       {previewItem && (
-        <ImagePreviewDialog
-          image={previewItem.image}
+        <ImagePreview
+          image={{
+            url: previewItem.image.url,
+            thumbnailUrl: previewItem.image.thumbnailUrl,
+            prompt: previewItem.image.prompt ?? previewItem.job.prompt,
+            actions: buildGalleryImageActions(
+              previewItem,
+              () => {
+                onEditImage(previewItem.image, generationFormFromJob(previewItem.job));
+                setPreviewItem(null);
+              },
+              () => {
+                onEditPrompt(generationFormFromJob(previewItem.job));
+                setPreviewItem(null);
+              },
+              () => {
+                onJumpToConversation({ conversationId: previewItem.job.conversation_id?.trim() || previewItem.job.id, jobId: previewItem.job.id });
+                setPreviewItem(null);
+              },
+              () => void regenerateRecord({ job: previewItem.job, images: [previewItem.image], elapsedSeconds: estimateJobElapsed(previewItem.job) }),
+              () => void deleteRecord({ job: previewItem.job, images: [previewItem.image], elapsedSeconds: estimateJobElapsed(previewItem.job) }),
+            ),
+          }}
           onClose={() => setPreviewItem(null)}
-          onEdit={(draft, mask) => {
-            onEditImage(previewItem.image, draft, mask);
-            setPreviewItem(null);
-          }}
-          editOptions={{
-            initialForm: generationFormFromJob(previewItem.job),
-            availableRatios,
-            qualityOptions,
-            formatOptions,
-            maxImagesPerRequest: config.maxImagesPerRequest,
-            turnstileSiteKey: config.turnstileSiteKey,
-            turnstileRequired: config.turnstileRequired,
-            submitting: Boolean(regeneratingId),
-            onSubmit: createEditTaskFromImage,
-          }}
         />
       )}
     </section>
@@ -2224,7 +1807,7 @@ function GalleryImageCard({
   return (
     <div data-image-action-host className="group relative overflow-hidden rounded-[24px] border border-white/10 bg-white/[0.04]">
       <CossButton type="button" variant="ghost" className="block aspect-square h-auto w-full rounded-none border-0 bg-transparent p-0 hover:bg-transparent" onClick={onOpen}>
-        <img src={item.image.url} alt={item.job.prompt || "生成图片"} className="h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]" />
+        <img src={item.image.thumbnailUrl ?? item.image.url} alt={item.job.prompt || "生成图片"} className="h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]" />
       </CossButton>
       <div className="pointer-events-none absolute bottom-3 right-3 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
         <HoverImageActionBar actions={actions} />
@@ -2463,8 +2046,8 @@ function SettingsProviderSection({
       <div className="mt-4 flex flex-wrap items-center gap-3">
         <CossButton
           type="button"
-          variant="outline"
-          className="h-10 rounded-[12px] border-white/25 bg-white/[0.08] px-4 py-0 text-xs font-semibold leading-none text-white/90 hover:bg-white/[0.14] hover:text-white"
+          variant="default"
+          className="h-10 rounded-[12px] border-white/10 bg-white/90 px-4 py-0 text-xs font-semibold leading-none text-[#121212] shadow-none hover:bg-white/90 hover:text-[#121212]"
           loading={saving}
           onClick={onSave}
         >
@@ -2554,9 +2137,9 @@ function Notice({ tone, text }: { tone: "error" | "success" | "warn"; text: stri
   const variant = tone === "error" ? "destructive" : tone === "success" ? "success" : "warning";
   const Icon = tone === "success" ? CheckCircle2 : AlertCircle;
   return (
-    <Alert variant={variant} className="flex items-start gap-3">
-      <Icon className="mt-0.5 shrink-0" />
-      <AlertDescription>{text}</AlertDescription>
+    <Alert variant={variant} className="flex items-center gap-4 rounded-[24px] px-4 py-4">
+      <Icon className="size-5 shrink-0" />
+      <AlertDescription className="leading-6">{text}</AlertDescription>
     </Alert>
   );
 }
@@ -2669,6 +2252,30 @@ function normalizeImageMime(value: string): string {
   return mimeType === "image/jpg" ? "image/jpeg" : mimeType;
 }
 
+async function compressReferenceImage(file: File): Promise<{ file: File; compressed: boolean }> {
+  const image = await loadBrowserImage(file);
+  const scale = Math.min(1, FAST_REFERENCE_IMAGE_EDGE / Math.max(image.naturalWidth, image.naturalHeight));
+  const width = Math.max(1, Math.round(image.naturalWidth * scale));
+  const height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) return { file, compressed: false };
+  context.drawImage(image, 0, 0, width, height);
+
+  const preferred = await canvasToBlob(canvas, "image/webp", 0.86).catch(() => null);
+  const fallback = preferred ?? (await canvasToBlob(canvas, "image/jpeg", 0.88).catch(() => null));
+  if (!fallback || fallback.size >= file.size) return { file, compressed: false };
+
+  const type = normalizeImageMime(fallback.type) || "image/jpeg";
+  const extension = type === "image/webp" ? "webp" : "jpg";
+  return {
+    file: new File([fallback], replaceFileExtension(file.name || "reference", extension), { type }),
+    compressed: true,
+  };
+}
+
 async function imageItemToFile(image: ImageItem): Promise<File> {
   const response = await fetch(`/api/images/${encodeURIComponent(image.id)}/download?raw=1`, { credentials: "include" });
   if (!response.ok) {
@@ -2692,160 +2299,6 @@ function imageDownloadName(image: ImageItem): string {
 
 function imageDownloadUrl(image: ImageItem): string {
   return `/api/images/${encodeURIComponent(image.id)}/download?raw=1&download=1`;
-}
-
-function currentViewportSize(): { width: number; height: number } {
-  if (typeof window === "undefined") {
-    return { width: 1024, height: 768 };
-  }
-  return { width: window.innerWidth, height: window.innerHeight };
-}
-
-function imageContainRect(containerWidth: number, containerHeight: number, imageWidth: number, imageHeight: number) {
-  const ratio = imageWidth > 0 && imageHeight > 0 ? imageWidth / imageHeight : 1;
-  const containerRatio = containerWidth / containerHeight;
-  const width = containerRatio > ratio ? containerHeight * ratio : containerWidth;
-  const height = containerRatio > ratio ? containerHeight : containerWidth / ratio;
-  return {
-    x: (containerWidth - width) / 2,
-    y: (containerHeight - height) / 2,
-    width,
-    height,
-  };
-}
-
-function imageSelectionPointFromEvent(
-  event: ReactPointerEvent<HTMLCanvasElement>,
-  stage: HTMLDivElement | null,
-  image: ImageItem,
-): ImageSelectionPoint | null {
-  if (!stage) return null;
-  const bounds = stage.getBoundingClientRect();
-  const imageRect = imageContainRect(bounds.width, bounds.height, image.width, image.height);
-  const x = event.clientX - bounds.left - imageRect.x;
-  const y = event.clientY - bounds.top - imageRect.y;
-  if (x < 0 || y < 0 || x > imageRect.width || y > imageRect.height) return null;
-  return {
-    x: clampNumber(x / imageRect.width, 0, 1),
-    y: clampNumber(y / imageRect.height, 0, 1),
-  };
-}
-
-function drawImageSelectionCanvas(
-  canvas: HTMLCanvasElement | null,
-  stage: HTMLDivElement | null,
-  image: ImageItem,
-  strokes: ImageSelectionStroke[],
-): void {
-  if (!canvas || !stage) return;
-  const bounds = stage.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  const width = Math.max(1, Math.round(bounds.width));
-  const height = Math.max(1, Math.round(bounds.height));
-  if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
-    canvas.width = Math.round(width * dpr);
-    canvas.height = Math.round(height * dpr);
-  }
-  canvas.style.width = `${width}px`;
-  canvas.style.height = `${height}px`;
-
-  const context = canvas.getContext("2d");
-  if (!context) return;
-  context.setTransform(dpr, 0, 0, dpr, 0, 0);
-  context.clearRect(0, 0, width, height);
-
-  const imageRect = imageContainRect(width, height, image.width, image.height);
-  context.save();
-  context.beginPath();
-  context.rect(imageRect.x, imageRect.y, imageRect.width, imageRect.height);
-  context.clip();
-  context.strokeStyle = "rgba(110, 255, 48, 0.78)";
-  context.fillStyle = "rgba(110, 255, 48, 0.78)";
-  context.lineCap = "round";
-  context.lineJoin = "round";
-  for (const stroke of strokes) {
-    drawSelectionStroke(context, stroke, imageRect);
-  }
-  context.restore();
-}
-
-function drawSelectionStroke(
-  context: CanvasRenderingContext2D,
-  stroke: ImageSelectionStroke,
-  imageRect: { x: number; y: number; width: number; height: number },
-): void {
-  const points = stroke.points;
-  if (points.length === 0) return;
-  const lineWidth = Math.max(8, stroke.brushRatio * Math.min(imageRect.width, imageRect.height));
-  context.lineWidth = lineWidth;
-  const first = points[0];
-  if (points.length === 1) {
-    context.beginPath();
-    context.arc(imageRect.x + first.x * imageRect.width, imageRect.y + first.y * imageRect.height, lineWidth / 2, 0, Math.PI * 2);
-    context.fill();
-    return;
-  }
-  context.beginPath();
-  context.moveTo(imageRect.x + first.x * imageRect.width, imageRect.y + first.y * imageRect.height);
-  for (const point of points.slice(1)) {
-    context.lineTo(imageRect.x + point.x * imageRect.width, imageRect.y + point.y * imageRect.height);
-  }
-  context.stroke();
-}
-
-async function createSelectionMask(image: ImageItem, strokes: ImageSelectionStroke[]): Promise<ImageSelectionMask> {
-  if (!image.width || !image.height) {
-    throw new Error("图片尺寸无效，无法生成选区遮罩。");
-  }
-  const canvas = document.createElement("canvas");
-  canvas.width = image.width;
-  canvas.height = image.height;
-  const context = canvas.getContext("2d");
-  if (!context) {
-    throw new Error("浏览器不支持选区遮罩生成。");
-  }
-
-  context.fillStyle = "#fff";
-  context.fillRect(0, 0, canvas.width, canvas.height);
-  context.globalCompositeOperation = "destination-out";
-  context.strokeStyle = "#000";
-  context.fillStyle = "#000";
-  context.lineCap = "round";
-  context.lineJoin = "round";
-  for (const stroke of strokes) {
-    drawSelectionStroke(context, stroke, { x: 0, y: 0, width: canvas.width, height: canvas.height });
-  }
-
-  const blob = await canvasToBlob(canvas, "image/png");
-  const name = `${image.id}-mask.png`;
-  return {
-    file: new File([blob], name, { type: "image/png" }),
-    name,
-  };
-}
-
-async function compressReferenceImage(file: File): Promise<{ file: File; compressed: boolean }> {
-  const image = await loadBrowserImage(file);
-  const scale = Math.min(1, FAST_REFERENCE_IMAGE_EDGE / Math.max(image.naturalWidth, image.naturalHeight));
-  const width = Math.max(1, Math.round(image.naturalWidth * scale));
-  const height = Math.max(1, Math.round(image.naturalHeight * scale));
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const context = canvas.getContext("2d");
-  if (!context) return { file, compressed: false };
-  context.drawImage(image, 0, 0, width, height);
-
-  const preferred = await canvasToBlob(canvas, "image/webp", 0.86).catch(() => null);
-  const fallback = preferred ?? (await canvasToBlob(canvas, "image/jpeg", 0.88).catch(() => null));
-  if (!fallback || fallback.size >= file.size) return { file, compressed: false };
-
-  const type = normalizeImageMime(fallback.type) || "image/jpeg";
-  const extension = type === "image/webp" ? "webp" : "jpg";
-  return {
-    file: new File([fallback], replaceFileExtension(file.name || "reference", extension), { type }),
-    compressed: true,
-  };
 }
 
 function loadBrowserImage(file: File): Promise<HTMLImageElement> {
@@ -2873,39 +2326,9 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number)
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (blob) resolve(blob);
-      else reject(new Error("选区遮罩生成失败。"));
+      else reject(new Error("图片处理失败。"));
     }, type, quality);
   });
-}
-
-function clampNumber(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-function imagePreviewSize(
-  imageWidth: number,
-  imageHeight: number,
-  viewportWidth: number,
-  viewportHeight: number,
-  editing: boolean,
-): { panelWidth: number; panelHeight: number; editorWidth: number } {
-  const ratio = imageWidth > 0 && imageHeight > 0 ? imageWidth / imageHeight : 1;
-  const maxEditorWidth = Math.max(0, viewportWidth - IMAGE_PREVIEW_VIEWPORT_GAP * 2 - IMAGE_PREVIEW_IMAGE_INSET * 2 - IMAGE_PREVIEW_MIN_STAGE_SIZE);
-  const editorWidth = editing ? Math.min(IMAGE_PREVIEW_EDITOR_WIDTH, maxEditorWidth) : 0;
-  const maxStageWidth = Math.max(
-    IMAGE_PREVIEW_MIN_STAGE_SIZE,
-    viewportWidth - IMAGE_PREVIEW_VIEWPORT_GAP * 2 - IMAGE_PREVIEW_IMAGE_INSET * 2 - editorWidth,
-  );
-  const maxStageHeight = Math.max(IMAGE_PREVIEW_MIN_STAGE_SIZE, viewportHeight - IMAGE_PREVIEW_VIEWPORT_GAP * 2 - IMAGE_PREVIEW_IMAGE_INSET * 2);
-  const widthLimited = maxStageWidth / maxStageHeight <= ratio;
-  const stageWidth = widthLimited ? maxStageWidth : maxStageHeight * ratio;
-  const stageHeight = widthLimited ? maxStageWidth / ratio : maxStageHeight;
-
-  return {
-    panelWidth: Math.round(editorWidth + stageWidth + IMAGE_PREVIEW_IMAGE_INSET * 2),
-    panelHeight: Math.round(stageHeight + IMAGE_PREVIEW_IMAGE_INSET * 2),
-    editorWidth: Math.round(editorWidth),
-  };
 }
 
 function thumbnailSize(width: number, height: number): { width: number; height: number } {
@@ -3012,13 +2435,6 @@ function terminalTimelineLabel(job: GenerationJob): string {
   if (!isTerminalJobStatus(job.status)) return "待完成";
   if (job.status === "partial_succeeded") return "部分完成";
   return statusText(job.status).replace("任务", "");
-}
-
-function completedResultCount(job: GenerationJob): number {
-  const results = job.results ?? [];
-  if (results.length > 0) return results.filter((result) => result.status === "succeeded" || result.status === "failed").length;
-  if (isTerminalJobStatus(job.status)) return job.quantity;
-  return 0;
 }
 
 function resizePromptTextarea(textarea: HTMLTextAreaElement): void {

@@ -66,11 +66,13 @@ export interface Env {
   MAX_DAILY_JOBS_PER_SPACE?: string;
   MAX_RUNNING_JOBS_PER_SPACE?: string;
   REQUEST_TIMEOUT_MS?: string;
-  PROVIDER_IMAGE_BATCH_SIZE?: string;
+  GENERATION_JOB_MAX_RUNTIME_MS?: string;
   PROVIDER_IMAGE_CONCURRENCY?: string;
   PROVIDER_TIMEOUT_RETRY_ATTEMPTS?: string;
   PROVIDER_RETRY_ATTEMPTS?: string;
   PROVIDER_RETRY_DELAY_SECONDS?: string;
+  POST_PROCESSING_RETRY_ATTEMPTS?: string;
+  POST_PROCESSING_RETRY_DELAY_SECONDS?: string;
   IMAGE_RETENTION_DAYS?: string;
   X_BEARER_TOKEN?: string;
   INSPIRATION_FEATURE_ENABLED?: string;
@@ -170,6 +172,7 @@ export interface GenerationReferenceImageSnapshot {
   mimeType: string;
   name: string;
   byteSize: number;
+  role?: "source" | "reference";
 }
 
 export interface GenerationJobResultRecord {
@@ -197,6 +200,10 @@ export interface ImageAssetRecord {
   height: number;
   byte_size: number;
   sha256: string;
+  thumbnail_storage_key: string | null;
+  thumbnail_mime_type: string | null;
+  thumbnail_byte_size: number | null;
+  thumbnail_sha256: string | null;
   created_at: string;
   prompt?: string;
   quality?: string;

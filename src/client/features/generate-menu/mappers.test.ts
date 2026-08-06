@@ -5,6 +5,7 @@ import {
   buildConversationList,
   buildGenerationFlowItem,
   mergeJobReferenceImages,
+  resolveGenerationFlowRecord,
   buildSidebarConversations,
   conversationIdForRecord,
   composerDraftFromRecord,
@@ -50,13 +51,13 @@ describe("generate menu mappers", () => {
   it("groups generation records into dated conversation list items", () => {
     const items = buildConversationList([
       record({ id: "job_today", created_at: "2026-06-14T08:12:00.000Z" }, [
-        { id: "img_1", jobId: "job_today", url: "/img.png", width: 100, height: 100, format: "png", createdAt: "2026-06-14T08:13:00.000Z" },
+        { id: "img_1", jobId: "job_today", url: "/img.png", thumbnailUrl: "/thumb.webp", width: 100, height: 100, format: "png", createdAt: "2026-06-14T08:13:00.000Z" },
       ]),
       record({ id: "job_old", created_at: "2026-06-12T08:12:00.000Z", prompt: "旧记录" }),
     ], new Date("2026-06-14T12:00:00.000Z"));
 
     expect(items).toMatchObject([
-      { id: "job_today", title: "默认创作默认创作默认创作...", groupLabel: "今天", previewImage: "/img.png" },
+      { id: "job_today", title: "默认创作默认创作默认创作...", groupLabel: "今天", previewImage: "/thumb.webp" },
       { id: "job_old", title: "旧记录", groupLabel: "6月12日", previewImage: null },
     ]);
   });
@@ -157,6 +158,20 @@ describe("generate menu mappers", () => {
     expect(buildGenerationFlowItem(record({ status: "succeeded" })).status).toBe("success");
   });
 
+  it("does not let a stale active job hide a refreshed terminal record", () => {
+    const completedRecord = record({ id: "job_done", status: "succeeded", completed_at: "2026-06-23T10:09:28.474Z" }, [
+      { id: "img_done", jobId: "job_done", url: "/api/images/img_done/download?raw=1", width: 100, height: 100, format: "png", createdAt: "2026-06-23T10:09:28.474Z" },
+    ]);
+    const staleActiveJob = {
+      ...completedRecord.job,
+      status: "queued",
+      stage: "queued",
+      completed_at: null,
+    } as const;
+
+    expect(resolveGenerationFlowRecord(completedRecord, staleActiveJob, [])).toBe(completedRecord);
+  });
+
   it("keeps submitted reference images when a refreshed job omits them", () => {
     const submittedJob = record({
       id: "job_with_reference",
@@ -203,7 +218,19 @@ describe("generate menu mappers", () => {
     expect(
       submittedReferenceImages([], { name: "参考图 1", url: "blob:continue-source" }),
     ).toEqual([
-      { name: "参考图 1", mimeType: "image/png", byteSize: 0, url: "blob:continue-source" },
+      { name: "参考图 1", mimeType: "image/png", byteSize: 0, role: "source", url: "blob:continue-source" },
+    ]);
+  });
+
+  it("keeps a continued-creation source before later uploaded references", () => {
+    expect(
+      submittedReferenceImages(
+        [{ name: "style.png", file: { type: "image/png", size: 128 }, url: "blob:style" }],
+        { name: "参考图 1", url: "blob:continue-source" },
+      ),
+    ).toEqual([
+      { name: "参考图 1", mimeType: "image/png", byteSize: 0, role: "source", url: "blob:continue-source" },
+      { name: "style.png", mimeType: "image/png", byteSize: 128, role: "reference", url: "blob:style" },
     ]);
   });
 
@@ -217,7 +244,7 @@ describe("generate menu mappers", () => {
         },
       ]),
     ).toEqual([
-      { name: "局部重绘", mimeType: "image/webp", byteSize: 2048, url: "blob:local-edit-reference" },
+      { name: "局部重绘", mimeType: "image/webp", byteSize: 2048, role: "reference", url: "blob:local-edit-reference" },
     ]);
   });
 
@@ -228,7 +255,7 @@ describe("generate menu mappers", () => {
         { name: "局部重绘", url: "blob:local-edit-source" },
       ),
     ).toEqual([
-      { name: "局部重绘", mimeType: "image/png", byteSize: 0, url: "blob:local-edit-source" },
+      { name: "局部重绘", mimeType: "image/png", byteSize: 0, role: "source", url: "blob:local-edit-source" },
     ]);
   });
 

@@ -22,6 +22,7 @@ export interface StoredReferenceImage {
   mimeType: string;
   name: string;
   byteSize: number;
+  role?: "source" | "reference";
 }
 
 export interface JobStatusUpdate {
@@ -98,10 +99,10 @@ export async function upsertCredential(
     imageModel: string;
     imageEncryptedApiKey: string;
     imageApiKeyHint: string;
-    promptBaseURL: string;
+    promptBaseURL?: string | null;
     promptModel: string;
-    promptEncryptedApiKey: string;
-    promptApiKeyHint: string;
+    promptEncryptedApiKey?: string | null;
+    promptApiKeyHint?: string | null;
   },
 ): Promise<void> {
   const existing = await getCredential(db, spaceId);
@@ -440,7 +441,7 @@ export async function insertRateLimitEvent(db: AppDatabase, spaceId: string, eve
 
 export async function insertImageUsageEvent(db: AppDatabase, spaceId: string, imageId: string): Promise<void> {
   await db
-    .prepare("INSERT INTO rate_limit_events (id, space_id, event_type) VALUES (?, ?, ?)")
+    .prepare("INSERT INTO rate_limit_events (id, space_id, event_type) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING")
     .bind(imageUsageEventId(imageId), spaceId, IMAGE_GENERATED_EVENT)
     .run();
 }
@@ -540,25 +541,79 @@ export async function insertImageAsset(
   db: AppDatabase,
   row: Omit<ImageAssetRecord, "created_at">,
 ): Promise<void> {
-  await db
-    .prepare(
-      `INSERT INTO image_assets (
-        id, space_id, job_id, storage_key, mime_type, format, width, height, byte_size, sha256
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .bind(
-      row.id,
-      row.space_id,
-      row.job_id,
-      row.storage_key,
-      row.mime_type,
-      row.format,
-      row.width,
-      row.height,
-      row.byte_size,
-      row.sha256,
-    )
-    .run();
+  try {
+    await db
+      .prepare(
+        `INSERT INTO image_assets (
+          id, space_id, job_id, storage_key, mime_type, format, width, height, byte_size, sha256,
+          thumbnail_storage_key, thumbnail_mime_type, thumbnail_byte_size, thumbnail_sha256
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (id) DO UPDATE SET
+          storage_key = excluded.storage_key,
+          mime_type = excluded.mime_type,
+          format = excluded.format,
+          width = excluded.width,
+          height = excluded.height,
+          byte_size = excluded.byte_size,
+          sha256 = excluded.sha256,
+          thumbnail_storage_key = COALESCE(excluded.thumbnail_storage_key, image_assets.thumbnail_storage_key),
+          thumbnail_mime_type = COALESCE(excluded.thumbnail_mime_type, image_assets.thumbnail_mime_type),
+          thumbnail_byte_size = COALESCE(excluded.thumbnail_byte_size, image_assets.thumbnail_byte_size),
+          thumbnail_sha256 = COALESCE(excluded.thumbnail_sha256, image_assets.thumbnail_sha256)`,
+      )
+      .bind(
+        row.id,
+        row.space_id,
+        row.job_id,
+        row.storage_key,
+        row.mime_type,
+        row.format,
+        row.width,
+        row.height,
+        row.byte_size,
+        row.sha256,
+        row.thumbnail_storage_key,
+        row.thumbnail_mime_type,
+        row.thumbnail_byte_size,
+        row.thumbnail_sha256,
+      )
+      .run();
+  } catch (error) {
+    if (!isMissingThumbnailColumnError(error)) throw error;
+    await db
+      .prepare(
+        `INSERT INTO image_assets (
+          id, space_id, job_id, storage_key, mime_type, format, width, height, byte_size, sha256
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (id) DO UPDATE SET
+          storage_key = excluded.storage_key,
+          mime_type = excluded.mime_type,
+          format = excluded.format,
+          width = excluded.width,
+          height = excluded.height,
+          byte_size = excluded.byte_size,
+          sha256 = excluded.sha256`,
+      )
+      .bind(
+        row.id,
+        row.space_id,
+        row.job_id,
+        row.storage_key,
+        row.mime_type,
+        row.format,
+        row.width,
+        row.height,
+        row.byte_size,
+        row.sha256,
+      )
+      .run();
+  }
+}
+
+function isMissingThumbnailColumnError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  const namesThumbnailColumn = /thumbnail_(storage_key|mime_type|byte_size|sha256)/.test(message);
+  return namesThumbnailColumn && /(does not exist|has no column|no column named|unknown column)/.test(message);
 }
 
 function imageUsageEventId(imageId: string): string {
@@ -576,6 +631,7 @@ function referenceImageSnapshot(image: StoredReferenceImage): GenerationReferenc
     mimeType: image.mimeType,
     name: image.name,
     byteSize: image.byteSize,
+    ...(image.role ? { role: image.role } : {}),
   };
 }
 

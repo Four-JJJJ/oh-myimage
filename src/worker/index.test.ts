@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { hashPassword } from "./crypto";
-import { app, hasUnlimitedDailyImageQuota, resolveProviderRetryAttempts } from "./index";
-import type { AppDatabase, AppObject, AppObjectStore, AppObjectStorePutOptions, AppPreparedStatement, Env, ImageAssetRecord, SpaceRecord } from "./types";
+import {
+  app,
+  hasUnlimitedDailyImageQuota,
+  resolvePostProcessingRetryAttempts,
+  resolvePostProcessingRetryDelaySeconds,
+  resolveProviderRetryAttempts,
+} from "./index";
+import type { AppDatabase, AppObject, AppObjectStore, AppObjectStorePutOptions, AppPreparedStatement, CredentialRecord, Env, ImageAssetRecord, SpaceRecord } from "./types";
 
 describe("daily image quota exemption", () => {
   it("no longer exempts any provider by URL", () => {
@@ -23,12 +29,110 @@ describe("provider queue retry attempts", () => {
     expect(resolveProviderRetryAttempts("2")).toBe(2);
     expect(resolveProviderRetryAttempts("99")).toBe(4);
   });
+
+  it("keeps a separate bounded retry budget for checkpointed post-processing", () => {
+    expect(resolvePostProcessingRetryAttempts(undefined)).toBe(2);
+    expect(resolvePostProcessingRetryAttempts("0")).toBe(0);
+    expect(resolvePostProcessingRetryAttempts("99")).toBe(4);
+    expect(resolvePostProcessingRetryDelaySeconds(undefined)).toBe(5);
+    expect(resolvePostProcessingRetryDelaySeconds("99")).toBe(60);
+  });
+});
+
+describe("provider settings", () => {
+  it("saves an image provider without requiring a prompt provider", async () => {
+    const db = new FakeRouteDatabase();
+    db.credentialRecord = null;
+
+    const response = await app.request(
+      "http://local.test/api/settings/provider",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          imageProvider: {
+            baseURL: "https://img.share-api.com/v1",
+            apiKey: "sk-test-image-provider",
+            model: "gpt-image-2",
+          },
+        }),
+      },
+      testEnv({ db, images: new FakeObjectStore() }),
+    );
+    const json = (await response.json()) as { ok: true; imageProvider: { baseURL: string; apiKeyHint: string }; promptProvider: null };
+
+    expect(response.status).toBe(200);
+    expect(json.imageProvider.baseURL).toBe("https://img.share-api.com/v1");
+    expect(json.imageProvider.apiKeyHint).toBe("sk-t...ider");
+    expect(json.promptProvider).toBeNull();
+    expect(db.credentialRecord).toMatchObject({
+      space_id: "space_1",
+      base_url: "https://img.share-api.com/v1",
+      model: "gpt-image-2",
+      api_key_hint: "sk-t...ider",
+      prompt_base_url: null,
+      prompt_encrypted_api_key: null,
+      prompt_api_key_hint: null,
+    });
+  });
+
+  it("keeps an existing image provider when saving a prompt provider later", async () => {
+    const db = new FakeRouteDatabase();
+    db.credentialRecord = makeCredentialRecord({
+      base_url: "https://img.share-api.com/v1",
+      model: "gpt-image-2",
+      encrypted_api_key: "existing-image-secret",
+      api_key_hint: "sk-i...mage",
+      prompt_base_url: null,
+      prompt_encrypted_api_key: null,
+      prompt_api_key_hint: null,
+    });
+
+    const response = await app.request(
+      "http://local.test/api/settings/provider",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          promptProvider: {
+            baseURL: "https://api.openai.com/v1",
+            apiKey: "sk-test-prompt-provider",
+            model: "gpt-5.5",
+          },
+        }),
+      },
+      testEnv({ db, images: new FakeObjectStore() }),
+    );
+    const json = (await response.json()) as { ok: true; imageProvider: { baseURL: string; apiKeyHint: string }; promptProvider: { baseURL: string; apiKeyHint: string } };
+
+    expect(response.status).toBe(200);
+    expect(json.imageProvider.baseURL).toBe("https://img.share-api.com/v1");
+    expect(json.imageProvider.apiKeyHint).toBe("sk-i...mage");
+    expect(json.promptProvider.baseURL).toBe("https://api.openai.com/v1");
+    expect(json.promptProvider.apiKeyHint).toBe("sk-t...ider");
+    expect(db.credentialRecord).toMatchObject({
+      base_url: "https://img.share-api.com/v1",
+      encrypted_api_key: "existing-image-secret",
+      api_key_hint: "sk-i...mage",
+      prompt_base_url: "https://api.openai.com/v1",
+      prompt_api_key_hint: "sk-t...ider",
+    });
+  });
 });
 
 describe("image downloads", () => {
   it("uses stable same-origin image URLs for generation records", async () => {
     const db = new FakeRouteDatabase();
     db.jobRecords.set("job_1", makeJobRecord());
+    db.imageRecords.set(
+      "img_1",
+      makeImageRecord({
+        thumbnail_storage_key: "space_1/thumbs/img_1.webp",
+        thumbnail_mime_type: "image/webp",
+        thumbnail_byte_size: 512,
+        thumbnail_sha256: "thumb-sha",
+      }),
+    );
     const response = await app.request(
       "http://local.test/api/generations",
       {
@@ -36,10 +140,11 @@ describe("image downloads", () => {
       },
       testEnv({ db, images: new FakeObjectStore() }),
     );
-    const json = (await response.json()) as { records: Array<{ images: Array<{ url: string }> }> };
+    const json = (await response.json()) as { records: Array<{ images: Array<{ url: string; thumbnailUrl: string | null }> }> };
 
     expect(response.status).toBe(200);
     expect(json.records[0]?.images[0]?.url).toBe("/api/images/img_1/download?raw=1");
+    expect(json.records[0]?.images[0]?.thumbnailUrl).toBe("/api/images/img_1/thumbnail");
   });
 
   it("returns generation records in pages of 40 and only exposes a cursor when more exist", async () => {
@@ -145,6 +250,7 @@ describe("image downloads", () => {
     expect(response.headers.get("Content-Type")).toBe("image/png");
     expect(response.headers.get("Cache-Control")).toBe("private, max-age=31536000, immutable");
     expect(response.headers.get("ETag")).toBe('"sha"');
+    expect(response.headers.get("Content-Length")).toBe("11");
     expect(response.headers.get("Content-Disposition")).toBe('attachment; filename="img_1.png"');
     expect(response.headers.get("Location")).toBeNull();
     expect(await response.text()).toBe("image-bytes");
@@ -164,6 +270,7 @@ describe("image downloads", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("image/png");
+    expect(response.headers.get("Content-Length")).toBe("11");
     expect(response.headers.get("Content-Disposition")).toBe('inline; filename="img_1.png"');
     expect(response.headers.get("Location")).toBeNull();
     expect(await response.text()).toBe("image-bytes");
@@ -188,6 +295,126 @@ describe("image downloads", () => {
     expect(images.getCalls).toEqual([]);
   });
 
+  it("returns cached generated thumbnails with long private cache headers", async () => {
+    const db = new FakeRouteDatabase();
+    db.imageRecords.set(
+      "img_1",
+      makeImageRecord({
+        thumbnail_storage_key: "space_1/thumbs/img_1.webp",
+        thumbnail_mime_type: "image/webp",
+        thumbnail_byte_size: 512,
+        thumbnail_sha256: "thumb-sha",
+      }),
+    );
+    const images = new FakeObjectStore();
+    const response = await app.request(
+      "http://local.test/api/images/img_1/thumbnail",
+      {
+        headers: { Cookie: "image2_session=test-token" },
+      },
+      testEnv({ db, images }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("image/webp");
+    expect(response.headers.get("Cache-Control")).toBe("private, max-age=31536000, immutable");
+    expect(response.headers.get("ETag")).toBe('"thumb-sha"');
+    expect(response.headers.get("Content-Length")).toBe("512");
+    expect(response.headers.get("Content-Disposition")).toBe('inline; filename="img_1-thumbnail.webp"');
+    expect(await response.text()).toBe("image-bytes");
+    expect(images.getCalls).toEqual(["space_1/thumbs/img_1.webp"]);
+  });
+
+  it("returns not modified for cached generated thumbnail reads", async () => {
+    const db = new FakeRouteDatabase();
+    db.imageRecords.set(
+      "img_1",
+      makeImageRecord({
+        thumbnail_storage_key: "space_1/thumbs/img_1.webp",
+        thumbnail_mime_type: "image/webp",
+        thumbnail_byte_size: 512,
+        thumbnail_sha256: "thumb-sha",
+      }),
+    );
+    const images = new FakeObjectStore();
+    const response = await app.request(
+      "http://local.test/api/images/img_1/thumbnail",
+      {
+        headers: { Cookie: "image2_session=test-token", "If-None-Match": '"thumb-sha"' },
+      },
+      testEnv({ db, images }),
+    );
+
+    expect(response.status).toBe(304);
+    expect(response.headers.get("Cache-Control")).toBe("private, max-age=31536000, immutable");
+    expect(response.headers.get("ETag")).toBe('"thumb-sha"');
+    expect(await response.text()).toBe("");
+    expect(images.getCalls).toEqual([]);
+  });
+
+  it("deletes generated assets, thumbnails, and recovery checkpoints with a completed generation record", async () => {
+    const db = new FakeRouteDatabase();
+    db.jobRecords.set(
+      "job_1",
+      makeJobRecord({
+        reference_image_storage_key: "space_1/job_1/reference-1.png",
+        mask_image_storage_key: "space_1/job_1/mask.png",
+      }),
+    );
+    db.imageRecords.set(
+      "img_1",
+      makeImageRecord({
+        thumbnail_storage_key: "space_1/thumbs/img_1.webp",
+        thumbnail_mime_type: "image/webp",
+        thumbnail_byte_size: 512,
+        thumbnail_sha256: "thumb-sha",
+      }),
+    );
+    const images = new FakeObjectStore();
+
+    const response = await app.request(
+      "http://local.test/api/generations/job_1",
+      {
+        method: "DELETE",
+        headers: { Cookie: "image2_session=test-token" },
+      },
+      testEnv({ db, images }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(images.deleteCalls).toEqual([
+      "space_1/img_1.png",
+      "space_1/thumbs/img_1.webp",
+      "space_1/job_1/reference-1.png",
+      "space_1/job_1/mask.png",
+      "space_1/job_1/provider-result-0.json",
+      "space_1/job_1/img_job_1_0.png",
+      "space_1/job_1/img_job_1_0.jpeg",
+      "space_1/job_1/img_job_1_0.webp",
+      "space_1/job_1/thumb_img_job_1_0.webp",
+    ]);
+  });
+
+  it("rejects deletion while a generation job is queued or running", async () => {
+    const db = new FakeRouteDatabase();
+    db.jobRecords.set("job_1", makeJobRecord({ status: "running", stage: "waiting_provider", completed_at: null }));
+    const images = new FakeObjectStore();
+
+    const response = await app.request(
+      "http://local.test/api/generations/job_1",
+      {
+        method: "DELETE",
+        headers: { Cookie: "image2_session=test-token" },
+      },
+      testEnv({ db, images }),
+    );
+    const json = (await response.json()) as { error: { code: string } };
+
+    expect(response.status).toBe(409);
+    expect(json.error.code).toBe("job_active");
+    expect(images.deleteCalls).toEqual([]);
+  });
+
   it("keeps normal downloads on the presigned redirect path", async () => {
     const images = new FakeObjectStore({ presignedUrl: "https://r2.example.com/signed-img" });
     const response = await app.request(
@@ -202,6 +429,61 @@ describe("image downloads", () => {
     expect(response.headers.get("Location")).toBe("https://r2.example.com/signed-img");
     expect(images.getCalls).toEqual([]);
     expect(images.presignedCalls).toEqual(["space_1/img_1.png"]);
+  });
+
+  it("returns reference image bytes with stable private cache headers", async () => {
+    const db = new FakeRouteDatabase();
+    db.jobRecords.set(
+      "job_1",
+      makeJobRecord({
+        reference_image_storage_key: "space_1/job_1/reference-1.png",
+        reference_image_mime_type: "image/png",
+        reference_image_name: "source.png",
+        reference_image_byte_size: 123,
+      }),
+    );
+    const images = new FakeObjectStore();
+
+    const response = await app.request(
+      "http://local.test/api/generations/job_1/references/0",
+      {
+        headers: { Cookie: "image2_session=test-token" },
+      },
+      testEnv({ db, images }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("image/png");
+    expect(response.headers.get("Cache-Control")).toBe("private, max-age=31536000, immutable");
+    expect(response.headers.get("ETag")).toBe('"space_1/job_1/reference-1.png:123"');
+    expect(images.getCalls).toEqual(["space_1/job_1/reference-1.png"]);
+  });
+
+  it("returns not modified for cached reference image reads", async () => {
+    const db = new FakeRouteDatabase();
+    db.jobRecords.set(
+      "job_1",
+      makeJobRecord({
+        reference_image_storage_key: "space_1/job_1/reference-1.png",
+        reference_image_mime_type: "image/png",
+        reference_image_name: "source.png",
+        reference_image_byte_size: 123,
+      }),
+    );
+    const images = new FakeObjectStore();
+
+    const response = await app.request(
+      "http://local.test/api/generations/job_1/references/0",
+      {
+        headers: { Cookie: "image2_session=test-token", "If-None-Match": '"space_1/job_1/reference-1.png:123"' },
+      },
+      testEnv({ db, images }),
+    );
+
+    expect(response.status).toBe(304);
+    expect(response.headers.get("Cache-Control")).toBe("private, max-age=31536000, immutable");
+    expect(response.headers.get("ETag")).toBe('"space_1/job_1/reference-1.png:123"');
+    expect(images.getCalls).toEqual([]);
   });
 });
 
@@ -298,8 +580,8 @@ describe("generation creation", () => {
       ]),
     );
     expect(JSON.parse(String(db.generationJobInserts[0]?.at(-1)))).toEqual([
-      expect.objectContaining({ storageKey: `space_1/${json.jobId}/reference-1.png`, name: "source-one.png", mimeType: "image/png" }),
-      expect.objectContaining({ storageKey: `space_1/${json.jobId}/reference-2.webp`, name: "source-two.webp", mimeType: "image/webp" }),
+      expect.objectContaining({ storageKey: `space_1/${json.jobId}/reference-1.png`, name: "source-one.png", mimeType: "image/png", role: "reference" }),
+      expect.objectContaining({ storageKey: `space_1/${json.jobId}/reference-2.webp`, name: "source-two.webp", mimeType: "image/webp", role: "reference" }),
     ]);
   });
 
@@ -343,6 +625,42 @@ describe("generation creation", () => {
         `space_1/${json.jobId}/reference-1.png`,
       ]),
     );
+    expect(JSON.parse(String(db.generationJobInserts[0]?.at(-1)))).toEqual([
+      expect.objectContaining({ storageKey: `space_1/${json.jobId}/reference-1.png`, role: "source" }),
+    ]);
+  });
+
+  it("maps the legacy referenceImageId field to the source-image edit path", async () => {
+    const db = new FakeRouteDatabase();
+    const images = new FakeObjectStore();
+    const generationQueue = new RecordingQueue();
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: "legacy continued edit",
+          aspectRatio: "1:1",
+          width: 1024,
+          height: 1024,
+          quality: "auto",
+          quantity: 1,
+          outputFormat: "png",
+          compression: 100,
+          referenceImageId: "img_1",
+        }),
+      },
+      testEnv({ db, images, generationQueue }),
+    );
+    const json = (await response.json()) as { jobId: string };
+
+    expect(response.status).toBe(200);
+    expect(images.copyCalls.map((call) => call.destinationKey)).toEqual([`space_1/${json.jobId}/reference-1.png`]);
+    expect(JSON.parse(String(db.generationJobInserts[0]?.at(-1)))).toEqual([
+      expect.objectContaining({ role: "source" }),
+    ]);
   });
 
   it("reuses the selected conversation id for continued prompts", async () => {
@@ -460,9 +778,12 @@ describe("generation creation", () => {
     );
   });
 
-  it("rejects requests that mix uploaded reference images with source image ids", async () => {
+  it("keeps a source image before uploaded references in one generation request", async () => {
+    const db = new FakeRouteDatabase();
+    const images = new FakeObjectStore();
+    const generationQueue = new RecordingQueue();
     const formData = new FormData();
-    formData.set("prompt", "bad edit request");
+    formData.set("prompt", "continue with a style reference");
     formData.set("aspectRatio", "1:1");
     formData.set("width", "1024");
     formData.set("height", "1024");
@@ -480,12 +801,18 @@ describe("generation creation", () => {
         headers: { Cookie: "image2_session=test-token" },
         body: formData,
       },
-      testEnv({ images: new FakeObjectStore(), generationQueue: new RecordingQueue() }),
+      testEnv({ db, images, generationQueue }),
     );
-    const json = (await response.json()) as { error: { code: string } };
+    const json = (await response.json()) as { ok: true; jobId: string; status: "queued" };
 
-    expect(response.status).toBe(400);
-    expect(json.error.code).toBe("reference_source_conflict");
+    expect(response.status).toBe(200);
+    expect(json.status).toBe("queued");
+    expect(images.copyCalls.map((call) => call.destinationKey)).toEqual([`space_1/${json.jobId}/reference-1.png`]);
+    expect(images.putCalls.map((call) => call.key)).toEqual([`space_1/${json.jobId}/reference-2.png`]);
+    expect(JSON.parse(String(db.generationJobInserts[0]?.at(-1)))).toEqual([
+      expect.objectContaining({ storageKey: `space_1/${json.jobId}/reference-1.png`, role: "source" }),
+      expect.objectContaining({ storageKey: `space_1/${json.jobId}/reference-2.png`, name: "source.png", role: "reference" }),
+    ]);
   });
 
   it("rejects more than eight uploaded reference images", async () => {
@@ -515,6 +842,39 @@ describe("generation creation", () => {
 
     expect(response.status).toBe(400);
     expect(json.error.code).toBe("too_many_reference_images");
+  });
+
+  it("counts a continued-creation source image toward the eight-reference limit", async () => {
+    const images = new FakeObjectStore();
+    const formData = new FormData();
+    formData.set("prompt", "too many references with a source image");
+    formData.set("aspectRatio", "1:1");
+    formData.set("width", "1024");
+    formData.set("height", "1024");
+    formData.set("quality", "auto");
+    formData.set("quantity", "1");
+    formData.set("outputFormat", "png");
+    formData.set("compression", "100");
+    formData.set("sourceImageId", "img_1");
+    for (let index = 0; index < 8; index += 1) {
+      formData.append("referenceImage", new File(["reference-bytes"], `reference-${index + 1}.png`, { type: "image/png" }));
+    }
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token" },
+        body: formData,
+      },
+      testEnv({ images, generationQueue: new RecordingQueue() }),
+    );
+    const json = (await response.json()) as { error: { code: string } };
+
+    expect(response.status).toBe(400);
+    expect(json.error.code).toBe("too_many_reference_images");
+    expect(images.copyCalls).toEqual([]);
+    expect(images.putCalls).toEqual([]);
   });
 
   it("rejects source image ids outside the current space", async () => {
@@ -691,6 +1051,7 @@ function testEnv({
     IMAGES: images,
     GENERATION_QUEUE: generationQueue,
     INSPIRATION_QUEUE: disabledQueue(),
+    APP_ENCRYPTION_KEY: "test-encryption-key-for-routes",
   };
 }
 
@@ -708,6 +1069,7 @@ class FakeRouteDatabase implements AppDatabase {
   readonly statusUpdates: Array<{ jobId: string; status: string; errorCode: string | null; errorMessage: string | null; stage: string }> = [];
   readonly imageRecords = new Map<string, ImageAssetRecord>([["img_1", makeImageRecord()]]);
   readonly jobRecords = new Map<string, Record<string, unknown>>();
+  credentialRecord: CredentialRecord | null = makeCredentialRecord();
 
   prepare(query: string): AppPreparedStatement {
     return new FakeRoutePreparedStatement(this, query);
@@ -803,24 +1165,7 @@ class FakeRoutePreparedStatement implements AppPreparedStatement {
       return job && job.space_id === this.values[1] ? (job as T) : null;
     }
     if (this.query.includes("FROM api_credentials")) {
-      return {
-        id: "cred_1",
-        space_id: "space_1",
-        base_url: "https://token.fourj.space/v1",
-        model: "gpt-image-2",
-        prompt_optimizer_model: "gpt-5.5",
-        encrypted_api_key: "encrypted",
-        api_key_hint: "test",
-        last_test_ok: 1,
-        last_tested_at: "2026-05-15T00:00:00.000Z",
-        prompt_base_url: "https://api.openai.com/v1",
-        prompt_encrypted_api_key: "prompt-encrypted",
-        prompt_api_key_hint: "prompt-test",
-        prompt_last_test_ok: 1,
-        prompt_last_tested_at: "2026-05-15T00:00:00.000Z",
-        created_at: "2026-05-15T00:00:00.000Z",
-        updated_at: "2026-05-15T00:00:00.000Z",
-      } as T;
+      return this.db.credentialRecord && this.db.credentialRecord.space_id === this.values[0] ? (this.db.credentialRecord as T) : null;
     }
     if (this.query.includes("COUNT(*) AS count FROM generation_jobs")) {
       return { count: 0 } as T;
@@ -865,6 +1210,57 @@ class FakeRoutePreparedStatement implements AppPreparedStatement {
         jobId: String(this.values.at(-1) ?? ""),
       });
     }
+    if (this.query.includes("INSERT INTO api_credentials")) {
+      const [
+        id,
+        spaceId,
+        baseURL,
+        model,
+        encryptedApiKey,
+        apiKeyHint,
+        promptBaseURL,
+        promptModel,
+        promptEncryptedApiKey,
+        promptApiKeyHint,
+      ] = this.values;
+      this.db.credentialRecord = makeCredentialRecord({
+        id: String(id),
+        space_id: String(spaceId),
+        base_url: String(baseURL),
+        model: String(model),
+        encrypted_api_key: String(encryptedApiKey),
+        api_key_hint: String(apiKeyHint),
+        prompt_base_url: promptBaseURL === null || promptBaseURL === undefined ? null : String(promptBaseURL),
+        prompt_optimizer_model: String(promptModel),
+        prompt_encrypted_api_key: promptEncryptedApiKey === null || promptEncryptedApiKey === undefined ? null : String(promptEncryptedApiKey),
+        prompt_api_key_hint: promptApiKeyHint === null || promptApiKeyHint === undefined ? null : String(promptApiKeyHint),
+      });
+    }
+    if (this.query.includes("UPDATE api_credentials")) {
+      const [
+        baseURL,
+        model,
+        encryptedApiKey,
+        apiKeyHint,
+        promptBaseURL,
+        promptModel,
+        promptEncryptedApiKey,
+        promptApiKeyHint,
+        spaceId,
+      ] = this.values;
+      this.db.credentialRecord = makeCredentialRecord({
+        ...(this.db.credentialRecord ?? {}),
+        space_id: String(spaceId),
+        base_url: String(baseURL),
+        model: String(model),
+        encrypted_api_key: String(encryptedApiKey),
+        api_key_hint: String(apiKeyHint),
+        prompt_base_url: promptBaseURL === null || promptBaseURL === undefined ? null : String(promptBaseURL),
+        prompt_optimizer_model: String(promptModel),
+        prompt_encrypted_api_key: promptEncryptedApiKey === null || promptEncryptedApiKey === undefined ? null : String(promptEncryptedApiKey),
+        prompt_api_key_hint: promptApiKeyHint === null || promptApiKeyHint === undefined ? null : String(promptApiKeyHint),
+      });
+    }
     return { success: true };
   }
 }
@@ -902,7 +1298,11 @@ class FakeObjectStore implements AppObjectStore {
     return {};
   }
 
-  async delete(_key: string): Promise<void> {}
+  readonly deleteCalls: string[] = [];
+
+  async delete(key: string): Promise<void> {
+    this.deleteCalls.push(key);
+  }
 
   async createPresignedGetUrl(key: string): Promise<string> {
     this.presignedCalls.push(key);
@@ -923,6 +1323,10 @@ function makeImageRecord(overrides: Partial<ImageAssetRecord> = {}): ImageAssetR
     height: 1024,
     byte_size: 11,
     sha256: "sha",
+    thumbnail_storage_key: null,
+    thumbnail_mime_type: null,
+    thumbnail_byte_size: null,
+    thumbnail_sha256: null,
     created_at: "2026-05-15T00:00:00.000Z",
     ...overrides,
   };
@@ -976,6 +1380,28 @@ function makeSpaceRecord(overrides: Partial<SpaceRecord> = {}): SpaceRecord {
     space_name: "Test Space",
     space_key: "test-space",
     password_hash: "hash",
+    created_at: "2026-05-15T00:00:00.000Z",
+    updated_at: "2026-05-15T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function makeCredentialRecord(overrides: Partial<CredentialRecord> = {}): CredentialRecord {
+  return {
+    id: "cred_1",
+    space_id: "space_1",
+    base_url: "https://token.fourj.space/v1",
+    model: "gpt-image-2",
+    prompt_optimizer_model: "gpt-5.5",
+    encrypted_api_key: "encrypted",
+    api_key_hint: "test",
+    last_test_ok: 1,
+    last_tested_at: "2026-05-15T00:00:00.000Z",
+    prompt_base_url: "https://api.openai.com/v1",
+    prompt_encrypted_api_key: "prompt-encrypted",
+    prompt_api_key_hint: "prompt-test",
+    prompt_last_test_ok: 1,
+    prompt_last_tested_at: "2026-05-15T00:00:00.000Z",
     created_at: "2026-05-15T00:00:00.000Z",
     updated_at: "2026-05-15T00:00:00.000Z",
     ...overrides,

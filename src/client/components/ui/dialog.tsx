@@ -8,6 +8,7 @@ const DialogTrigger = DialogPrimitive.Trigger;
 const DialogClose = DialogPrimitive.Close;
 const DialogTitle = DialogPrimitive.Title;
 const DialogDescription = DialogPrimitive.Description;
+const dialogBackdropSurfaceClassName = "backdrop-blur-sm";
 
 function DialogPopup({
   className,
@@ -19,7 +20,7 @@ function DialogPopup({
 }): React.ReactElement {
   return (
     <DialogPrimitive.Portal>
-      <DialogPrimitive.Backdrop className="fixed inset-0 z-50 bg-black/72 backdrop-blur-sm data-[ending-style]:opacity-0 data-[starting-style]:opacity-0" />
+      <DialogPrimitive.Backdrop className={cn("fixed inset-0 z-50 data-[ending-style]:opacity-0 data-[starting-style]:opacity-0", dialogBackdropSurfaceClassName)} />
       <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
         <DialogPrimitive.Popup
           className={cn(
@@ -52,4 +53,4 @@ function DialogFooter({ className, ...props }: React.HTMLAttributes<HTMLDivEleme
   return <div className={cn("flex items-center justify-end gap-2 border-t border-white/[0.08] px-5 py-4", className)} {...props} />;
 }
 
-export { Dialog, DialogClose, DialogDescription, DialogFooter, DialogHeader, DialogPanel, DialogPopup, DialogTitle, DialogTrigger };
+export { Dialog, DialogClose, DialogDescription, DialogFooter, DialogHeader, DialogPanel, DialogPopup, DialogTitle, DialogTrigger, dialogBackdropSurfaceClassName };

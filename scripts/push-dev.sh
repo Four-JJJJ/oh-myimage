@@ -16,6 +16,7 @@ RELEASE_NAME="${RELEASE_NAME:-dev-$(date +%Y%m%d%H%M%S)}"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_TESTS="${SKIP_TESTS:-0}"
 TEST_ARGS="${TEST_ARGS:-}"
+REBUILD_IMAGE="${REBUILD_IMAGE:-0}"
 
 RELEASE_DIR="${REMOTE_BASE_DIR}/releases/${RELEASE_NAME}"
 CURRENT_LINK="${REMOTE_BASE_DIR}/current"
@@ -27,6 +28,14 @@ FILES_TO_PACKAGE=(
   "src"
   "migrations"
   "deploy"
+  "public"
+  "index.html"
+  "Dockerfile"
+  ".dockerignore"
+  "postcss.config.js"
+  "tailwind.config.ts"
+  "tsconfig.json"
+  "vite.config.ts"
   "package.json"
   "package-lock.json"
 )
@@ -81,7 +90,13 @@ run tar -czf "$ARCHIVE_NAME" "${FILES_TO_PACKAGE[@]}"
 run ssh "$REMOTE_ALIAS" "mkdir -p ${RELEASE_DIR}"
 run scp "$ARCHIVE_NAME" "${REMOTE_ALIAS}:${REMOTE_ARCHIVE_PATH}"
 run ssh "$REMOTE_ALIAS" "cd ${RELEASE_DIR} && tar -xzf ${ARCHIVE_NAME} && rm -f ${ARCHIVE_NAME}"
+if [[ "$REBUILD_IMAGE" != "1" ]]; then
+  run ssh "$REMOTE_ALIAS" "if [[ -f ${CURRENT_LINK}/package-lock.json ]] && ! cmp -s ${RELEASE_DIR}/package-lock.json ${CURRENT_LINK}/package-lock.json; then printf 'package-lock.json changed; set REBUILD_IMAGE=1 to rebuild the dev image before restarting containers.\\n' >&2; exit 1; fi"
+fi
 run ssh "$REMOTE_ALIAS" "ln -sfn ${RELEASE_DIR} ${CURRENT_LINK}"
+if [[ "$REBUILD_IMAGE" == "1" ]]; then
+  run ssh "$REMOTE_ALIAS" "cd ${CURRENT_LINK} && docker compose -p ${REMOTE_PROJECT} --env-file ${REMOTE_ENV_FILE} -f ${REMOTE_COMPOSE_FILE} build oh-myimage-dev-api"
+fi
 run ssh "$REMOTE_ALIAS" "cd ${CURRENT_LINK} && docker compose -p ${REMOTE_PROJECT} --env-file ${REMOTE_ENV_FILE} -f ${REMOTE_COMPOSE_FILE} run --rm oh-myimage-dev-api npm run db:migrate:postgres"
 run ssh "$REMOTE_ALIAS" "cd ${CURRENT_LINK} && docker compose -p ${REMOTE_PROJECT} --env-file ${REMOTE_ENV_FILE} -f ${REMOTE_COMPOSE_FILE} up -d --force-recreate oh-myimage-dev-api oh-myimage-dev-worker"
 

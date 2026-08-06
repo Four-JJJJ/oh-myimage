@@ -27,6 +27,11 @@ export interface ProviderImageBinary {
   mimeType: string;
 }
 
+export interface ProviderImageDownloadOptions {
+  providerBaseURL: string;
+  apiKey: string;
+}
+
 export interface ProviderGenerationResponse {
   created?: number;
   data?: ProviderImage[];
@@ -56,20 +61,35 @@ export interface ImageGenerationPayload {
 
 const DEFAULT_GENERATION_TIMEOUT_MS = 600_000;
 const MAX_QUEUE_CONSUMER_TIMEOUT_MS = 14 * 60 * 1000;
-const DEFAULT_PROVIDER_IMAGE_BATCH_SIZE = 1;
-const MAX_PROVIDER_IMAGE_BATCH_SIZE = 4;
+const MIN_GENERATION_JOB_MAX_RUNTIME_MS = 60_000;
+const DEFAULT_GENERATION_JOB_MAX_RUNTIME_MS = MAX_QUEUE_CONSUMER_TIMEOUT_MS;
 const DEFAULT_PROVIDER_IMAGE_CONCURRENCY = 2;
 const MAX_PROVIDER_IMAGE_CONCURRENCY = 4;
 const DEFAULT_RESPONSES_MODEL = "gpt-5.5";
 const DEFAULT_PROMPT_OPTIMIZER_MODEL = DEFAULT_RESPONSES_MODEL;
 const DEFAULT_PROMPT_OPTIMIZER_TIMEOUT_MS = 45_000;
-const IMMEDIATE_PROVIDER_TIMEOUT_RETRY_DELAY_MS = 3_000;
-const DEFAULT_PROVIDER_TIMEOUT_RETRY_ATTEMPTS = 1;
-const MAX_PROVIDER_TIMEOUT_RETRY_ATTEMPTS = 3;
-const IMMEDIATE_PROVIDER_TIMEOUT_RETRY_REQUEST_TIMEOUT_MS = 15_000;
+const PROVIDER_TIMEOUT_RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 60_000, 60_000] as const;
+const DEFAULT_PROVIDER_TIMEOUT_RETRY_ATTEMPTS = 0;
+const MAX_PROVIDER_TIMEOUT_RETRY_ATTEMPTS = 4;
+const IMMEDIATE_PROVIDER_TIMEOUT_RETRY_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_PROVIDER_IMAGE_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_PROVIDER_IMAGE_REDIRECTS = 3;
+const PROVIDER_IMAGE_DOWNLOAD_RETRY_DELAYS_MS = [1_000, 3_000] as const;
+const PROVIDER_IMAGE_DOWNLOAD_ATTEMPT_TIMEOUT_MS = 60_000;
+const IMAGE_STORAGE_RETRY_DELAYS_MS = [1_000, 3_000] as const;
+const GENERATED_THUMBNAIL_MAX_EDGE_PX = 512;
+const GENERATED_THUMBNAIL_WEBP_QUALITY = 78;
 const PROMPT_OPTIMIZER_MODELS = new Set(["gpt-5.5", "gpt-5.4"]);
+const PROVIDER_RESULT_CHECKPOINT_VERSION = 1;
+const REFERENCE_IMAGE_PROMPT_SUFFIX = [
+  "Use the attached reference image(s) as active visual input, not as optional background context.",
+  "If the user asks for a change, make that change visibly clear; do not reproduce the reference unchanged unless the user explicitly asks to preserve it.",
+].join(" ");
+const SOURCE_IMAGE_PROMPT_SUFFIX = [
+  "The first attached image is the primary source image to edit.",
+  "Any later attached images are supplemental references for the style, material, color, or content the user names.",
+  "Preserve only the traits the user explicitly asks to keep, and make requested changes visibly clear.",
+].join(" ");
 const MASKED_IMAGE_EDIT_PROMPT_SUFFIX = [
   "Treat the user's prompt as the replacement content for that selected area, not as an instruction to add a new object elsewhere in the image.",
   "Replace the masked content so the selected area matches the user's prompt exactly, including short words, labels, or characters when text is requested.",
@@ -91,17 +111,31 @@ interface GenerationRunResult {
   errors: ProviderError[];
 }
 
+type ProviderRetryScope = "provider" | "post_processing";
+
+interface ProviderResultCheckpoint {
+  version: typeof PROVIDER_RESULT_CHECKPOINT_VERSION;
+  acceptedAt: string;
+  image: ProviderImage;
+  revisedPrompt: string | null;
+  usage?: unknown;
+}
+
 export class ProviderError extends Error {
   constructor(
     public readonly code: string,
     message: string,
     public readonly retryable = false,
+    public readonly retryScope: ProviderRetryScope = "provider",
   ) {
     super(message);
   }
 }
 
 export interface ProcessGenerationOptions {
+  retryProviderErrors?: boolean;
+  retryPostProcessingErrors?: boolean;
+  /** @deprecated Use retryProviderErrors. Kept for callers built against the previous option. */
   throwRetryableErrors?: boolean;
 }
 
@@ -119,6 +153,21 @@ export function shouldPersistFailedResult(error: ProviderError): boolean {
 
 export function resolveProviderTimeoutRetryAttempts(value: string | undefined): number {
   return Math.min(Math.max(Math.trunc(envNumber(value, DEFAULT_PROVIDER_TIMEOUT_RETRY_ATTEMPTS)), 0), MAX_PROVIDER_TIMEOUT_RETRY_ATTEMPTS);
+}
+
+export function resolveProviderTimeoutRetryDelayMs(attempt: number): number {
+  const index = Math.max(0, Math.trunc(attempt));
+  return PROVIDER_TIMEOUT_RETRY_DELAYS_MS[index] ?? PROVIDER_TIMEOUT_RETRY_DELAYS_MS[PROVIDER_TIMEOUT_RETRY_DELAYS_MS.length - 1];
+}
+
+export function generationJobDeadlineMs(
+  job: Pick<GenerationJobRecord, "started_at">,
+  maxRuntimeMs: number,
+  nowMs = Date.now(),
+): number {
+  const persistedStart = providerTimestampMs(job.started_at);
+  const startMs = Number.isFinite(persistedStart) && persistedStart <= nowMs ? persistedStart : nowMs;
+  return startMs + maxRuntimeMs;
 }
 
 function wait(ms: number): Promise<void> {
@@ -230,6 +279,8 @@ export async function processGenerationMessage(message: GenerationMessage, env: 
     const apiKey = await decryptSecret(credential.encrypted_api_key, env.APP_ENCRYPTION_KEY ?? "");
     const result = await requestGeneration(job, credential, apiKey, env);
     const completedCount = result.existingCount + result.storedImages.length;
+    const retryError = [...result.errors].reverse().find((error) => shouldRetryProcessingError(error, options));
+    if (retryError) throw retryError;
     if (completedCount === 0) {
       throw result.errors.at(-1) ?? new ProviderError("empty_response", "模型服务没有返回图片。");
     }
@@ -255,11 +306,17 @@ export async function processGenerationMessage(message: GenerationMessage, env: 
     );
   } catch (error) {
     const providerError = normalizeProviderError(error);
-    if (options.throwRetryableErrors && providerError.retryable) {
+    if (shouldRetryProcessingError(providerError, options)) {
       throw providerError;
     }
     await updateJobStatus(env.DB, job.id, "failed", providerError.code, providerError.message);
   }
+}
+
+function shouldRetryProcessingError(error: ProviderError, options: ProcessGenerationOptions): boolean {
+  if (!error.retryable) return false;
+  if (error.retryScope === "post_processing") return options.retryPostProcessingErrors === true;
+  return options.retryProviderErrors ?? options.throwRetryableErrors ?? false;
 }
 
 async function requestGeneration(
@@ -269,8 +326,8 @@ async function requestGeneration(
   env: Env,
 ): Promise<GenerationRunResult> {
   const timeoutMs = resolveGenerationTimeoutMs(env.REQUEST_TIMEOUT_MS);
+  const jobDeadline = generationJobDeadlineMs(job, resolveGenerationJobMaxRuntimeMs(env.GENERATION_JOB_MAX_RUNTIME_MS));
   const concurrency = resolveProviderImageConcurrency(env.PROVIDER_IMAGE_CONCURRENCY);
-  const deadline = Date.now() + timeoutMs;
   const existingImages = await listImagesForJob(env.DB, job.space_id, job.id);
   const existingResults = await listGenerationResultsForJob(env.DB, job.space_id, job.id);
   const remainingCount = Math.max(0, job.quantity - existingImages.length);
@@ -279,12 +336,12 @@ async function requestGeneration(
   const availableIndexes = availableResultIndexes(job.quantity, existingResults, existingImages.length);
   const tasks = Array.from({ length: remainingCount }, (_, index) => async () => {
     const resultIndex = availableIndexes[index] ?? existingImages.length + index;
-    const remainingTimeoutMs = deadline - Date.now();
-    if (remainingTimeoutMs < 1000) {
+    const startedAt = new Date().toISOString();
+    const remainingJobRuntimeMs = jobDeadline - Date.now();
+    if (remainingJobRuntimeMs < 1000) {
       throw new ProviderError(
-        "provider_timeout",
-        `模型服务超过 ${formatDuration(timeoutMs)} 仍未返回，已停止等待。请确认 baseURL 的网关、负载均衡和模型服务超时都不低于这个时间。`,
-        true,
+        "generation_runtime_exceeded",
+        "生成任务已达到本次处理的最长运行时间，未完成的图片已停止等待。请稍后重试或减少单次生成数量。",
       );
     }
     await upsertGenerationJobResult(env.DB, {
@@ -296,7 +353,7 @@ async function requestGeneration(
       image_asset_id: null,
       error_code: null,
       error_message: null,
-      started_at: new Date().toISOString(),
+      started_at: startedAt,
       completed_at: null,
     });
     await updateJobStatus(env.DB, job.id, "running", undefined, undefined, {
@@ -305,7 +362,15 @@ async function requestGeneration(
       progressTotal: job.quantity,
     });
     try {
-      const stored = await generateAndStoreOneImage(job, credential, apiKey, remainingTimeoutMs, env, resultIndex);
+      const stored = await generateAndStoreOneImage(
+        job,
+        credential,
+        apiKey,
+        Math.min(timeoutMs, remainingJobRuntimeMs),
+        env,
+        resultIndex,
+        jobDeadline,
+      );
       await upsertGenerationJobResult(env.DB, {
         id: generationResultId(job.id, resultIndex),
         space_id: job.space_id,
@@ -315,26 +380,24 @@ async function requestGeneration(
         image_asset_id: stored.imageId,
         error_code: null,
         error_message: null,
-        started_at: new Date().toISOString(),
+        started_at: startedAt,
         completed_at: new Date().toISOString(),
       });
       return stored;
     } catch (error) {
       const providerError = normalizeProviderError(error);
-      if (shouldPersistFailedResult(providerError)) {
-        await upsertGenerationJobResult(env.DB, {
-          id: generationResultId(job.id, resultIndex),
-          space_id: job.space_id,
-          job_id: job.id,
-          result_index: resultIndex,
-          status: "failed",
-          image_asset_id: null,
-          error_code: providerError.code,
-          error_message: providerError.message,
-          started_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-        });
-      }
+      await upsertGenerationJobResult(env.DB, {
+        id: generationResultId(job.id, resultIndex),
+        space_id: job.space_id,
+        job_id: job.id,
+        result_index: resultIndex,
+        status: "failed",
+        image_asset_id: null,
+        error_code: providerError.code,
+        error_message: providerError.message,
+        started_at: startedAt,
+        completed_at: new Date().toISOString(),
+      });
       throw providerError;
     }
   });
@@ -365,26 +428,57 @@ async function generateAndStoreOneImage(
   timeoutMs: number,
   env: Env,
   resultIndex: number,
+  jobDeadlineMs: number,
 ): Promise<StoredGenerationImage> {
   const recovered = await recoverStoredImageForResult(job, resultIndex, env);
-  if (recovered) return recovered;
-
-  const idempotencyKey = providerIdempotencyKey(job, resultIndex);
-  const response = await requestGenerationBatchWithRecovery(job, credential, apiKey, timeoutMs, env, idempotencyKey);
-  const image = response.data?.find((item) => item.b64_json || item.url);
-  if (!image) {
-    throw new ProviderError("empty_response", "模型服务没有返回图片。");
+  if (recovered) {
+    const checkpoint = await loadProviderResultCheckpoint(job, resultIndex, env);
+    await deleteProviderResultCheckpointBestEffort(job, resultIndex, env);
+    return checkpoint
+      ? { ...recovered, revisedPrompt: checkpoint.revisedPrompt, usage: checkpoint.usage }
+      : recovered;
   }
 
-  const binary = await resolveProviderImageBinary(image, job.output_format, timeoutMs);
+  let checkpoint = await loadProviderResultCheckpoint(job, resultIndex, env);
+  if (!checkpoint) {
+    const idempotencyKey = providerIdempotencyKey(job, resultIndex);
+    const response = await requestGenerationBatchWithRecovery(job, credential, apiKey, timeoutMs, env, idempotencyKey, jobDeadlineMs);
+    const image = response.data?.find((item) => item.b64_json || item.url);
+    if (!image) {
+      throw new ProviderError("empty_response", "模型服务没有返回图片。");
+    }
+    checkpoint = {
+      version: PROVIDER_RESULT_CHECKPOINT_VERSION,
+      acceptedAt: new Date().toISOString(),
+      image: checkpointImage(image),
+      revisedPrompt: image.revised_prompt ?? null,
+      usage: response.usage,
+    };
+    await persistProviderResultCheckpoint(job, resultIndex, checkpoint, env);
+  }
+
+  const remainingRuntimeMs = jobDeadlineMs - Date.now();
+  if (remainingRuntimeMs < 1_000) {
+    throw new ProviderError(
+      "generation_runtime_exceeded",
+      "模型已返回结果，但任务已达到最长运行时间，未继续下载。为避免重复扣费，系统不会自动重新提交生图。",
+    );
+  }
+  const binary = await resolveProviderImageBinary(
+    checkpoint.image,
+    job.output_format,
+    Math.min(timeoutMs, remainingRuntimeMs),
+    { providerBaseURL: credential.base_url, apiKey },
+  );
   const id = imageIdForResult(job.id, resultIndex);
-  await persistGeneratedImage(job, env, id, resultIndex, binary.bytes, binary.mimeType, binary.format);
+  await persistGeneratedImage(job, env, id, resultIndex, binary.bytes, binary.mimeType, binary.format, jobDeadlineMs);
+  await deleteProviderResultCheckpointBestEffort(job, resultIndex, env);
 
   return {
     imageId: id,
     resultIndex,
-    revisedPrompt: image.revised_prompt ?? null,
-    usage: response.usage,
+    revisedPrompt: checkpoint.revisedPrompt,
+    usage: checkpoint.usage,
   };
 }
 
@@ -395,17 +489,26 @@ export async function requestGenerationBatchWithRecovery(
   timeoutMs: number,
   env: Env,
   idempotencyKey: string,
+  deadlineMs = Date.now() + timeoutMs,
 ): Promise<ProviderGenerationResponse> {
   try {
-    return await requestGenerationBatch(job, credential, apiKey, timeoutMs, env, idempotencyKey);
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs < 1_000) {
+      throw new ProviderError("generation_runtime_exceeded", "生成任务已达到最长运行时间，未再次提交模型请求。");
+    }
+    return await requestGenerationBatch(job, credential, apiKey, Math.min(timeoutMs, remainingMs), env, idempotencyKey);
   } catch (error) {
     const providerError = normalizeProviderError(error);
     if (!shouldImmediatelyRetryImageGeneration(providerError)) throw providerError;
 
     const retryAttempts = resolveProviderTimeoutRetryAttempts(env.PROVIDER_TIMEOUT_RETRY_ATTEMPTS);
     for (let attempt = 0; attempt < retryAttempts; attempt += 1) {
-      await wait(IMMEDIATE_PROVIDER_TIMEOUT_RETRY_DELAY_MS);
-      const retryTimeoutMs = Math.min(timeoutMs, IMMEDIATE_PROVIDER_TIMEOUT_RETRY_REQUEST_TIMEOUT_MS);
+      const retryDelayMs = resolveProviderTimeoutRetryDelayMs(attempt);
+      if (Date.now() + retryDelayMs >= deadlineMs) break;
+      await wait(retryDelayMs);
+      const remainingMs = deadlineMs - Date.now();
+      if (remainingMs < 1_000) break;
+      const retryTimeoutMs = Math.min(timeoutMs, IMMEDIATE_PROVIDER_TIMEOUT_RETRY_REQUEST_TIMEOUT_MS, remainingMs);
       try {
         return await requestGenerationBatch(job, credential, apiKey, retryTimeoutMs, env, idempotencyKey);
       } catch (retryError) {
@@ -422,14 +525,10 @@ export async function resolveProviderImageBinary(
   image: Pick<ProviderImage, "b64_json" | "url">,
   fallbackFormat: string,
   timeoutMs: number,
+  options?: ProviderImageDownloadOptions,
 ): Promise<ProviderImageBinary> {
   if (image.b64_json) {
-    const format = normalizeProviderImageFormat(fallbackFormat);
-    return {
-      bytes: bytesFromBase64(image.b64_json),
-      format,
-      mimeType: mimeFromFormat(format),
-    };
+    return providerImageBinaryFromBytes(bytesFromBase64(image.b64_json), fallbackFormat);
   }
 
   if (!image.url) {
@@ -437,15 +536,62 @@ export async function resolveProviderImageBinary(
   }
 
   const initialUrl = validateProviderImageUrl(image.url);
+  const deadline = Date.now() + Math.max(1_000, timeoutMs);
+  let lastError: ProviderError | null = null;
+
+  for (let attempt = 0; attempt <= PROVIDER_IMAGE_DOWNLOAD_RETRY_DELAYS_MS.length; attempt += 1) {
+    if (attempt > 0) {
+      const retryDelayMs = PROVIDER_IMAGE_DOWNLOAD_RETRY_DELAYS_MS[attempt - 1] ?? 0;
+      if (Date.now() + retryDelayMs >= deadline) break;
+      await wait(retryDelayMs);
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs < 1_000) break;
+    try {
+      return await downloadProviderImageOnce(
+        initialUrl,
+        fallbackFormat,
+        Math.min(remainingMs, PROVIDER_IMAGE_DOWNLOAD_ATTEMPT_TIMEOUT_MS),
+        options,
+      );
+    } catch (error) {
+      const providerError =
+        error instanceof ProviderError
+          ? error
+          : new ProviderError(
+              "provider_image_download_failed",
+              `模型已返回图片链接，但下载失败：${redactSecrets(error instanceof Error ? error.message : "未知错误")}`,
+              true,
+            );
+      lastError = providerError;
+      if (!shouldRetryProviderImageDownload(providerError) || attempt === PROVIDER_IMAGE_DOWNLOAD_RETRY_DELAYS_MS.length) {
+        throw asPostProcessingError(providerError);
+      }
+    }
+  }
+
+  throw asPostProcessingError(
+    lastError ?? new ProviderError("provider_image_download_timeout", "模型已返回图片链接，但下载图片超时。", true),
+  );
+}
+
+async function downloadProviderImageOnce(
+  initialUrl: URL,
+  fallbackFormat: string,
+  attemptTimeoutMs: number,
+  options?: ProviderImageDownloadOptions,
+): Promise<ProviderImageBinary> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort("timeout"), Math.max(1_000, timeoutMs));
+  const timer = setTimeout(() => controller.abort("timeout"), Math.max(1_000, attemptTimeoutMs));
   try {
-    const { response, finalUrl } = await fetchProviderImageUrl(initialUrl, controller.signal);
+    const { response, finalUrl } = await fetchProviderImageUrl(initialUrl, controller.signal, options);
     if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
       throw new ProviderError(
         "provider_image_download_failed",
         `模型已返回图片链接，但下载失败：${response.status}。`,
-        response.status >= 500 || response.status === 429,
+        isRetryableProviderImageStatus(response.status),
       );
     }
 
@@ -459,12 +605,7 @@ export async function resolveProviderImageBinary(
     }
 
     const bytes = await responseBytesWithLimit(response, MAX_PROVIDER_IMAGE_DOWNLOAD_BYTES);
-    const format = providerImageFormatFromResponse(contentType, finalUrl.toString(), fallbackFormat);
-    return {
-      bytes,
-      format,
-      mimeType: contentType ?? mimeFromFormat(format),
-    };
+    return providerImageBinaryFromBytes(bytes, providerImageFormatFromResponse(contentType, finalUrl.toString(), fallbackFormat));
   } catch (error) {
     if (error instanceof ProviderError) throw error;
     if (controller.signal.aborted) {
@@ -480,6 +621,20 @@ export async function resolveProviderImageBinary(
   }
 }
 
+function shouldRetryProviderImageDownload(error: ProviderError): boolean {
+  return (
+    error.retryable &&
+    (error.code === "provider_image_download_failed" || error.code === "provider_image_download_timeout")
+  );
+}
+
+function asPostProcessingError(error: ProviderError): ProviderError {
+  const message = error.retryable
+    ? `${error.message} 系统只会恢复这份已接收结果，不会重新提交生图。`
+    : error.message;
+  return new ProviderError(error.code, message, error.retryable, "post_processing");
+}
+
 function validateProviderImageUrl(rawUrl: string): URL {
   let url: URL;
   try {
@@ -487,8 +642,10 @@ function validateProviderImageUrl(rawUrl: string): URL {
   } catch {
     throw new ProviderError("provider_image_download_blocked", "模型返回的图片链接不是有效 URL。");
   }
-  if (url.protocol !== "https:") {
-    throw new ProviderError("provider_image_download_blocked", "模型返回的图片链接必须使用 HTTPS。");
+  // 模型可能返回 http:// 图片链接（如部分中转服务），允许下载；
+  // 但内网/本机地址校验始终生效，防止 SSRF。
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new ProviderError("provider_image_download_blocked", "模型返回的图片链接只支持 HTTP/HTTPS 协议。");
   }
   if (url.username || url.password || isBlockedProviderImageHost(url.hostname)) {
     throw new ProviderError("provider_image_download_blocked", "模型返回的图片链接不允许指向本机或内网地址。");
@@ -496,12 +653,21 @@ function validateProviderImageUrl(rawUrl: string): URL {
   return url;
 }
 
-async function fetchProviderImageUrl(initialUrl: URL, signal: AbortSignal): Promise<{ response: Response; finalUrl: URL }> {
+async function fetchProviderImageUrl(
+  initialUrl: URL,
+  signal: AbortSignal,
+  options?: ProviderImageDownloadOptions,
+): Promise<{ response: Response; finalUrl: URL }> {
   let currentUrl = initialUrl;
   for (let redirectCount = 0; redirectCount <= MAX_PROVIDER_IMAGE_REDIRECTS; redirectCount += 1) {
+    const authorization = providerImageAuthorization(currentUrl, options);
     const response = await fetch(currentUrl.toString(), {
       redirect: "manual",
       signal,
+      headers: {
+        Accept: "image/*",
+        ...(authorization ? { Authorization: authorization } : {}),
+      },
     });
     if (!isRedirectStatus(response.status)) return { response, finalUrl: currentUrl };
 
@@ -510,6 +676,19 @@ async function fetchProviderImageUrl(initialUrl: URL, signal: AbortSignal): Prom
     currentUrl = validateProviderImageUrl(new URL(location, currentUrl).toString());
   }
   throw new ProviderError("provider_image_download_blocked", "模型返回的图片链接重定向次数过多。");
+}
+
+function providerImageAuthorization(url: URL, options?: ProviderImageDownloadOptions): string | null {
+  if (!options?.apiKey) return null;
+  try {
+    return new URL(options.providerBaseURL).origin === url.origin ? `Bearer ${options.apiKey}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function isRetryableProviderImageStatus(status: number): boolean {
+  return status === 404 || status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
 }
 
 function isRedirectStatus(status: number): boolean {
@@ -581,27 +760,168 @@ async function responseBytesWithLimit(response: Response, maxBytes: number): Pro
   return bytes;
 }
 
+function checkpointImage(image: ProviderImage): ProviderImage {
+  if (image.b64_json) return { b64_json: image.b64_json };
+  if (image.url) return { url: image.url };
+  return {};
+}
+
+export function providerResultCheckpointStorageKey(
+  job: Pick<GenerationJobRecord, "space_id" | "id">,
+  resultIndex: number,
+): string {
+  return `${job.space_id}/${job.id}/provider-result-${resultIndex}.json`;
+}
+
+async function persistProviderResultCheckpoint(
+  job: Pick<GenerationJobRecord, "space_id" | "id">,
+  resultIndex: number,
+  checkpoint: ProviderResultCheckpoint,
+  env: Env,
+): Promise<void> {
+  const storageKey = providerResultCheckpointStorageKey(job, resultIndex);
+  const serialized = JSON.stringify(checkpoint);
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= IMAGE_STORAGE_RETRY_DELAYS_MS.length; attempt += 1) {
+    if (attempt > 0) await wait(IMAGE_STORAGE_RETRY_DELAYS_MS[attempt - 1] ?? 0);
+    try {
+      await env.IMAGES.put(storageKey, serialized, {
+        httpMetadata: {
+          contentType: "application/json",
+          contentDisposition: `inline; filename="provider-result-${resultIndex}.json"`,
+        },
+        customMetadata: {
+          jobId: job.id,
+          spaceId: job.space_id,
+          resultIndex: String(resultIndex),
+          kind: "provider-result-checkpoint",
+        },
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new ProviderError(
+    "provider_result_checkpoint_failed",
+    `模型已返回结果，但保存安全恢复记录失败：${redactSecrets(lastError instanceof Error ? lastError.message : "未知错误")}。为避免重复扣费，系统不会自动重新提交生图。`,
+  );
+}
+
+async function loadProviderResultCheckpoint(
+  job: Pick<GenerationJobRecord, "space_id" | "id">,
+  resultIndex: number,
+  env: Env,
+): Promise<ProviderResultCheckpoint | null> {
+  const storageKey = providerResultCheckpointStorageKey(job, resultIndex);
+  let object: Awaited<ReturnType<Env["IMAGES"]["get"]>>;
+  try {
+    object = await env.IMAGES.get(storageKey);
+  } catch (error) {
+    throw new ProviderError(
+      "provider_result_checkpoint_read_failed",
+      `读取生图恢复记录失败：${redactSecrets(error instanceof Error ? error.message : "未知错误")}`,
+      true,
+      "post_processing",
+    );
+  }
+  if (!object) return null;
+
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(await object.arrayBuffer())) as Partial<ProviderResultCheckpoint>;
+    const image = parsed.image;
+    if (
+      parsed.version !== PROVIDER_RESULT_CHECKPOINT_VERSION ||
+      !image ||
+      (typeof image.b64_json !== "string" && typeof image.url !== "string")
+    ) {
+      throw new Error("checkpoint shape is invalid");
+    }
+    return {
+      version: PROVIDER_RESULT_CHECKPOINT_VERSION,
+      acceptedAt: typeof parsed.acceptedAt === "string" ? parsed.acceptedAt : "",
+      image: checkpointImage(image),
+      revisedPrompt: typeof parsed.revisedPrompt === "string" ? parsed.revisedPrompt : null,
+      usage: parsed.usage,
+    };
+  } catch (error) {
+    throw new ProviderError(
+      "provider_result_checkpoint_invalid",
+      `生图恢复记录损坏：${redactSecrets(error instanceof Error ? error.message : "未知错误")}。为避免重复扣费，系统不会重新提交生图。`,
+    );
+  }
+}
+
+async function deleteProviderResultCheckpointBestEffort(
+  job: Pick<GenerationJobRecord, "space_id" | "id">,
+  resultIndex: number,
+  env: Env,
+): Promise<void> {
+  const storageKey = providerResultCheckpointStorageKey(job, resultIndex);
+  try {
+    await env.IMAGES.delete(storageKey);
+  } catch (error) {
+    console.warn("provider result checkpoint cleanup skipped", redactSecrets(error instanceof Error ? error.message : "unknown error"));
+  }
+}
+
 export async function recoverStoredImageForResult(job: GenerationJobRecord, resultIndex: number, env: Env): Promise<StoredGenerationImage | null> {
   const id = imageIdForResult(job.id, resultIndex);
-  const format = job.output_format;
-  const mimeType = mimeFromFormat(format);
-  const storageKey = storageKeyForResult(job, id, format);
-  const object = await env.IMAGES.get(storageKey);
-  if (!object) return null;
-  const bytes = new Uint8Array(await object.arrayBuffer());
-  await insertImageAsset(env.DB, {
-    id,
-    space_id: job.space_id,
-    job_id: job.id,
-    storage_key: storageKey,
-    mime_type: object.httpMetadata?.contentType ?? mimeType,
-    format,
-    width: job.width,
-    height: job.height,
-    byte_size: bytes.byteLength,
-    sha256: await sha256Hex(bytes),
-  });
-  await insertImageUsageEvent(env.DB, job.space_id, id);
+  const candidates = [...new Set([normalizeProviderImageFormat(job.output_format), "png", "webp", "jpeg"])] as string[];
+  let stored: {
+    format: string;
+    storageKey: string;
+    object: NonNullable<Awaited<ReturnType<Env["IMAGES"]["get"]>>>;
+  } | null = null;
+  for (const candidate of candidates) {
+    const storageKey = storageKeyForResult(job, id, candidate);
+    let object: Awaited<ReturnType<Env["IMAGES"]["get"]>>;
+    try {
+      object = await env.IMAGES.get(storageKey);
+    } catch (error) {
+      throw new ProviderError(
+        "image_recovery_read_failed",
+        `检查已保存图片失败：${redactSecrets(error instanceof Error ? error.message : "未知错误")}`,
+        true,
+        "post_processing",
+      );
+    }
+    if (object) {
+      stored = { format: candidate, storageKey, object };
+      break;
+    }
+  }
+  if (!stored) return null;
+  const { storageKey, object } = stored;
+  try {
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    const binary = providerImageBinaryFromBytes(bytes, stored.format);
+    await insertImageAsset(env.DB, {
+      id,
+      space_id: job.space_id,
+      job_id: job.id,
+      storage_key: storageKey,
+      mime_type: object.httpMetadata?.contentType ?? binary.mimeType,
+      format: binary.format,
+      width: job.width,
+      height: job.height,
+      byte_size: bytes.byteLength,
+      sha256: await sha256Hex(bytes),
+      thumbnail_storage_key: null,
+      thumbnail_mime_type: null,
+      thumbnail_byte_size: null,
+      thumbnail_sha256: null,
+    });
+    await insertImageUsageEvent(env.DB, job.space_id, id);
+  } catch (error) {
+    if (error instanceof ProviderError) throw error;
+    throw new ProviderError(
+      "image_asset_recovery_failed",
+      `图片已保存，但补写图片记录失败：${redactSecrets(error instanceof Error ? error.message : "未知错误")}`,
+      true,
+      "post_processing",
+    );
+  }
   return {
     imageId: id,
     resultIndex,
@@ -618,27 +938,12 @@ async function persistGeneratedImage(
   bytes: Uint8Array,
   mimeType: string,
   format: string,
+  deadlineMs: number,
 ): Promise<void> {
   const storageKey = storageKeyForResult(job, id, format);
-  try {
-    await env.IMAGES.put(storageKey, bytes, {
-      httpMetadata: {
-        contentType: mimeType,
-        contentDisposition: `inline; filename="${id}.${format}"`,
-      },
-      customMetadata: {
-        jobId: job.id,
-        spaceId: job.space_id,
-        resultIndex: String(resultIndex),
-      },
-    });
-  } catch (error) {
-    throw new ProviderError(
-      "image_storage_failed",
-      `模型已返回图片，但保存到对象存储失败：${redactSecrets(error instanceof Error ? error.message : "未知错误")}`,
-      true,
-    );
-  }
+  let thumbnail: Awaited<ReturnType<typeof thumbnailMetadataForResult>> | null = null;
+  await storeGeneratedImageWithRecovery(job, env, id, resultIndex, storageKey, bytes, mimeType, format, deadlineMs);
+  thumbnail = await persistGeneratedThumbnailBestEffort(job, env, id, resultIndex, bytes);
 
   try {
     await insertImageAsset(env.DB, {
@@ -652,6 +957,10 @@ async function persistGeneratedImage(
       height: job.height,
       byte_size: bytes.byteLength,
       sha256: await sha256Hex(bytes),
+      thumbnail_storage_key: thumbnail?.storageKey ?? null,
+      thumbnail_mime_type: thumbnail?.mimeType ?? null,
+      thumbnail_byte_size: thumbnail?.bytes.byteLength ?? null,
+      thumbnail_sha256: thumbnail ? await sha256Hex(thumbnail.bytes) : null,
     });
     await insertImageUsageEvent(env.DB, job.space_id, id);
   } catch (error) {
@@ -659,8 +968,53 @@ async function persistGeneratedImage(
       "image_asset_persist_failed",
       `模型已返回图片并保存到对象存储，但写入图片记录失败；下次重试会优先补保存记录：${redactSecrets(error instanceof Error ? error.message : "未知错误")}`,
       true,
+      "post_processing",
     );
   }
+}
+
+async function storeGeneratedImageWithRecovery(
+  job: GenerationJobRecord,
+  env: Env,
+  id: string,
+  resultIndex: number,
+  storageKey: string,
+  bytes: Uint8Array,
+  mimeType: string,
+  format: string,
+  deadlineMs: number,
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= IMAGE_STORAGE_RETRY_DELAYS_MS.length; attempt += 1) {
+    if (attempt > 0) {
+      const delayMs = IMAGE_STORAGE_RETRY_DELAYS_MS[attempt - 1] ?? 0;
+      if (Date.now() + delayMs >= deadlineMs) break;
+      await wait(delayMs);
+    }
+    if (deadlineMs - Date.now() < 1_000) break;
+    try {
+      await env.IMAGES.put(storageKey, bytes, {
+        httpMetadata: {
+          contentType: mimeType,
+          contentDisposition: `inline; filename="${id}.${format}"`,
+        },
+        customMetadata: {
+          jobId: job.id,
+          spaceId: job.space_id,
+          resultIndex: String(resultIndex),
+        },
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new ProviderError(
+    "image_storage_failed",
+    `模型已返回图片，但保存到对象存储失败：${redactSecrets(lastError instanceof Error ? lastError.message : "已达到任务最长运行时间")}。系统只会恢复这份已接收结果，不会重新提交生图。`,
+    true,
+    "post_processing",
+  );
 }
 
 async function requestGenerationBatch(
@@ -804,8 +1158,8 @@ export function resolveGenerationTimeoutMs(value: string | undefined): number {
   return Math.min(Math.max(envNumber(value, DEFAULT_GENERATION_TIMEOUT_MS), 1000), MAX_QUEUE_CONSUMER_TIMEOUT_MS);
 }
 
-export function resolveProviderImageBatchSize(value: string | undefined): number {
-  return Math.min(Math.max(Math.trunc(envNumber(value, DEFAULT_PROVIDER_IMAGE_BATCH_SIZE)), 1), MAX_PROVIDER_IMAGE_BATCH_SIZE);
+export function resolveGenerationJobMaxRuntimeMs(value: string | undefined): number {
+  return Math.min(Math.max(envNumber(value, DEFAULT_GENERATION_JOB_MAX_RUNTIME_MS), MIN_GENERATION_JOB_MAX_RUNTIME_MS), MAX_QUEUE_CONSUMER_TIMEOUT_MS);
 }
 
 export function resolveProviderImageConcurrency(value: string | undefined): number {
@@ -865,10 +1219,21 @@ export function buildImageGenerationPayload(job: GenerationJobRecord, count: num
   return payload;
 }
 
-export function buildProviderImagePrompt(job: Pick<GenerationJobRecord, "prompt" | "mask_image_storage_key">): string {
+export function buildProviderImagePrompt(
+  job: Pick<GenerationJobRecord, "prompt" | "mask_image_storage_key" | "reference_images_json" | "reference_image_storage_key">,
+): string {
   const prompt = job.prompt.trim();
-  if (!job.mask_image_storage_key) return prompt;
-  return [prompt, MASKED_IMAGE_EDIT_PROMPT_SUFFIX].filter(Boolean).join("\n\n");
+  const referenceContext = referencePromptContext(job);
+  return [prompt, referenceContext, job.mask_image_storage_key ? MASKED_IMAGE_EDIT_PROMPT_SUFFIX : ""].filter(Boolean).join("\n\n");
+}
+
+function referencePromptContext(
+  job: Pick<GenerationJobRecord, "reference_images_json" | "reference_image_storage_key" | "mask_image_storage_key">,
+): string {
+  const snapshots = parseReferenceImagesJson(job.reference_images_json);
+  if (!job.reference_image_storage_key && snapshots.length === 0) return "";
+  const hasSource = Boolean(job.mask_image_storage_key) || snapshots.some((snapshot) => snapshot.role === "source");
+  return hasSource ? SOURCE_IMAGE_PROMPT_SUFFIX : REFERENCE_IMAGE_PROMPT_SUFFIX;
 }
 
 export function imageGenerationEndpointPath(job: Pick<GenerationJobRecord, "reference_image_storage_key" | "reference_images_json">): "/images/edits" | "/images/generations" {
@@ -1010,6 +1375,7 @@ function parseReferenceImagesJson(value: string | null | undefined): GenerationR
           mimeType: typeof record.mimeType === "string" ? record.mimeType : "image/png",
           name: typeof record.name === "string" ? record.name : "reference.png",
           byteSize: typeof record.byteSize === "number" ? record.byteSize : 0,
+          ...(record.role === "source" || record.role === "reference" ? { role: record.role } : {}),
         };
       })
       .filter((item): item is GenerationReferenceImageSnapshot => Boolean(item));
@@ -1049,6 +1415,80 @@ function storageKeyForResult(job: Pick<GenerationJobRecord, "space_id" | "id">, 
   return `${job.space_id}/${job.id}/${imageId}.${format}`;
 }
 
+async function loadSharp(): Promise<typeof import("sharp") | null> {
+  try {
+    const sharpModule = await import("sharp");
+    return sharpModule.default ?? sharpModule;
+  } catch {
+    return null;
+  }
+}
+
+async function thumbnailMetadataForResult(
+  job: Pick<GenerationJobRecord, "space_id" | "id">,
+  imageId: string,
+  bytes: Uint8Array,
+): Promise<{ storageKey: string; mimeType: string; format: string; bytes: Uint8Array } | null> {
+  const sharp = await loadSharp();
+  if (!sharp) return null;
+
+  return sharp(bytes, { failOn: "none" })
+    .rotate()
+    .resize({
+      width: GENERATED_THUMBNAIL_MAX_EDGE_PX,
+      height: GENERATED_THUMBNAIL_MAX_EDGE_PX,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .webp({ quality: GENERATED_THUMBNAIL_WEBP_QUALITY })
+    .toBuffer()
+    .then((thumbnailBytes) => ({
+      storageKey: `${job.space_id}/${job.id}/thumb_${imageId}.webp`,
+      mimeType: "image/webp",
+      format: "webp",
+      bytes: thumbnailBytes,
+    }))
+    .catch(() => null);
+}
+
+async function persistGeneratedThumbnailBestEffort(
+  job: Pick<GenerationJobRecord, "space_id" | "id">,
+  env: Env,
+  imageId: string,
+  resultIndex: number,
+  bytes: Uint8Array,
+): Promise<{ storageKey: string; mimeType: string; format: string; bytes: Uint8Array } | null> {
+  const thumbnail = await thumbnailMetadataForResult(job, imageId, bytes);
+  if (!thumbnail) return null;
+  try {
+    await env.IMAGES.put(thumbnail.storageKey, thumbnail.bytes, {
+      httpMetadata: {
+        contentType: thumbnail.mimeType,
+        contentDisposition: `inline; filename="${imageId}-thumbnail.${thumbnail.format}"`,
+      },
+      customMetadata: {
+        jobId: job.id,
+        spaceId: job.space_id,
+        resultIndex: String(resultIndex),
+        sourceImageId: imageId,
+        kind: "thumbnail",
+      },
+    });
+    return thumbnail;
+  } catch (error) {
+    console.warn("generated thumbnail persistence skipped", redactSecrets(error instanceof Error ? error.message : "unknown error"));
+    return null;
+  }
+}
+
+export function generatedThumbnailConfig(): { maxEdgePx: number; mimeType: "image/webp"; quality: number } {
+  return {
+    maxEdgePx: GENERATED_THUMBNAIL_MAX_EDGE_PX,
+    mimeType: "image/webp",
+    quality: GENERATED_THUMBNAIL_WEBP_QUALITY,
+  };
+}
+
 async function loadMaskImageBlob(job: GenerationJobRecord, env: Env): Promise<{ blob: Blob; filename: string }> {
   if (!job.mask_image_storage_key) {
     throw new ProviderError("mask_image_missing", "选区遮罩文件不存在，请重新涂抹后再试。");
@@ -1076,6 +1516,11 @@ function formatDuration(ms: number): string {
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = seconds % 60;
   return remainingSeconds ? `${minutes} 分 ${remainingSeconds} 秒` : `${minutes} 分钟`;
+}
+
+function providerTimestampMs(value: string | null | undefined): number {
+  if (!value) return Number.NaN;
+  return Date.parse(/[zZ]|[+-]\d{2}:\d{2}$/.test(value) ? value : `${value.replace(" ", "T")}Z`);
 }
 
 function mimeFromFormat(format: string): string {
@@ -1122,15 +1567,58 @@ function normalizeProviderImageFormat(format: string): string {
   return format === "jpeg" || format === "webp" ? format : "png";
 }
 
+function providerImageBinaryFromBytes(bytes: Uint8Array, fallbackFormat: string): ProviderImageBinary {
+  const format = formatFromImageBytes(bytes);
+  if (!format) {
+    throw new ProviderError("provider_image_invalid_data", "模型服务返回的内容不是有效的 PNG、JPEG 或 WebP 图片。");
+  }
+  void fallbackFormat;
+  return { bytes, format, mimeType: mimeFromFormat(format) };
+}
+
+function formatFromImageBytes(bytes: Uint8Array): "png" | "jpeg" | "webp" | null {
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return "png";
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "jpeg";
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return "webp";
+  }
+  return null;
+}
+
 const PROMPT_OPTIMIZER_INSTRUCTIONS = [
   "你是图片生成提示词优化器。",
   "基于用户原始意图优化提示词，让它更适合高质量图片生成。",
   "补强主体、构图、材质、风格、镜头、光线、色彩和细节，但不要改变用户想生成的核心内容。",
+  "如果存在参考图，严格保留用户对第1张、第2张等图片角色和顺序的描述，不要重新分配角色。",
+  "明确区分必须保持的内容与必须改变的内容；不要把‘保持基本形状’扩大成颜色、材质、光线和细节都完全不变。",
+  "用户要求修正、变化或风格迁移时，让目标变化清晰可见，并避免同时加入互相冲突的保持与改变约束。",
   "保留用户使用的主要语言；如果用户混合中英文，可以混合输出。",
   "只输出优化后的提示词本身，不输出解释、标题、编号、Markdown 或引号。",
 ].join("\n");
 
-function promptOptimizationInput(input: PromptOptimizationInput): string {
+export function promptOptimizationInput(input: PromptOptimizationInput): string {
   return [
     `原始提示词：${input.prompt}`,
     "",
@@ -1139,6 +1627,9 @@ function promptOptimizationInput(input: PromptOptimizationInput): string {
     `- 尺寸：${input.width}x${input.height}`,
     `- 质量：${input.quality}`,
     `- 输出格式：${input.outputFormat}`,
+    `- 参考图数量：${input.referenceImageCount}`,
+    `- 是否基于已有生成图继续创作：${input.hasSourceImage ? "是；第1张图是当前编辑目标" : "否"}`,
+    `- 是否为局部重绘：${input.hasMaskImage ? "是；只改遮罩选区，未选区域保持不变" : "否"}`,
     "- 背景：根据原始提示词判断；如果原始提示词明确要求透明背景，请在优化结果中保留该要求，否则不要额外添加透明背景要求。",
   ].join("\n");
 }

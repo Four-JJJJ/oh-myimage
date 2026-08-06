@@ -1,4 +1,5 @@
 import { ClipboardEvent, ChangeEvent, Dispatch, FormEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { BorderBeam } from "border-beam";
 import {
   ChevronDown,
@@ -20,6 +21,7 @@ import generationRegenerateIcon from "../../assets/figma/generation-regenerate.s
 import referenceDeleteIcon from "../../assets/figma/reference-delete.svg";
 import sidebarAdd from "../../assets/figma/sidebar-add.svg";
 import { claimGenerationSubmitLock, isTerminalGenerationJobStatus, mergePolledJobState, releaseGenerationSubmitLock } from "../../generation-state";
+import { generationProgressSummary } from "../../generation-progress";
 import {
   AlertDialog,
   AlertDialogClose,
@@ -30,7 +32,7 @@ import {
   AlertDialogTitle,
 } from "../../components/ui/alert-dialog";
 import { Button } from "../../components/ui/button";
-import { Dialog, DialogDescription, DialogFooter, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "../../components/ui/dialog";
+import { Dialog, DialogDescription, DialogFooter, DialogHeader, DialogPanel, DialogPopup, DialogTitle, dialogBackdropSurfaceClassName } from "../../components/ui/dialog";
 import { cn } from "../../lib/utils";
 import { Group } from "../../components/ui/group";
 import { Input } from "../../components/ui/input";
@@ -65,6 +67,7 @@ import {
   createDraftConversation,
   mergeJobReferenceImages,
   resolveDefaultActiveConversationId,
+  resolveGenerationFlowRecord,
   resolveLatestVisibleConversationId,
   submittedReferenceImages,
   updateDraftConversationTitle,
@@ -133,8 +136,9 @@ interface ImageSelectionStroke {
   points: ImageSelectionPoint[];
 }
 
-interface PreviewImage {
+export interface PreviewImage {
   url: string;
+  thumbnailUrl?: string | null;
   prompt?: string;
   actions?: HoverImageAction[];
 }
@@ -267,12 +271,15 @@ function ComposerQualityIcon({ className }: { className?: string }) {
 
 const fastPollIntervalMs = 2000;
 const standardPollIntervalMs = 5000;
-const slowPollIntervalMs = 10000;
+const slowPollIntervalMs = 5000;
 const standardPollAfterMs = 30_000;
 const slowPollAfterMs = 120_000;
+const activeGenerationRecordsRefreshIntervalMs = 12_000;
+const initialGenerationStatusTimeoutMs = 8_000;
 const maxReferenceImages = 8;
 const referenceImageMaxBytes = 10 * 1024 * 1024;
 const referenceImageMimeTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
+const fastReferenceImageEdge = 2048;
 const composerTextareaLineHeight = 21;
 const composerTextareaMinRows = 2;
 const composerTextareaMaxRows = 12;
@@ -283,6 +290,7 @@ export const loadingStatusAnimationDurationMs = 24_480;
 export const composerPromptPlaceholderText = "可以直接描述想生成的图片内容，例如：主体 / 材质 / 构图 / 风格 / 镜头 / 光线等";
 export const composerPromptTextMetricsClassName = "text-[15px] leading-[21px]";
 export const imagePreviewToolbarPositionClassName = "absolute bottom-4 right-4 z-10";
+export const imagePreviewToolbarGroupClassName = "rounded-[16px] border border-white/[0.08] bg-[#121212] p-0.5";
 export const loadingStatusLines = [
   "正在生成图片",
   "正在排队处理",
@@ -304,9 +312,94 @@ export const composerOptimizeBeamProps = {
   colorVariant: "colorful",
   strength: 0.7,
 } as const;
+const imagePreviewVisibleImageClassName = "relative col-start-1 row-start-1 max-h-[calc(100dvh-64px)] max-w-[calc(100vw-64px)] object-contain";
+const imagePreviewPreloadClassName = "pointer-events-none absolute size-px opacity-0";
+const IMAGE_PREVIEW_STALL_TIMEOUT_MS = 30_000;
 
 export function imagePreviewActionKeys() {
   return [...imagePreviewActionOrder];
+}
+
+export function resolveImagePreviewChromeState({
+  hasImageUrl,
+  imageLoaded,
+}: {
+  hasImageUrl: boolean;
+  imageLoaded: boolean;
+}) {
+  return {
+    showActions: hasImageUrl && imageLoaded,
+  };
+}
+
+export function resolveImagePreviewProgressPercent(loaded: number, total: number): number | null {
+  if (!Number.isFinite(loaded) || !Number.isFinite(total) || total <= 0) return null;
+  return Math.min(100, Math.max(0, Math.round((loaded / total) * 100)));
+}
+
+export function createQueuedGenerationJob(
+  id: string,
+  form: GenerateForm,
+  referenceImages: NonNullable<GenerationJob["referenceImages"]>,
+): GenerationJob {
+  return {
+    id,
+    status: "queued",
+    stage: "queued",
+    prompt: form.prompt,
+    aspect_ratio: form.aspectRatio,
+    width: form.width,
+    height: form.height,
+    quality: form.quality,
+    quantity: form.quantity,
+    output_format: form.outputFormat,
+    background: "auto",
+    compression: form.compression,
+    error_code: null,
+    error_message: null,
+    referenceImages,
+    created_at: new Date().toISOString(),
+  };
+}
+
+export function resolveInitialGenerationStatusTimeoutMs(): number {
+  return initialGenerationStatusTimeoutMs;
+}
+
+export function remainingReferenceSlots(referenceImageCount: number, hasSourceImage: boolean): number {
+  return Math.max(0, maxReferenceImages - referenceImageCount - (hasSourceImage ? 1 : 0));
+}
+
+export function shouldShowReferenceCarryoverHint({
+  hasConversationImage,
+  hasCurrentReference,
+  prompt,
+}: {
+  hasConversationImage: boolean;
+  hasCurrentReference: boolean;
+  prompt: string;
+}): boolean {
+  return hasConversationImage && !hasCurrentReference && prompt.trim().length > 0;
+}
+
+export function shouldDismissImagePreviewAfterAction(action: Pick<HoverImageAction, "key">): boolean {
+  return action.key === "continue" || action.key === "local-edit" || action.key === "regenerate" || action.key === "delete";
+}
+
+export function imagePreviewActionsWithDismiss(
+  actions: HoverImageAction[] | undefined,
+  onClose: () => void,
+): HoverImageAction[] {
+  return (actions ?? []).map((action) => {
+    if (!action.onSelect || !shouldDismissImagePreviewAfterAction(action)) return action;
+    return {
+      ...action,
+      onSelect: () => {
+        onClose();
+        action.onSelect?.();
+      },
+    };
+  });
 }
 
 export function shouldShowComposerOptimizeBeam(optimizing: boolean): boolean {
@@ -346,6 +439,54 @@ export function shouldPollGeneration(visibilityState: Document["visibilityState"
   return visibilityState !== "hidden";
 }
 
+export function shouldRefreshGenerationOnLifecycleEvent(
+  _eventType: "visibilitychange" | "focus" | "online",
+  visibilityState: Document["visibilityState"] | undefined,
+): boolean {
+  return shouldPollGeneration(visibilityState);
+}
+
+export function resolveGenerationPollRequestInit(): RequestInit {
+  return { cache: "no-store" };
+}
+
+export function resolveActiveGenerationRecordsRefreshIntervalMs(): number {
+  return activeGenerationRecordsRefreshIntervalMs;
+}
+
+export function shouldRefreshActiveGenerationRecords({
+  records,
+  activeJob,
+}: {
+  records: Pick<GenerationRecord, "job">[];
+  activeJob: Pick<GenerationJob, "status"> | null | undefined;
+}): boolean {
+  if (activeJob && !isTerminalJobStatus(activeJob.status)) return true;
+  return records.some((record) => !isTerminalJobStatus(record.job.status));
+}
+
+export function shouldRefreshActiveGenerationRecordsOnTimer({
+  visibilityState,
+  hasActiveRecords,
+}: {
+  visibilityState: Document["visibilityState"] | undefined;
+  hasActiveRecords: boolean;
+}): boolean {
+  return hasActiveRecords && shouldPollGeneration(visibilityState);
+}
+
+export function shouldRefreshActiveGenerationRecordsOnLifecycleEvent({
+  eventType,
+  visibilityState,
+  hasActiveRecords,
+}: {
+  eventType: "visibilitychange" | "focus" | "online";
+  visibilityState: Document["visibilityState"] | undefined;
+  hasActiveRecords: boolean;
+}): boolean {
+  return hasActiveRecords && shouldRefreshGenerationOnLifecycleEvent(eventType, visibilityState);
+}
+
 export function GenerateMenuView({
   config,
   providerConfigured,
@@ -376,6 +517,7 @@ export function GenerateMenuView({
   const [sourceImageId, setSourceImageId] = useState<string | undefined>();
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [preparingReferences, setPreparingReferences] = useState(false);
   const [optimizing, setOptimizing] = useState(false);
   const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
   const [turnstileToken, setTurnstileToken] = useState("");
@@ -386,7 +528,9 @@ export function GenerateMenuView({
   const composerRef = useRef<HTMLFormElement | null>(null);
   const submitLockRef = useRef(false);
   const pollInFlightRef = useRef(false);
+  const recordsRefreshInFlightRef = useRef(false);
   const activeJobRef = useRef<GenerationJob | null>(null);
+  const hasActiveGenerationRecordsRef = useRef(false);
   const shouldStickToBottomRef = useRef(true);
   const lastAutoScrolledConversationIdRef = useRef<string | null>(null);
   const lastAutoScrolledFlowCountRef = useRef(0);
@@ -412,7 +556,7 @@ export function GenerateMenuView({
   const activeFlows = useMemo(
     () =>
       activeConversationRecords.map((record) =>
-        buildGenerationFlowItem(record.job.id === activeJob?.id ? { ...record, job: activeJob, images: activeImages } : record),
+        buildGenerationFlowItem(resolveGenerationFlowRecord(record, activeJob, activeImages)),
       ),
     [activeConversationRecords, activeImages, activeJob],
   );
@@ -421,6 +565,74 @@ export function GenerateMenuView({
   useEffect(() => {
     activeJobRef.current = activeJob;
   }, [activeJob]);
+
+  useEffect(() => {
+    hasActiveGenerationRecordsRef.current = shouldRefreshActiveGenerationRecords({ records, activeJob });
+  }, [activeJob, records]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const clearRefreshTimer = () => {
+      if (timer === undefined) return;
+      window.clearTimeout(timer);
+      timer = undefined;
+    };
+
+    const refreshActiveRecords = async () => {
+      if (cancelled || recordsRefreshInFlightRef.current) return;
+      recordsRefreshInFlightRef.current = true;
+      try {
+        await loadRecords(undefined, { background: true });
+      } finally {
+        recordsRefreshInFlightRef.current = false;
+      }
+    };
+
+    const scheduleRefresh = () => {
+      if (cancelled) return;
+      clearRefreshTimer();
+      timer = window.setTimeout(() => {
+        if (shouldRefreshActiveGenerationRecordsOnTimer({
+          visibilityState: document.visibilityState,
+          hasActiveRecords: hasActiveGenerationRecordsRef.current,
+        })) {
+          void refreshActiveRecords();
+        }
+        scheduleRefresh();
+      }, resolveActiveGenerationRecordsRefreshIntervalMs());
+    };
+
+    const refreshNow = (eventType: "visibilitychange" | "focus" | "online") => {
+      if (!shouldRefreshActiveGenerationRecordsOnLifecycleEvent({
+        eventType,
+        visibilityState: document.visibilityState,
+        hasActiveRecords: hasActiveGenerationRecordsRef.current,
+      })) {
+        return;
+      }
+      void refreshActiveRecords();
+    };
+
+    const handleVisibilityChange = () => refreshNow("visibilitychange");
+    const handleFocus = () => refreshNow("focus");
+    const handleOnline = () => refreshNow("online");
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleFocus);
+    window.addEventListener("online", handleOnline);
+    scheduleRefresh();
+
+    return () => {
+      cancelled = true;
+      recordsRefreshInFlightRef.current = false;
+      clearRefreshTimer();
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleFocus);
+      window.removeEventListener("online", handleOnline);
+    };
+  }, [loadRecords]);
 
   useEffect(() => {
     setConversationIdsByRecordId((current) => {
@@ -476,15 +688,25 @@ export function GenerateMenuView({
     let cancelled = false;
     let timer: number | undefined;
 
+    const clearPollTimer = () => {
+      if (timer === undefined) return;
+      window.clearTimeout(timer);
+      timer = undefined;
+    };
+
     const schedulePoll = () => {
       if (cancelled) return;
       const currentJob = activeJobRef.current;
       if (!currentJob || isTerminalJobStatus(currentJob.status)) return;
+      clearPollTimer();
       timer = window.setTimeout(pollJob, resolveGenerationPollIntervalMs(currentJob.created_at));
     };
 
     const pollJob = async () => {
       if (cancelled) return;
+      clearPollTimer();
+      const currentJob = activeJobRef.current;
+      if (!currentJob || isTerminalJobStatus(currentJob.status)) return;
       if (!shouldPollGeneration(document.visibilityState)) {
         schedulePoll();
         return;
@@ -495,16 +717,16 @@ export function GenerateMenuView({
       }
       pollInFlightRef.current = true;
       try {
-        const result = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${activeJob.id}`);
-        const fallbackReferenceImages = submittedReferenceImagesByJobId[activeJob.id] ?? activeJob.referenceImages;
-        const mergedReferenceJob = mergeJobReferenceImages(result.job, fallbackReferenceImages ? { ...result.job, referenceImages: fallbackReferenceImages } : activeJob);
+        const result = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${currentJob.id}`, resolveGenerationPollRequestInit());
+        const fallbackReferenceImages = submittedReferenceImagesByJobId[currentJob.id] ?? currentJob.referenceImages;
+        const mergedReferenceJob = mergeJobReferenceImages(result.job, fallbackReferenceImages ? { ...result.job, referenceImages: fallbackReferenceImages } : currentJob);
         const nextJob = mergePolledJobState(activeJobRef.current, mergedReferenceJob);
         activeJobRef.current = nextJob;
         setActiveJob(nextJob);
         setActiveImages(result.images);
         upsertRecord(setRecords, nextJob, result.images);
         if (isTerminalJobStatus(nextJob.status)) {
-          window.clearInterval(timer);
+          clearPollTimer();
           void onUsageChanged();
           void loadRecords(undefined, { background: true });
         }
@@ -516,11 +738,26 @@ export function GenerateMenuView({
       }
     };
 
+    const refreshNow = (eventType: "visibilitychange" | "focus" | "online") => {
+      if (!shouldRefreshGenerationOnLifecycleEvent(eventType, document.visibilityState)) return;
+      void pollJob();
+    };
+
+    const handleVisibilityChange = () => refreshNow("visibilitychange");
+    const handleFocus = () => refreshNow("focus");
+    const handleOnline = () => refreshNow("online");
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleFocus);
+    window.addEventListener("online", handleOnline);
     schedulePoll();
     return () => {
       cancelled = true;
       pollInFlightRef.current = false;
-      if (timer !== undefined) window.clearTimeout(timer);
+      clearPollTimer();
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleFocus);
+      window.removeEventListener("online", handleOnline);
     };
   }, [activeJob?.id, activeJob?.status, activeJob?.referenceImages, loadRecords, onUsageChanged, setRecords, submittedReferenceImagesByJobId]);
 
@@ -642,20 +879,27 @@ export function GenerateMenuView({
         ),
       });
       void onUsageChanged();
-      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
-      const firstPollJob = mergeJobReferenceImages(firstPoll.job, submittedReferences.length > 0 ? { ...firstPoll.job, referenceImages: submittedReferences } : null);
+      let firstPollJob = createQueuedGenerationJob(result.jobId, form, submittedReferences);
+      let firstPollImages: ImageItem[] = [];
+      try {
+        const firstPoll = await loadInitialGenerationStatus(result.jobId);
+        firstPollJob = mergeJobReferenceImages(firstPoll.job, submittedReferences.length > 0 ? { ...firstPoll.job, referenceImages: submittedReferences } : null);
+        firstPollImages = firstPoll.images;
+      } catch {
+        // The generation was accepted. The normal polling loop will pick up its status shortly.
+      }
       if (submittedReferences.length > 0) {
         setSubmittedReferenceImagesByJobId((current) => ({ ...current, [firstPollJob.id]: submittedReferences }));
       }
       const conversationId =
-        conversationIdForRecord({ job: firstPollJob, images: firstPoll.images, elapsedSeconds: null }) || activeConversationId || firstPoll.job.id;
+        conversationIdForRecord({ job: firstPollJob, images: firstPollImages, elapsedSeconds: null }) || activeConversationId || result.jobId;
       shouldStickToBottomRef.current = true;
       setActiveJob(firstPollJob);
-      setActiveImages(firstPoll.images);
+      setActiveImages(firstPollImages);
       setConversationIdsByRecordId((current) => ({ ...current, [firstPollJob.id]: conversationId }));
       setActiveConversationId(conversationId);
       setDraftConversation(null);
-      upsertRecord(setRecords, firstPollJob, firstPoll.images);
+      upsertRecord(setRecords, firstPollJob, firstPollImages);
       setForm((current) => ({ ...current, prompt: "" }));
       setReferenceImages([]);
       setSourceImageId(undefined);
@@ -691,6 +935,9 @@ export function GenerateMenuView({
           height: form.height,
           quality: form.quality,
           outputFormat: form.outputFormat,
+          referenceImageCount: referenceImages.length + (sourceImageId ? 1 : 0),
+          hasSourceImage: Boolean(sourceImageId),
+          hasMaskImage: Boolean(referenceMask),
         }),
       });
       updateForm("prompt", result.optimizedPrompt.trim());
@@ -702,7 +949,7 @@ export function GenerateMenuView({
   }
 
   function addReferenceFiles(event: ChangeEvent<HTMLInputElement>) {
-    addReferenceFilesFromList(Array.from(event.target.files ?? []));
+    void addReferenceFilesFromList(Array.from(event.target.files ?? []));
     event.target.value = "";
   }
 
@@ -710,39 +957,51 @@ export function GenerateMenuView({
     const files = Array.from(event.clipboardData.files).filter((item) => item.type.startsWith("image/"));
     if (files.length === 0) return;
     event.preventDefault();
-    addReferenceFilesFromList(files);
+    void addReferenceFilesFromList(files);
   }
 
-  function addReferenceFilesFromList(files: File[]) {
+  async function addReferenceFilesFromList(files: File[]) {
     if (files.length === 0) return;
-    const remaining = maxReferenceImages - referenceImages.length;
+    const remaining = remainingReferenceSlots(referenceImages.length, Boolean(sourceImagePreview));
     if (remaining <= 0) {
       setError(`参考图最多 ${maxReferenceImages} 张。`);
       return;
     }
 
-    const accepted: ReferenceImagePreview[] = [];
-    for (const file of files.slice(0, remaining)) {
-      const mimeType = normalizeImageMime(file.type);
-      if (!referenceImageMimeTypes.has(mimeType)) {
-        setError("参考图仅支持 PNG、JPEG 或 WebP 格式。");
-        return;
+    setPreparingReferences(true);
+    try {
+      const accepted: ReferenceImagePreview[] = [];
+      for (const file of files.slice(0, remaining)) {
+        const mimeType = normalizeImageMime(file.type);
+        if (!referenceImageMimeTypes.has(mimeType)) {
+          setError("参考图仅支持 PNG、JPEG 或 WebP 格式。");
+          return;
+        }
+        let preparedFile: File;
+        try {
+          preparedFile = await prepareReferenceImage(file);
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "参考图读取失败。");
+          return;
+        }
+        if (preparedFile.size > referenceImageMaxBytes) {
+          setError("参考图不能超过 10MB。");
+          return;
+        }
+        const url = URL.createObjectURL(preparedFile);
+        objectUrlsRef.current.push(url);
+        accepted.push({ file: preparedFile, name: preparedFile.name || file.name || "参考图", url });
       }
-      if (file.size > referenceImageMaxBytes) {
-        setError("参考图不能超过 10MB。");
-        return;
-      }
-      const url = URL.createObjectURL(file);
-      objectUrlsRef.current.push(url);
-      accepted.push({ file, name: file.name || "参考图", url });
-    }
 
-    if (files.length > remaining) setError(`参考图最多 ${maxReferenceImages} 张。`);
-    else setError("");
-    setSourceImageId(undefined);
-    setSourceImagePreview(null);
-    setReferenceMask(null);
-    setReferenceImages((current) => [...current, ...accepted]);
+      if (files.length > remaining) setError(`参考图最多 ${maxReferenceImages} 张。`);
+      else setError("");
+      // Adding a regular reference changes a local edit into a regular multi-reference request,
+      // but the continued-creation source image remains part of that request.
+      setReferenceMask(null);
+      setReferenceImages((current) => [...current, ...accepted]);
+    } finally {
+      setPreparingReferences(false);
+    }
   }
 
   function clearAllReferences() {
@@ -890,9 +1149,15 @@ export function GenerateMenuView({
         layoutMode={composerLayoutMode}
         form={form}
         config={config}
-        loading={loading}
+        loading={loading || preparingReferences}
+        referencePreparing={preparingReferences}
         optimizing={optimizing}
         providerConfigured={providerConfigured}
+        showReferenceCarryoverHint={shouldShowReferenceCarryoverHint({
+          hasConversationImage: activeFlows.some((flow) => flow.images.length > 0),
+          hasCurrentReference: Boolean(sourceImagePreview || referenceMask || referenceImages.length > 0),
+          prompt: form.prompt,
+        })}
         referenceImages={referenceImages}
         sourceImagePreview={sourceImagePreview}
         referenceMask={referenceMask}
@@ -1255,12 +1520,30 @@ function GenerationStageImageCell({
   onCopyPrompt: (prompt: string) => void;
 }) {
   const [isPinnedOpen, setIsPinnedOpen] = useState(false);
+  const [displayImageUrl, setDisplayImageUrl] = useState(image.thumbnailUrl ?? image.url);
   const actions = buildGeneratedImageActions(image, prompt, record, onContinue, onLocalEdit, onRegenerate, onDelete, onCopyPrompt);
+
+  useEffect(() => {
+    setDisplayImageUrl(image.thumbnailUrl ?? image.url);
+  }, [image.thumbnailUrl, image.url]);
 
   return (
     <div data-image-action-host className={cn("group/image relative h-full min-w-0 flex-1 overflow-hidden bg-[#222]", showDivider && "border-l border-white/20")}>
-      <CossButton type="button" variant="ghost" className="block h-full w-full rounded-none border-0 bg-transparent p-0 hover:bg-transparent" onClick={() => onPreview({ url: image.url, prompt: image.prompt ?? prompt, actions })}>
-        <img src={image.url} alt={image.prompt ?? "生成图片"} decoding="async" className="h-full w-full object-cover" />
+      <CossButton
+        type="button"
+        variant="ghost"
+        className="block h-full w-full rounded-none border-0 bg-transparent p-0 hover:bg-transparent"
+        onClick={() => onPreview({ url: image.url, thumbnailUrl: image.thumbnailUrl, prompt: image.prompt ?? prompt, actions })}
+      >
+        <img
+          src={displayImageUrl}
+          alt={image.prompt ?? "生成图片"}
+          decoding="async"
+          className="h-full w-full object-cover"
+          onError={() => {
+            if (displayImageUrl !== image.url) setDisplayImageUrl(image.url);
+          }}
+        />
       </CossButton>
       <div
         className={cn(
@@ -1356,7 +1639,7 @@ export function HoverImageActionBar({
   return (
     <TooltipProvider delay={120}>
       <div ref={rootRef} className="pointer-events-auto inline-flex">
-        <Group className="rounded-[16px] border border-white/[0.08] bg-[#121212] p-0.5 shadow-[0_18px_40px_rgb(0_0_0/0.46)]">
+        <Group className={imagePreviewToolbarGroupClassName}>
           {inlineActions.map((action) => (
             <ActionGroupEntry key={action.key} action={action} onConfirmAction={setConfirmAction} />
           ))}
@@ -1570,7 +1853,7 @@ function LoadingStatusText() {
 }
 
 export function generationStageLayout(job: Pick<GenerationJob, "width" | "height" | "quantity">, images: ImageItem[]): { width: number; height: number; columns: number } {
-  const count = Math.max(1, images.length || job.quantity || 1);
+  const count = Math.max(1, job.quantity || images.length || 1);
   const firstImage = images[0];
   const aspect = safeAspectRatio(firstImage?.width ?? job.width, firstImage?.height ?? job.height);
 
@@ -1849,8 +2132,10 @@ function ComposerPanel({
   form,
   config,
   loading,
+  referencePreparing,
   optimizing,
   providerConfigured,
+  showReferenceCarryoverHint,
   referenceImages,
   sourceImagePreview,
   referenceMask,
@@ -1873,8 +2158,10 @@ function ComposerPanel({
   form: GenerateForm;
   config: AppConfig;
   loading: boolean;
+  referencePreparing: boolean;
   optimizing: boolean;
   providerConfigured: boolean;
+  showReferenceCarryoverHint: boolean;
   referenceImages: ReferenceImagePreview[];
   sourceImagePreview: SourceImagePreview | null;
   referenceMask: ImageSelectionMask | null;
@@ -1953,6 +2240,7 @@ function ComposerPanel({
             variant="outline"
             size="sm"
             className={composerActionButtonClassName}
+            disabled={referencePreparing}
             onClick={onPickReference}
           >
             <ComposerReferenceIcon className="size-4 shrink-0 text-white/90" />
@@ -1976,6 +2264,11 @@ function ComposerPanel({
           onPaste={onPromptPaste}
         />
       </div>
+      {showReferenceCarryoverHint && (
+        <p role="note" className="-mt-2 w-full text-xs leading-5 text-amber-100/72">
+          当前不会自动参考上一张图；如需继续修改，请先在图片菜单选择“基于这张图片继续创作”。
+        </p>
+      )}
       <div className="flex w-full items-center justify-between gap-20">
         <div className="flex min-w-0 items-center gap-2">
           {shouldShowComposerOptimizeBeam(optimizing) ? (
@@ -2019,7 +2312,89 @@ function uniqueModelOptions(options: string[] | undefined, configuredModel: stri
   return Array.from(new Set(candidates));
 }
 
-function ImagePreview({ image, onClose }: { image: PreviewImage; onClose: () => void }) {
+export function ImagePreview({ image, onClose }: { image: PreviewImage; onClose: () => void }) {
+  const hasImageUrl = image.url.trim().length > 0;
+  const placeholderUrl = image.thumbnailUrl ?? "";
+  const [loadState, setLoadState] = useState<"loading" | "loaded" | "error">(hasImageUrl ? "loading" : "error");
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [loadProgressPercent, setLoadProgressPercent] = useState<number | null>(hasImageUrl ? 0 : null);
+  const [loadedImageUrl, setLoadedImageUrl] = useState<string | null>(null);
+  const imageLoaded = loadState === "loaded";
+  const loadingProgressLabel = `${imageLoaded ? 100 : loadProgressPercent ?? 0}%`;
+  const chromeState = resolveImagePreviewChromeState({ hasImageUrl, imageLoaded });
+  const actions = useMemo(() => imagePreviewActionsWithDismiss(image.actions, onClose), [image.actions, onClose]);
+
+  useEffect(() => {
+    setLoadState(hasImageUrl ? "loading" : "error");
+    setLoadProgressPercent(hasImageUrl ? 0 : null);
+    setLoadedImageUrl(null);
+    if (!hasImageUrl) return;
+
+    const abortController = new AbortController();
+    let objectUrl: string | null = null;
+    let stalledSince = Date.now();
+
+    const stallTimer = window.setInterval(() => {
+      if (Date.now() - stalledSince > IMAGE_PREVIEW_STALL_TIMEOUT_MS) {
+        abortController.abort();
+        setLoadState("error");
+      }
+    }, 1000);
+
+    async function loadFullSizeImage() {
+      try {
+        // 使用原始 image.url（不带额外参数），让浏览器 HTTP 强缓存和 SW 缓存
+        // 都能命中：画廊已加载过的图片，预览直接秒开；否则才走网络下载。
+        const response = await fetch(image.url, { signal: abortController.signal });
+        if (!response.ok) throw new Error(`Image preview request failed with ${response.status}`);
+        stalledSince = Date.now();
+        const contentLength = Number(response.headers.get("Content-Length") ?? "");
+        const reader = response.body?.getReader();
+        if (!reader) {
+          const blob = await response.blob();
+          objectUrl = URL.createObjectURL(blob);
+          setLoadedImageUrl(objectUrl);
+          setLoadProgressPercent(100);
+          setLoadState("loaded");
+          return;
+        }
+
+        const chunks: ArrayBuffer[] = [];
+        let loaded = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          stalledSince = Date.now();
+          // Copy into an ArrayBuffer so Blob accepts chunks from every supported stream implementation.
+          chunks.push(new Uint8Array(value).buffer);
+          loaded += value.byteLength;
+          setLoadProgressPercent(resolveImagePreviewProgressPercent(loaded, contentLength));
+        }
+
+        const blob = new Blob(chunks, {
+          type: response.headers.get("Content-Type") ?? "image/png",
+        });
+        objectUrl = URL.createObjectURL(blob);
+        setLoadedImageUrl(objectUrl);
+        setLoadProgressPercent(100);
+        setLoadState("loaded");
+      } catch (error) {
+        if (!abortController.signal.aborted || Date.now() - stalledSince > IMAGE_PREVIEW_STALL_TIMEOUT_MS) {
+          console.error("image preview load failed", error);
+          setLoadState("error");
+        }
+      }
+    }
+
+    void loadFullSizeImage();
+
+    return () => {
+      window.clearInterval(stallTimer);
+      abortController.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [hasImageUrl, image.url, loadAttempt]);
+
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") onClose();
@@ -2029,38 +2404,75 @@ function ImagePreview({ image, onClose }: { image: PreviewImage; onClose: () => 
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [onClose]);
 
-  return (
+  return createPortal(
     <div
-      className="fixed inset-0 z-50 grid place-items-center bg-black/72 p-8 backdrop-blur-md"
+      className={cn("fixed inset-0 z-[100] grid place-items-center p-8", dialogBackdropSurfaceClassName)}
       role="dialog"
       aria-modal="true"
       aria-label="图片预览"
       onClick={onClose}
     >
-      <div className="relative flex max-h-[calc(100dvh-64px)] max-w-[calc(100vw-64px)] items-center justify-center" onClick={(event) => event.stopPropagation()}>
-        <img src={image.url} alt="" aria-hidden="true" decoding="async" className="pointer-events-none absolute inset-0 h-full w-full scale-110 object-contain opacity-32 blur-3xl" />
-        {image.actions && image.actions.length > 0 && (
+      <CossButton
+        type="button"
+        variant="ghost"
+        size="icon"
+        aria-label="关闭预览"
+        className="absolute right-8 top-8 z-10 grid size-9 place-items-center rounded-full border-0 bg-white/10 text-white/80 transition hover:bg-white/16 hover:text-white"
+        onClick={onClose}
+      >
+        <X aria-hidden size={20} />
+      </CossButton>
+      <div className="relative isolate grid min-h-24 min-w-24 max-h-[calc(100dvh-64px)] max-w-[calc(100vw-64px)] place-items-center" onClick={(event) => event.stopPropagation()}>
+        {chromeState.showActions && actions.length > 0 && (
           <div className={imagePreviewToolbarPositionClassName}>
-            <HoverImageActionBar actions={image.actions} />
+            <HoverImageActionBar actions={actions} />
           </div>
         )}
-        <CossButton
-          type="button"
-          variant="ghost"
-          size="icon"
-          aria-label="关闭预览"
-          className="absolute right-4 top-4 z-10 grid size-9 place-items-center rounded-full border-0 bg-white/10 text-white/80 transition hover:bg-white/16 hover:text-white"
-          onClick={onClose}
-        >
-          <X aria-hidden size={20} />
-        </CossButton>
-      <img
-          src={image.url}
-          alt={image.prompt ?? "生成图片"}
-          className="ohm-smooth-card relative max-h-[calc(100dvh-64px)] max-w-[calc(100vw-64px)] rounded-[24px] border border-white/10 bg-white/[0.04] object-contain shadow-[0_24px_90px_rgb(0_0_0/0.52)]"
-        />
+        {placeholderUrl && !imageLoaded && (
+          <img
+            src={placeholderUrl}
+            alt={image.prompt ?? "生成图片"}
+            className={cn(imagePreviewVisibleImageClassName, "blur-sm")}
+          />
+        )}
+        {loadedImageUrl && (
+          <img
+            src={loadedImageUrl}
+            alt={image.prompt ?? "生成图片"}
+            className={cn(imagePreviewVisibleImageClassName, !imageLoaded && "opacity-0")}
+            onLoad={() => setLoadState("loaded")}
+            onError={() => setLoadState("error")}
+          />
+        )}
+        {loadState === "loading" && (
+          <div className="absolute inset-0 grid place-items-center">
+            <div className="grid size-16 place-items-center rounded-full bg-black/70 text-sm font-medium text-white" aria-label="大图加载中">
+              <span className="grid size-12 place-items-center rounded-full bg-[#121212]">
+                {loadingProgressLabel}
+              </span>
+            </div>
+          </div>
+        )}
+        {loadState === "error" && (
+          <div className="absolute inset-0 grid place-items-center bg-black/45 px-6 text-center">
+            <div className="flex max-w-xs flex-col items-center gap-3 rounded-[16px] bg-[#121212]/94 px-5 py-4 text-sm text-white/72">
+              <span>大图加载失败，可重试或先关闭预览。</span>
+              {hasImageUrl && (
+                <CossButton
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setLoadAttempt((attempt) => attempt + 1)}
+                >
+                  重新加载
+                </CossButton>
+              )}
+            </div>
+          </div>
+        )}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -2178,7 +2590,7 @@ function LocalEditDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup showCloseButton className="h-[70dvh] max-h-[70dvh] max-w-[70vw] bg-[#121212]">
+      <DialogPopup showCloseButton className="h-[80dvh] min-h-[70dvh] w-[80vw] !max-w-[80vw] max-h-[80dvh] bg-[#121212]">
         <DialogHeader className="px-5 py-3">
           <div className="min-w-0">
             <DialogTitle className="text-lg font-semibold leading-6 text-white">局部编辑</DialogTitle>
@@ -2475,11 +2887,59 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number)
   });
 }
 
+async function prepareReferenceImage(file: File): Promise<File> {
+  if (shouldPreserveReferenceImage(file)) return file;
+  const image = await loadFileImage(file);
+
+  const scale = Math.min(1, fastReferenceImageEdge / Math.max(image.naturalWidth, image.naturalHeight));
+  const width = Math.max(1, Math.round(image.naturalWidth * scale));
+  const height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) return file;
+  context.drawImage(image, 0, 0, width, height);
+
+  const compressed = await canvasToBlob(canvas, "image/webp", 0.86).catch(() => null)
+    ?? await canvasToBlob(canvas, "image/jpeg", 0.88).catch(() => null);
+  if (!compressed || compressed.size >= file.size) return file;
+
+  const type = normalizeImageMime(compressed.type) || "image/jpeg";
+  const extension = type === "image/webp" ? "webp" : "jpg";
+  return new File([compressed], replaceFileExtension(file.name || "reference", extension), { type });
+}
+
+export function shouldPreserveReferenceImage(file: Pick<File, "size">): boolean {
+  return file.size <= referenceImageMaxBytes;
+}
+
+function loadFileImage(file: File): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("参考图读取失败。"));
+    };
+    image.src = url;
+  });
+}
+
+function replaceFileExtension(name: string, extension: string): string {
+  const trimmed = name.trim() || "reference";
+  return `${trimmed.replace(/\.[^.]+$/, "")}.${extension}`;
+}
+
 function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function buildFlowChips(flow: ReturnType<typeof buildGenerationFlowItem>): string[] {
+export function buildFlowChips(flow: ReturnType<typeof buildGenerationFlowItem>): string[] {
   const longEdge = Math.max(flow.job.width, flow.job.height);
   const resolution = longEdge >= 3840 ? "4K" : longEdge >= 2048 ? "2K" : "1K";
   const chips = [
@@ -2491,6 +2951,9 @@ function buildFlowChips(flow: ReturnType<typeof buildGenerationFlowItem>): strin
   ];
   if (flow.status !== "pending" && typeof flow.elapsedSeconds === "number") {
     chips.push(`耗时：${flow.elapsedSeconds.toFixed(1)}s`);
+  }
+  if (flow.status !== "pending") {
+    chips.push(generationProgressSummary(flow.job, flow.images.length));
   }
   return chips;
 }
@@ -2545,6 +3008,19 @@ function revokeObjectUrls(urls: string[]): void {
 
 function isTerminalJobStatus(status: GenerationJob["status"]): boolean {
   return isTerminalGenerationJobStatus(status);
+}
+
+async function loadInitialGenerationStatus(jobId: string): Promise<{ ok: true; job: GenerationJob; images: ImageItem[] }> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), resolveInitialGenerationStatusTimeoutMs());
+  try {
+    return await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(
+      `/api/generations/${jobId}`,
+      { ...resolveGenerationPollRequestInit(), signal: controller.signal },
+    );
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 function upsertRecord(

@@ -1,4 +1,5 @@
 import type { GenerationJob, GenerationRecord } from "../../api";
+import { isTerminalGenerationJobStatus } from "../../generation-state";
 
 export interface ConversationListItem {
   id: string;
@@ -55,7 +56,7 @@ export function buildConversationList(records: GenerationRecord[], now = new Dat
   return records.map((record) => ({
     id: record.job.id,
     title: truncateConversationTitle(record.job.prompt),
-    previewImage: record.images[0]?.url ?? null,
+    previewImage: record.images[0]?.thumbnailUrl ?? record.images[0]?.url ?? null,
     createdAt: record.job.created_at,
     groupLabel: groupLabelForDate(record.job.created_at, now),
     latestRecordId: record.job.id,
@@ -132,6 +133,16 @@ export function buildGenerationFlowItem(record: GenerationRecord): GenerationFlo
   };
 }
 
+export function resolveGenerationFlowRecord(
+  record: GenerationRecord,
+  activeJob: GenerationJob | null | undefined,
+  activeImages: GenerationRecord["images"],
+): GenerationRecord {
+  if (!activeJob || activeJob.id !== record.job.id) return record;
+  if (isTerminalGenerationJobStatus(record.job.status) && !isTerminalGenerationJobStatus(activeJob.status)) return record;
+  return { ...record, job: activeJob, images: activeImages };
+}
+
 export function mergeJobReferenceImages(job: GenerationJob, fallbackJob?: GenerationJob | null): GenerationJob {
   if (!fallbackJob || fallbackJob.id !== job.id || (fallbackJob.referenceImages?.length ?? 0) === 0) return job;
   if ((job.referenceImages?.length ?? 0) === 0) return { ...job, referenceImages: fallbackJob.referenceImages };
@@ -156,22 +167,24 @@ export function submittedReferenceImages(
   referenceImages: SubmittedReferenceImagePreview[],
   sourceImagePreview?: SubmittedSourceImagePreview | null,
 ): NonNullable<GenerationJob["referenceImages"]> {
-  if (referenceImages.length > 0) {
-    return referenceImages.map((image, index) => ({
+  const source = sourceImagePreview
+    ? [{
+        name: sourceImagePreview.name || "参考图 1",
+        mimeType: "image/png",
+        byteSize: 0,
+        role: "source" as const,
+        url: sourceImagePreview.url,
+      }]
+    : [];
+  return [
+    ...source,
+    ...referenceImages.map((image, index) => ({
       name: image.name || `参考图 ${index + 1}`,
       mimeType: image.file.type || "image/png",
       byteSize: image.file.size,
+      role: "reference" as const,
       url: image.url,
-    }));
-  }
-  if (!sourceImagePreview) return [];
-  return [
-    {
-      name: sourceImagePreview.name || "参考图 1",
-      mimeType: "image/png",
-      byteSize: 0,
-      url: sourceImagePreview.url,
-    },
+    })),
   ];
 }
 
