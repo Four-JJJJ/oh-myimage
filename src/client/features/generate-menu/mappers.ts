@@ -1,5 +1,6 @@
 import type { GenerationJob, GenerationRecord } from "../../api";
 import { isTerminalGenerationJobStatus } from "../../generation-state";
+import { DEFAULT_IMAGE_MODEL } from "../../../image-models";
 
 export interface ConversationListItem {
   id: string;
@@ -214,7 +215,7 @@ export function composerDraftFromRecord(record: GenerationRecord, sourceImageId?
   return {
     prompt: record.job.prompt,
     referenceImages: [],
-    selectedModel: "gpt-image-2",
+    selectedModel: DEFAULT_IMAGE_MODEL,
     selectedQuality: record.job.quality,
     sourceImageId,
     sourceRecordId: record.job.id,

@@ -22,6 +22,7 @@ import referenceDeleteIcon from "../../assets/figma/reference-delete.svg";
 import sidebarAdd from "../../assets/figma/sidebar-add.svg";
 import { claimGenerationSubmitLock, isTerminalGenerationJobStatus, mergePolledJobState, releaseGenerationSubmitLock } from "../../generation-state";
 import { generationProgressSummary } from "../../generation-progress";
+import { DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS, imageModelLabel } from "../../../image-models";
 import {
   AlertDialog,
   AlertDialogClose,
@@ -175,7 +176,7 @@ declare global {
 
 const defaultForm: GenerateForm = {
   prompt: "",
-  model: "gpt-image-2",
+  model: DEFAULT_IMAGE_MODEL,
   aspectRatio: "16:9",
   resolution: "1K",
   width: 1536,
@@ -283,7 +284,6 @@ const fastReferenceImageEdge = 2048;
 const composerTextareaLineHeight = 21;
 const composerTextareaMinRows = 2;
 const composerTextareaMaxRows = 12;
-const imageModelOptions = ["gpt-image-2"] as const;
 const imagePreviewActionOrder = ["continue", "local-edit", "regenerate", "copy", "download", "delete"] as const;
 const imageSelectionBrushRatio = 0.085;
 export const loadingStatusAnimationDurationMs = 24_480;
@@ -1898,6 +1898,20 @@ function useDismissiblePopup(rootRef: RefObject<HTMLElement>, open: boolean, onD
   }, [open, onDismiss, rootRef]);
 }
 
+const composerPopupGapPx = 8;
+
+export function resolveComposerPopupPlacement(
+  triggerRect: Pick<DOMRect, "top" | "bottom">,
+  popupHeight: number,
+  viewportHeight: number,
+): "above" | "below" {
+  const spaceAbove = Math.max(0, triggerRect.top - composerPopupGapPx);
+  const spaceBelow = Math.max(0, viewportHeight - triggerRect.bottom - composerPopupGapPx);
+  if (spaceBelow >= popupHeight) return "below";
+  if (spaceAbove >= popupHeight) return "above";
+  return spaceAbove > spaceBelow ? "above" : "below";
+}
+
 function ComposerChoiceMenu({
   label,
   icon,
@@ -1914,14 +1928,49 @@ function ComposerChoiceMenu({
   onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [placement, setPlacement] = useState<"above" | "below">("below");
+  const [popupMaxHeight, setPopupMaxHeight] = useState<number | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const popupRef = useRef<HTMLDivElement | null>(null);
   useDismissiblePopup(rootRef, open, () => setOpen(false));
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setPlacement("below");
+      setPopupMaxHeight(null);
+      return;
+    }
+
+    const updatePlacement = () => {
+      const trigger = triggerRef.current;
+      const popup = popupRef.current;
+      if (!trigger || !popup) return;
+      const triggerRect = trigger.getBoundingClientRect();
+      const popupRect = popup.getBoundingClientRect();
+      const nextPlacement = resolveComposerPopupPlacement(triggerRect, popupRect.height, window.innerHeight);
+      const availableSpace = nextPlacement === "above"
+        ? triggerRect.top - composerPopupGapPx
+        : window.innerHeight - triggerRect.bottom - composerPopupGapPx;
+      setPlacement(nextPlacement);
+      setPopupMaxHeight(Math.max(1, Math.floor(availableSpace)));
+    };
+
+    updatePlacement();
+    window.addEventListener("resize", updatePlacement);
+    window.addEventListener("scroll", updatePlacement, true);
+    return () => {
+      window.removeEventListener("resize", updatePlacement);
+      window.removeEventListener("scroll", updatePlacement, true);
+    };
+  }, [open, options.length]);
 
   const selected = options.find((option) => option.value === value) ?? options[0];
 
   return (
     <div ref={rootRef} className="relative shrink-0">
           <CossButton
+            ref={triggerRef}
             type="button"
             aria-haspopup="listbox"
             aria-expanded={open}
@@ -1938,9 +1987,16 @@ function ComposerChoiceMenu({
             {icon && <span className="grid size-4 shrink-0 place-items-center text-white/90">{icon}</span>}
             <span className="whitespace-nowrap">{selected.label}</span>
             <ChevronDown aria-hidden size={20} className={cn("shrink-0 text-white/60 transition-transform", open && "rotate-180")} />
-          </CossButton>
+      </CossButton>
       {open && (
-        <div className="absolute left-0 top-[calc(100%+8px)] z-30 w-max min-w-full overflow-hidden rounded-[8px] border border-white/15 bg-[#121212] p-1 shadow-[0_12px_32px_rgb(0_0_0/0.32)]">
+        <div
+          ref={popupRef}
+          className={cn(
+            "absolute left-0 z-30 w-max min-w-full max-w-[calc(100vw-16px)] overflow-y-auto rounded-[8px] border border-white/15 bg-[#121212] p-1 shadow-[0_12px_32px_rgb(0_0_0/0.32)]",
+            placement === "above" ? "bottom-[calc(100%+8px)]" : "top-[calc(100%+8px)]",
+          )}
+          style={popupMaxHeight === null ? undefined : { maxHeight: `${popupMaxHeight}px` }}
+        >
           <div role="listbox" aria-label={label} className="flex w-max min-w-full flex-col gap-1">
             {options.map((option) => (
               <CossButton
@@ -1950,7 +2006,7 @@ function ComposerChoiceMenu({
                 role="option"
                 aria-selected={option.value === selected.value}
                 className={cn(
-                  "h-auto rounded-[8px] border-0 px-3 py-1.5 text-left text-sm leading-[22px] text-white/78 transition hover:bg-white/10 hover:text-white",
+                  "h-auto justify-start rounded-[8px] border-0 px-3 py-1.5 text-left text-sm leading-[22px] text-white/78 transition hover:bg-white/10 hover:text-white",
                   option.value === selected.value && "bg-white/10 text-white",
                 )}
                 onClick={() => {
@@ -2283,7 +2339,7 @@ function ComposerPanel({
             value={modelName}
             disabled={modelOptions.length <= 1}
             icon={<ComposerModelIcon className="size-4 text-white/90" />}
-            options={modelOptions.map((model) => ({ value: model, label: model.replace(/^gpt-/, "") }))}
+            options={modelOptions.map((model) => ({ value: model, label: imageModelLabel(model) }))}
             onChange={(next) => onUpdate("model", next)}
           />
           <ComposerGenerationSettingsMenu form={form} maxImagesPerRequest={config.maxImagesPerRequest} onUpdate={onUpdate} />
@@ -2308,7 +2364,7 @@ function ComposerPanel({
 }
 
 function uniqueModelOptions(options: string[] | undefined, configuredModel: string) {
-  const candidates = [...(options ?? []), configuredModel, ...imageModelOptions].map((model) => model.trim()).filter(Boolean);
+  const candidates = [...(options ?? []), configuredModel, ...IMAGE_MODEL_OPTIONS].map((model) => model.trim()).filter(Boolean);
   return Array.from(new Set(candidates));
 }
 

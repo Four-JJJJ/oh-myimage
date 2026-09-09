@@ -2,23 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import { hashPassword } from "./crypto";
 import {
   app,
-  hasUnlimitedDailyImageQuota,
   resolvePostProcessingRetryAttempts,
   resolvePostProcessingRetryDelaySeconds,
   resolveProviderRetryAttempts,
 } from "./index";
-import type { AppDatabase, AppObject, AppObjectStore, AppObjectStorePutOptions, AppPreparedStatement, CredentialRecord, Env, ImageAssetRecord, SpaceRecord } from "./types";
-
-describe("daily image quota exemption", () => {
-  it("no longer exempts any provider by URL", () => {
-    expect(hasUnlimitedDailyImageQuota({ base_url: "https://token.fourj.space/v1" })).toBe(false);
-    expect(hasUnlimitedDailyImageQuota({ base_url: "https://image.fourj.space/v1" })).toBe(false);
-  });
-
-  it("keeps regular provider URLs non-exempt", () => {
-    expect(hasUnlimitedDailyImageQuota({ base_url: "https://api.openai.com/v1" })).toBe(false);
-  });
-});
+import type { AppDatabase, AppObject, AppObjectStore, AppObjectStorePutOptions, AppPreparedStatement, CredentialRecord, Env, ImageAssetRecord, ImageProviderProfileRecord, SpaceRecord } from "./types";
 
 describe("provider queue retry attempts", () => {
   it("defaults to no automatic requeue retries", () => {
@@ -40,6 +28,19 @@ describe("provider queue retry attempts", () => {
 });
 
 describe("provider settings", () => {
+  it("exposes Image 2.5 Flare as the default generation model", async () => {
+    const response = await app.request(
+      "http://local.test/api/config",
+      {},
+      testEnv({ db: new FakeRouteDatabase(), images: new FakeObjectStore() }),
+    );
+    const json = (await response.json()) as { ok: true; config: { model: string; modelOptions: string[] } };
+
+    expect(response.status).toBe(200);
+    expect(json.config.model).toBe("gpt-image-2.5-flare");
+    expect(json.config.modelOptions).toEqual(["gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]);
+  });
+
   it("saves an image provider without requiring a prompt provider", async () => {
     const db = new FakeRouteDatabase();
     db.credentialRecord = null;
@@ -117,6 +118,140 @@ describe("provider settings", () => {
       prompt_base_url: "https://api.openai.com/v1",
       prompt_api_key_hint: "sk-t...ider",
     });
+  });
+
+  it("creates and switches between multiple image provider profiles", async () => {
+    const db = new FakeRouteDatabase();
+    db.imageProviderProfiles.set("profile_1", makeImageProviderProfileRecord());
+    db.credentialRecord = makeCredentialRecord({ active_image_provider_id: "profile_1" });
+
+    const firstResponse = await app.request(
+      "http://local.test/api/settings/provider",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          imageProvider: {
+            providerId: null,
+            name: "备用 Provider",
+            baseURL: "https://img.backup-api.com/v1",
+            apiKey: "sk-backup-provider",
+            model: "gpt-image-2.5-sunburst",
+          },
+        }),
+      },
+      testEnv({ db, images: new FakeObjectStore() }),
+    );
+    const firstJson = (await firstResponse.json()) as {
+      ok: true;
+      imageProviders: Array<{ id: string; name: string; baseURL: string; model: string }>;
+      activeImageProviderId: string | null;
+    };
+
+    expect(firstResponse.status).toBe(200);
+    expect(firstJson.imageProviders).toHaveLength(2);
+    expect(firstJson.imageProviders.at(-1)).toMatchObject({
+      name: "备用 Provider",
+      baseURL: "https://img.backup-api.com/v1",
+      model: "gpt-image-2.5-sunburst",
+    });
+    expect(firstJson.activeImageProviderId).toBe(firstJson.imageProviders.at(-1)?.id);
+
+    const firstProfileId = firstJson.imageProviders[0]?.id;
+    expect(firstProfileId).toBeTruthy();
+    const selectResponse = await app.request(
+      "http://local.test/api/settings/provider/select",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({ providerId: firstProfileId }),
+      },
+      testEnv({ db, images: new FakeObjectStore() }),
+    );
+    const selectJson = (await selectResponse.json()) as {
+      ok: true;
+      imageProvider: { baseURL: string; model: string; apiKeyHint: string };
+      activeImageProviderId: string | null;
+    };
+
+    expect(selectResponse.status).toBe(200);
+    expect(selectJson.activeImageProviderId).toBe(firstProfileId);
+    expect(selectJson.imageProvider).toMatchObject({
+      baseURL: "https://token.fourj.space/v1",
+      model: "gpt-image-2",
+      apiKeyHint: "test",
+    });
+    expect(db.credentialRecord).toMatchObject({
+      base_url: "https://token.fourj.space/v1",
+      model: "gpt-image-2",
+      active_image_provider_id: firstProfileId,
+    });
+  });
+
+  it("switches away from a deleted active profile and keeps one profile", async () => {
+    const db = new FakeRouteDatabase();
+    db.imageProviderProfiles.set(
+      "profile_2",
+      makeImageProviderProfileRecord({
+        id: "profile_2",
+        name: "备用 Provider",
+        base_url: "https://img.backup-api.com/v1",
+        model: "gpt-image-2.5-flare",
+        encrypted_api_key: "backup-encrypted",
+        api_key_hint: "sk-b...der",
+      }),
+    );
+    db.credentialRecord = makeCredentialRecord({ active_image_provider_id: "profile_1" });
+    db.imageProviderProfiles.set(
+      "profile_1",
+      makeImageProviderProfileRecord({
+        id: "profile_1",
+        name: "当前 Provider",
+        base_url: db.credentialRecord.base_url,
+        model: db.credentialRecord.model,
+        encrypted_api_key: db.credentialRecord.encrypted_api_key,
+        api_key_hint: db.credentialRecord.api_key_hint,
+      }),
+    );
+
+    const response = await app.request(
+      "http://local.test/api/settings/provider/profiles/profile_1",
+      {
+        method: "DELETE",
+        headers: { Cookie: "image2_session=test-token" },
+      },
+      testEnv({ db, images: new FakeObjectStore() }),
+    );
+    const json = (await response.json()) as {
+      ok: true;
+      imageProviders: Array<{ id: string }>;
+      activeImageProviderId: string | null;
+      imageProvider: { baseURL: string; model: string };
+    };
+
+    expect(response.status).toBe(200);
+    expect(json.imageProviders).toHaveLength(1);
+    expect(json.imageProviders[0]?.id).toBe("profile_2");
+    expect(json.activeImageProviderId).toBe("profile_2");
+    expect(json.imageProvider).toMatchObject({
+      baseURL: "https://img.backup-api.com/v1",
+      model: "gpt-image-2.5-flare",
+    });
+    expect(db.credentialRecord).toMatchObject({
+      active_image_provider_id: "profile_2",
+      base_url: "https://img.backup-api.com/v1",
+    });
+
+    const lastDeleteResponse = await app.request(
+      "http://local.test/api/settings/provider/profiles/profile_2",
+      {
+        method: "DELETE",
+        headers: { Cookie: "image2_session=test-token" },
+      },
+      testEnv({ db, images: new FakeObjectStore() }),
+    );
+    expect(lastDeleteResponse.status).toBe(400);
+    await expect(lastDeleteResponse.json()).resolves.toMatchObject({ error: { code: "provider_profile_required" } });
   });
 });
 
@@ -488,6 +623,65 @@ describe("image downloads", () => {
 });
 
 describe("generation creation", () => {
+  it("uses the requested Image 2.5 Sunburst model for a new generation", async () => {
+    const db = new FakeRouteDatabase();
+    const generationQueue = new RecordingQueue();
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: "Image 2.5 Sunburst generation",
+          model: "gpt-image-2.5-sunburst",
+          aspectRatio: "1:1",
+          width: 1024,
+          height: 1024,
+          quality: "auto",
+          quantity: 1,
+          outputFormat: "png",
+          compression: 100,
+        }),
+      },
+      testEnv({ db, images: new FakeObjectStore(), generationQueue }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(db.generationJobInserts[0]?.[12]).toBe("gpt-image-2.5-sunburst");
+  });
+
+  it("ignores legacy daily-quota environment variables", async () => {
+    const db = new FakeRouteDatabase();
+    const generationQueue = new RecordingQueue();
+    const env = Object.assign(testEnv({ db, images: new FakeObjectStore(), generationQueue }), {
+      MAX_DAILY_IMAGES_PER_SPACE: "0",
+      MAX_DAILY_JOBS_PER_SPACE: "0",
+    });
+
+    const response = await app.request(
+      "http://local.test/api/generations",
+      {
+        method: "POST",
+        headers: { Cookie: "image2_session=test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: "unlimited daily generation",
+          aspectRatio: "1:1",
+          width: 1024,
+          height: 1024,
+          quality: "auto",
+          quantity: 1,
+          outputFormat: "png",
+          compression: 100,
+        }),
+      },
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(generationQueue.messages).toHaveLength(1);
+  });
+
   it("stores reference and mask images before enqueueing edit generation jobs", async () => {
     const db = new FakeRouteDatabase();
     const images = new FakeObjectStore();
@@ -1069,6 +1263,7 @@ class FakeRouteDatabase implements AppDatabase {
   readonly statusUpdates: Array<{ jobId: string; status: string; errorCode: string | null; errorMessage: string | null; stage: string }> = [];
   readonly imageRecords = new Map<string, ImageAssetRecord>([["img_1", makeImageRecord()]]);
   readonly jobRecords = new Map<string, Record<string, unknown>>();
+  readonly imageProviderProfiles = new Map<string, ImageProviderProfileRecord>();
   credentialRecord: CredentialRecord | null = makeCredentialRecord();
 
   prepare(query: string): AppPreparedStatement {
@@ -1167,6 +1362,10 @@ class FakeRoutePreparedStatement implements AppPreparedStatement {
     if (this.query.includes("FROM api_credentials")) {
       return this.db.credentialRecord && this.db.credentialRecord.space_id === this.values[0] ? (this.db.credentialRecord as T) : null;
     }
+    if (this.query.includes("FROM image_provider_profiles")) {
+      const profile = this.db.imageProviderProfiles.get(String(this.values[0] ?? ""));
+      return profile && profile.space_id === this.values[1] ? (profile as T) : null;
+    }
     if (this.query.includes("COUNT(*) AS count FROM generation_jobs")) {
       return { count: 0 } as T;
     }
@@ -1189,6 +1388,11 @@ class FakeRoutePreparedStatement implements AppPreparedStatement {
       const jobIds = new Set(this.values.slice(1).map(String));
       return {
         results: Array.from(this.db.imageRecords.values()).filter((image) => jobIds.has(image.job_id)) as T[],
+      };
+    }
+    if (this.query.includes("FROM image_provider_profiles")) {
+      return {
+        results: Array.from(this.db.imageProviderProfiles.values()).filter((profile) => profile.space_id === this.values[0]) as T[],
       };
     }
     return { results: [] };
@@ -1236,7 +1440,20 @@ class FakeRoutePreparedStatement implements AppPreparedStatement {
         prompt_api_key_hint: promptApiKeyHint === null || promptApiKeyHint === undefined ? null : String(promptApiKeyHint),
       });
     }
-    if (this.query.includes("UPDATE api_credentials")) {
+    if (this.query.includes("SET base_url = (SELECT base_url FROM image_provider_profiles")) {
+      const profileId = String(this.values[0]);
+      const profile = this.db.imageProviderProfiles.get(profileId);
+      if (profile && this.db.credentialRecord?.space_id === this.values[1]) {
+        this.db.credentialRecord = makeCredentialRecord({
+          ...this.db.credentialRecord,
+          base_url: profile.base_url,
+          model: profile.model,
+          encrypted_api_key: profile.encrypted_api_key,
+          api_key_hint: profile.api_key_hint,
+          active_image_provider_id: profile.id,
+        });
+      }
+    } else if (this.query.includes("UPDATE api_credentials")) {
       const [
         baseURL,
         model,
@@ -1260,6 +1477,42 @@ class FakeRoutePreparedStatement implements AppPreparedStatement {
         prompt_encrypted_api_key: promptEncryptedApiKey === null || promptEncryptedApiKey === undefined ? null : String(promptEncryptedApiKey),
         prompt_api_key_hint: promptApiKeyHint === null || promptApiKeyHint === undefined ? null : String(promptApiKeyHint),
       });
+    }
+    if (this.query.includes("INSERT INTO image_provider_profiles")) {
+      const [id, spaceId, name, baseURL, model, encryptedApiKey, apiKeyHint, lastTestOk, lastTestedAt] = this.values;
+      this.db.imageProviderProfiles.set(String(id), {
+        id: String(id),
+        space_id: String(spaceId),
+        name: String(name),
+        base_url: String(baseURL),
+        model: String(model),
+        encrypted_api_key: String(encryptedApiKey),
+        api_key_hint: String(apiKeyHint),
+        last_test_ok: Number(lastTestOk),
+        last_tested_at: lastTestedAt === null ? null : String(lastTestedAt),
+        created_at: "2026-05-15T00:00:00.000Z",
+        updated_at: "2026-05-15T00:00:00.000Z",
+      });
+    }
+    if (this.query.includes("UPDATE image_provider_profiles")) {
+      const [name, baseURL, model, encryptedApiKey, apiKeyHint, profileId, spaceId] = this.values;
+      const profile = this.db.imageProviderProfiles.get(String(profileId));
+      if (profile && profile.space_id === spaceId) {
+        Object.assign(profile, {
+          name: String(name),
+          base_url: String(baseURL),
+          model: String(model),
+          encrypted_api_key: String(encryptedApiKey),
+          api_key_hint: String(apiKeyHint),
+          last_test_ok: 0,
+          last_tested_at: null,
+        });
+      }
+    }
+    if (this.query.includes("DELETE FROM image_provider_profiles")) {
+      const [profileId, spaceId] = this.values;
+      const profile = this.db.imageProviderProfiles.get(String(profileId));
+      if (profile?.space_id === spaceId) this.db.imageProviderProfiles.delete(String(profileId));
     }
     return { success: true };
   }
@@ -1402,6 +1655,23 @@ function makeCredentialRecord(overrides: Partial<CredentialRecord> = {}): Creden
     prompt_api_key_hint: "prompt-test",
     prompt_last_test_ok: 1,
     prompt_last_tested_at: "2026-05-15T00:00:00.000Z",
+    created_at: "2026-05-15T00:00:00.000Z",
+    updated_at: "2026-05-15T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function makeImageProviderProfileRecord(overrides: Partial<ImageProviderProfileRecord> = {}): ImageProviderProfileRecord {
+  return {
+    id: "profile_1",
+    space_id: "space_1",
+    name: "默认配置",
+    base_url: "https://token.fourj.space/v1",
+    model: "gpt-image-2",
+    encrypted_api_key: "encrypted",
+    api_key_hint: "test",
+    last_test_ok: 1,
+    last_tested_at: "2026-05-15T00:00:00.000Z",
     created_at: "2026-05-15T00:00:00.000Z",
     updated_at: "2026-05-15T00:00:00.000Z",
     ...overrides,

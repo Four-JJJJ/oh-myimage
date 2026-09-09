@@ -16,7 +16,7 @@
 
 默认真相源：
 
-- 远端机器：`ssh token-new`
+- 远端机器：`ssh token-US`
 - 远端主机：`204.44.101.202`
 - 用户验收地址：`https://dev-gen.fourj.space/`
 
@@ -103,17 +103,17 @@ tar -czf oh-myimage-dev-release.tar.gz \
 远端准备目录并上传：
 
 ```bash
-ssh token-new "mkdir -p /opt/oh-myimage-dev/releases/<release-name>"
-scp oh-myimage-dev-release.tar.gz token-new:/opt/oh-myimage-dev/releases/<release-name>/
-ssh token-new "cd /opt/oh-myimage-dev/releases/<release-name> && tar -xzf oh-myimage-dev-release.tar.gz && rm -f oh-myimage-dev-release.tar.gz"
+ssh token-US "mkdir -p /opt/oh-myimage-dev/releases/<release-name>"
+scp oh-myimage-dev-release.tar.gz token-US:/opt/oh-myimage-dev/releases/<release-name>/
+ssh token-US "cd /opt/oh-myimage-dev/releases/<release-name> && tar -xzf oh-myimage-dev-release.tar.gz && rm -f oh-myimage-dev-release.tar.gz"
 ```
 
 切换、迁移、重启：
 
 ```bash
-ssh token-new "ln -sfn /opt/oh-myimage-dev/releases/<release-name> /opt/oh-myimage-dev/current"
-ssh token-new "cd /opt/oh-myimage-dev/current && docker compose -p oh-myimage-dev --env-file /etc/oh-myimage-dev/oh-myimage-dev.env -f deploy/docker-compose.oh-myimage-dev.yml run --rm oh-myimage-dev-api npm run db:migrate:postgres"
-ssh token-new "cd /opt/oh-myimage-dev/current && docker compose -p oh-myimage-dev --env-file /etc/oh-myimage-dev/oh-myimage-dev.env -f deploy/docker-compose.oh-myimage-dev.yml up -d --force-recreate oh-myimage-dev-api oh-myimage-dev-worker"
+ssh token-US "ln -sfn /opt/oh-myimage-dev/releases/<release-name> /opt/oh-myimage-dev/current"
+ssh token-US "cd /opt/oh-myimage-dev/current && docker compose -p oh-myimage-dev --env-file /etc/oh-myimage-dev/oh-myimage-dev.env -f deploy/docker-compose.oh-myimage-dev.yml run --rm oh-myimage-dev-api npm run db:migrate:postgres"
+ssh token-US "cd /opt/oh-myimage-dev/current && docker compose -p oh-myimage-dev --env-file /etc/oh-myimage-dev/oh-myimage-dev.env -f deploy/docker-compose.oh-myimage-dev.yml up -d --force-recreate oh-myimage-dev-api oh-myimage-dev-worker"
 ```
 
 线上校验：
@@ -121,8 +121,8 @@ ssh token-new "cd /opt/oh-myimage-dev/current && docker compose -p oh-myimage-de
 ```bash
 curl -s https://dev-gen.fourj.space/ | grep -o 'assets/index-[^\" ]*\.js' | head -n 1
 curl -s https://dev-gen.fourj.space/api/config
-ssh token-new "readlink -f /opt/oh-myimage-dev/current"
-ssh token-new "docker ps --format 'table {{.Names}}\t{{.Status}}' | grep oh-myimage-dev"
+ssh token-US "readlink -f /opt/oh-myimage-dev/current"
+ssh token-US "docker ps --format 'table {{.Names}}\t{{.Status}}' | grep oh-myimage-dev"
 ```
 
 ## 交付要求

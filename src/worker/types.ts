@@ -62,8 +62,6 @@ export interface Env {
   DEFAULT_IMAGE_MODEL?: string;
   PROMPT_OPTIMIZER_MODEL?: string;
   MAX_IMAGES_PER_REQUEST?: string;
-  MAX_DAILY_IMAGES_PER_SPACE?: string;
-  MAX_DAILY_JOBS_PER_SPACE?: string;
   MAX_RUNNING_JOBS_PER_SPACE?: string;
   REQUEST_TIMEOUT_MS?: string;
   GENERATION_JOB_MAX_RUNTIME_MS?: string;
@@ -124,6 +122,21 @@ export interface CredentialRecord {
   prompt_api_key_hint: string | null;
   prompt_last_test_ok: number;
   prompt_last_tested_at: string | null;
+  active_image_provider_id?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ImageProviderProfileRecord {
+  id: string;
+  space_id: string;
+  name: string;
+  base_url: string;
+  model: string;
+  encrypted_api_key: string;
+  api_key_hint: string;
+  last_test_ok: number;
+  last_tested_at: string | null;
   created_at: string;
   updated_at: string;
 }

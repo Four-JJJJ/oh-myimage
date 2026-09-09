@@ -74,8 +74,9 @@ const MAX_PROVIDER_TIMEOUT_RETRY_ATTEMPTS = 4;
 const IMMEDIATE_PROVIDER_TIMEOUT_RETRY_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_PROVIDER_IMAGE_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_PROVIDER_IMAGE_REDIRECTS = 3;
-const PROVIDER_IMAGE_DOWNLOAD_RETRY_DELAYS_MS = [1_000, 3_000] as const;
+const PROVIDER_IMAGE_DOWNLOAD_RETRY_DELAYS_MS = [1_000, 3_000, 8_000, 20_000] as const;
 const PROVIDER_IMAGE_DOWNLOAD_ATTEMPT_TIMEOUT_MS = 60_000;
+const PROVIDER_IMAGE_DOWNLOAD_USER_AGENT = "oh-myimage/1.0";
 const IMAGE_STORAGE_RETRY_DELAYS_MS = [1_000, 3_000] as const;
 const GENERATED_THUMBNAIL_MAX_EDGE_PX = 512;
 const GENERATED_THUMBNAIL_WEBP_QUALITY = 78;
@@ -158,6 +159,11 @@ export function resolveProviderTimeoutRetryAttempts(value: string | undefined): 
 export function resolveProviderTimeoutRetryDelayMs(attempt: number): number {
   const index = Math.max(0, Math.trunc(attempt));
   return PROVIDER_TIMEOUT_RETRY_DELAYS_MS[index] ?? PROVIDER_TIMEOUT_RETRY_DELAYS_MS[PROVIDER_TIMEOUT_RETRY_DELAYS_MS.length - 1];
+}
+
+export function resolvePostCheckpointImageTimeoutMs(remainingRuntimeMs: number, timeoutMs: number): number {
+  const floorMs = Math.min(Math.max(Math.trunc(timeoutMs), 1_000), PROVIDER_IMAGE_DOWNLOAD_ATTEMPT_TIMEOUT_MS);
+  return Math.max(Math.trunc(remainingRuntimeMs), floorMs);
 }
 
 export function generationJobDeadlineMs(
@@ -337,13 +343,6 @@ async function requestGeneration(
   const tasks = Array.from({ length: remainingCount }, (_, index) => async () => {
     const resultIndex = availableIndexes[index] ?? existingImages.length + index;
     const startedAt = new Date().toISOString();
-    const remainingJobRuntimeMs = jobDeadline - Date.now();
-    if (remainingJobRuntimeMs < 1000) {
-      throw new ProviderError(
-        "generation_runtime_exceeded",
-        "生成任务已达到本次处理的最长运行时间，未完成的图片已停止等待。请稍后重试或减少单次生成数量。",
-      );
-    }
     await upsertGenerationJobResult(env.DB, {
       id: generationResultId(job.id, resultIndex),
       space_id: job.space_id,
@@ -366,7 +365,7 @@ async function requestGeneration(
         job,
         credential,
         apiKey,
-        Math.min(timeoutMs, remainingJobRuntimeMs),
+        Math.min(timeoutMs, Math.max(jobDeadline - Date.now(), PROVIDER_IMAGE_DOWNLOAD_ATTEMPT_TIMEOUT_MS)),
         env,
         resultIndex,
         jobDeadline,
@@ -457,21 +456,23 @@ async function generateAndStoreOneImage(
     await persistProviderResultCheckpoint(job, resultIndex, checkpoint, env);
   }
 
-  const remainingRuntimeMs = jobDeadlineMs - Date.now();
-  if (remainingRuntimeMs < 1_000) {
+  const downloadTimeoutMs = resolvePostCheckpointImageTimeoutMs(jobDeadlineMs - Date.now(), timeoutMs);
+  if (downloadTimeoutMs < 1_000) {
     throw new ProviderError(
       "generation_runtime_exceeded",
-      "模型已返回结果，但任务已达到最长运行时间，未继续下载。为避免重复扣费，系统不会自动重新提交生图。",
+      "模型已返回结果，但任务已达到最长运行时间，未继续下载。系统只会恢复这份已接收结果，不会重新提交生图。",
+      true,
+      "post_processing",
     );
   }
   const binary = await resolveProviderImageBinary(
     checkpoint.image,
     job.output_format,
-    Math.min(timeoutMs, remainingRuntimeMs),
+    downloadTimeoutMs,
     { providerBaseURL: credential.base_url, apiKey },
   );
   const id = imageIdForResult(job.id, resultIndex);
-  await persistGeneratedImage(job, env, id, resultIndex, binary.bytes, binary.mimeType, binary.format, jobDeadlineMs);
+  await persistGeneratedImage(job, env, id, resultIndex, binary.bytes, binary.mimeType, binary.format, Date.now() + downloadTimeoutMs);
   await deleteProviderResultCheckpointBestEffort(job, resultIndex, env);
 
   return {
@@ -566,8 +567,16 @@ export async function resolveProviderImageBinary(
             );
       lastError = providerError;
       if (!shouldRetryProviderImageDownload(providerError) || attempt === PROVIDER_IMAGE_DOWNLOAD_RETRY_DELAYS_MS.length) {
+        console.warn(
+          "provider image download failed",
+          JSON.stringify({ host: initialUrl.host, attempt: attempt + 1, code: providerError.code }),
+        );
         throw asPostProcessingError(providerError);
       }
+      console.warn(
+        "provider image download retrying",
+        JSON.stringify({ host: initialUrl.host, attempt: attempt + 1, code: providerError.code }),
+      );
     }
   }
 
@@ -596,7 +605,10 @@ async function downloadProviderImageOnce(
     }
 
     const contentType = normalizeProviderContentType(response.headers.get("content-type"));
-    if (contentType && !formatFromMimeType(contentType)) {
+    if (isTransientProviderImageContentType(contentType)) {
+      throw new ProviderError("provider_image_download_failed", "模型已返回图片链接，但响应还不是图片。", true);
+    }
+    if (!isAcceptedProviderImageContentType(contentType)) {
       throw new ProviderError("provider_image_download_invalid_content_type", "模型已返回图片链接，但响应不是支持的图片格式。");
     }
     const declaredLength = contentLength(response.headers.get("content-length"));
@@ -666,12 +678,14 @@ async function fetchProviderImageUrl(
       signal,
       headers: {
         Accept: "image/*",
+        "User-Agent": PROVIDER_IMAGE_DOWNLOAD_USER_AGENT,
         ...(authorization ? { Authorization: authorization } : {}),
       },
     });
     if (!isRedirectStatus(response.status)) return { response, finalUrl: currentUrl };
 
     const location = response.headers.get("location");
+    await response.body?.cancel().catch(() => {});
     if (!location) return { response, finalUrl: currentUrl };
     currentUrl = validateProviderImageUrl(new URL(location, currentUrl).toString());
   }
@@ -1507,7 +1521,7 @@ async function loadMaskImageBlob(job: GenerationJobRecord, env: Env): Promise<{ 
 
 function isImageOnlyModel(model: string): boolean {
   const normalized = model.toLowerCase();
-  return normalized === "image-2" || normalized.startsWith("gpt-image") || normalized.startsWith("dall-e");
+  return normalized.startsWith("image-") || normalized.startsWith("gpt-image") || normalized.startsWith("dall-e");
 }
 
 function formatDuration(ms: number): string {
@@ -1549,6 +1563,29 @@ function formatFromMimeType(contentType: string | null): string | null {
   if (contentType === "image/webp") return "webp";
   if (contentType === "image/jpeg") return "jpeg";
   return null;
+}
+
+function isTransientProviderImageContentType(contentType: string | null): boolean {
+  return (
+    contentType === "text/html" ||
+    contentType === "application/json" ||
+    contentType === "application/xml" ||
+    contentType === "text/xml" ||
+    contentType === "text/javascript" ||
+    contentType === "application/javascript"
+  );
+}
+
+function isAcceptedProviderImageContentType(contentType: string | null): boolean {
+  if (!contentType || formatFromMimeType(contentType)) return true;
+  return (
+    contentType === "application/octet-stream" ||
+    contentType === "binary/octet-stream" ||
+    contentType === "application/binary" ||
+    contentType === "application/force-download" ||
+    contentType === "application/download" ||
+    contentType === "text/plain"
+  );
 }
 
 function formatFromImageUrl(rawUrl: string): string | null {

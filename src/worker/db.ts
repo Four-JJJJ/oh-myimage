@@ -6,6 +6,7 @@ import {
   GenerationJobRecord,
   GenerationReferenceImageSnapshot,
   ImageAssetRecord,
+  ImageProviderProfileRecord,
   JobStage,
   JobStatus,
   SessionRecord,
@@ -154,6 +155,89 @@ export async function upsertCredential(
 
 export async function getCredential(db: AppDatabase, spaceId: string): Promise<CredentialRecord | null> {
   return db.prepare("SELECT * FROM api_credentials WHERE space_id = ?").bind(spaceId).first<CredentialRecord>();
+}
+
+export async function listImageProviderProfiles(db: AppDatabase, spaceId: string): Promise<ImageProviderProfileRecord[]> {
+  const result = await db
+    .prepare("SELECT * FROM image_provider_profiles WHERE space_id = ? ORDER BY created_at ASC, id ASC")
+    .bind(spaceId)
+    .all<ImageProviderProfileRecord>();
+  return result.results ?? [];
+}
+
+export async function getImageProviderProfile(
+  db: AppDatabase,
+  spaceId: string,
+  profileId: string,
+): Promise<ImageProviderProfileRecord | null> {
+  return db
+    .prepare("SELECT * FROM image_provider_profiles WHERE id = ? AND space_id = ?")
+    .bind(profileId, spaceId)
+    .first<ImageProviderProfileRecord>();
+}
+
+export async function createImageProviderProfile(
+  db: AppDatabase,
+  input: Omit<ImageProviderProfileRecord, "created_at" | "updated_at">,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO image_provider_profiles (
+        id, space_id, name, base_url, model, encrypted_api_key, api_key_hint, last_test_ok, last_tested_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      input.id,
+      input.space_id,
+      input.name,
+      input.base_url,
+      input.model,
+      input.encrypted_api_key,
+      input.api_key_hint,
+      input.last_test_ok,
+      input.last_tested_at,
+    )
+    .run();
+}
+
+export async function updateImageProviderProfile(
+  db: AppDatabase,
+  spaceId: string,
+  profileId: string,
+  input: Pick<ImageProviderProfileRecord, "name" | "base_url" | "model" | "encrypted_api_key" | "api_key_hint">,
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE image_provider_profiles
+       SET name = ?, base_url = ?, model = ?, encrypted_api_key = ?, api_key_hint = ?,
+           last_test_ok = 0, last_tested_at = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND space_id = ?`,
+    )
+    .bind(input.name, input.base_url, input.model, input.encrypted_api_key, input.api_key_hint, profileId, spaceId)
+    .run();
+}
+
+export async function activateImageProviderProfile(db: AppDatabase, spaceId: string, profileId: string): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE api_credentials
+       SET base_url = (SELECT base_url FROM image_provider_profiles WHERE id = ? AND space_id = ?),
+           model = (SELECT model FROM image_provider_profiles WHERE id = ? AND space_id = ?),
+           encrypted_api_key = (SELECT encrypted_api_key FROM image_provider_profiles WHERE id = ? AND space_id = ?),
+           api_key_hint = (SELECT api_key_hint FROM image_provider_profiles WHERE id = ? AND space_id = ?),
+           active_image_provider_id = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE space_id = ?
+         AND EXISTS (SELECT 1 FROM image_provider_profiles WHERE id = ? AND space_id = ?)`,
+    )
+    .bind(profileId, spaceId, profileId, spaceId, profileId, spaceId, profileId, spaceId, profileId, spaceId)
+    .run();
+}
+
+export async function deleteImageProviderProfile(db: AppDatabase, spaceId: string, profileId: string): Promise<void> {
+  await db
+    .prepare("DELETE FROM image_provider_profiles WHERE id = ? AND space_id = ?")
+    .bind(profileId, spaceId)
+    .run();
 }
 
 export async function deleteCredential(db: AppDatabase, spaceId: string): Promise<void> {

@@ -20,6 +20,7 @@ import {
   resolveProviderImageConcurrency,
   resolveProviderTimeoutRetryDelayMs,
   resolveProviderTimeoutRetryAttempts,
+  resolvePostCheckpointImageTimeoutMs,
   resolveImageBackground,
   resolveResponsesModel,
   recoverStoredImageForResult,
@@ -84,6 +85,13 @@ describe("provider generation batching", () => {
     expect(generationJobDeadlineMs({ started_at: null }, 14 * 60 * 1000, laterDelivery)).toBe(
       laterDelivery + 14 * 60 * 1000,
     );
+  });
+
+  it("keeps a download budget after the job runtime is exhausted", () => {
+    expect(resolvePostCheckpointImageTimeoutMs(240_000, 600_000)).toBe(240_000);
+    expect(resolvePostCheckpointImageTimeoutMs(500, 600_000)).toBe(60_000);
+    expect(resolvePostCheckpointImageTimeoutMs(-120_000, 600_000)).toBe(60_000);
+    expect(resolvePostCheckpointImageTimeoutMs(-120_000, 10_000)).toBe(10_000);
   });
 });
 
@@ -393,6 +401,33 @@ describe("provider image result compatibility", () => {
     expect(result.bytes).toEqual(bytes);
     expect(result.format).toBe("png");
     expect(result.mimeType).toBe("image/png");
+    expect(fetch).toHaveBeenCalledWith(
+      "https://img.sulmes.com/images/example.png",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Accept: "image/*",
+          "User-Agent": "oh-myimage/1.0",
+        }),
+      }),
+    );
+  });
+
+  it("accepts generic binary content types and keeps the image file signature", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(PNG_SIGNATURE, {
+          status: 200,
+          headers: { "Content-Type": "application/octet-stream" },
+        }),
+      ),
+    );
+
+    const result = await resolveProviderImageBinary({ url: "https://img.example.com/final.bin" }, "jpeg", 10_000);
+
+    expect(result.bytes).toEqual(PNG_SIGNATURE);
+    expect(result.format).toBe("png");
+    expect(result.mimeType).toBe("image/png");
   });
 
   it("retries a transient URL download failure and stores the returned image", async () => {
@@ -499,7 +534,7 @@ describe("provider image result compatibility", () => {
           });
         }
         imageDownloads += 1;
-        if (imageDownloads <= 3) {
+        if (imageDownloads <= 5) {
           return new Response("temporarily unavailable", { status: 503, headers: { "Content-Type": "text/plain" } });
         }
         return new Response(PNG_SIGNATURE, { status: 200, headers: { "Content-Type": "image/png" } });
@@ -538,8 +573,58 @@ describe("provider image result compatibility", () => {
     );
 
     expect(providerPosts).toBe(1);
-    expect(imageDownloads).toBe(4);
+    expect(imageDownloads).toBe(6);
     expect(db.results).toEqual([expect.objectContaining({ result_index: 0, status: "succeeded", error_code: null })]);
+    expect(images.objects.has("space_1/job_1/img_job_1_0.png")).toBe(true);
+    expect(images.objects.has(checkpointKey)).toBe(false);
+    expect(db.completedJob).toMatchObject({ status: "succeeded", errorCode: null });
+  });
+
+  it("downloads a checkpointed provider URL after the job runtime budget is exhausted", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-02T11:20:00.000Z"));
+    const encryptionKey = "test-encryption-key-123";
+    const job = makeJob({ started_at: "2026-08-02 11:00:00" });
+    const db = new GenerationFlowDatabase(job, await encryptSecret("test-key", encryptionKey));
+    const images = new WritableMemoryObjectStore();
+    const checkpointKey = providerResultCheckpointStorageKey(job, 0);
+    await images.put(
+      checkpointKey,
+      JSON.stringify({
+        version: 1,
+        acceptedAt: "2026-08-02T11:13:00.000Z",
+        image: { url: "https://img.example.com/final.png" },
+        revisedPrompt: null,
+      }),
+    );
+    let providerPosts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          providerPosts += 1;
+          throw new Error("should not submit generation again");
+        }
+        return new Response(PNG_SIGNATURE, {
+          status: 200,
+          headers: { "Content-Type": "application/octet-stream" },
+        });
+      }),
+    );
+
+    await processGenerationMessage(
+      { jobId: "job_1", spaceId: "space_1" },
+      {
+        APP_ENCRYPTION_KEY: encryptionKey,
+        DB: db,
+        IMAGES: images,
+        REQUEST_TIMEOUT_MS: "10000",
+        GENERATION_JOB_MAX_RUNTIME_MS: "840000",
+      } as never,
+      { retryPostProcessingErrors: true },
+    );
+
+    expect(providerPosts).toBe(0);
     expect(images.objects.has("space_1/job_1/img_job_1_0.png")).toBe(true);
     expect(images.objects.has(checkpointKey)).toBe(false);
     expect(db.completedJob).toMatchObject({ status: "succeeded", errorCode: null });
@@ -583,7 +668,8 @@ describe("provider image result compatibility", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("rejects provider image downloads with non-image content types", async () => {
+  it("retries html error pages returned instead of the generated image", async () => {
+    vi.useFakeTimers();
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -594,7 +680,30 @@ describe("provider image result compatibility", () => {
       ),
     );
 
-    await expect(resolveProviderImageBinary({ url: "https://img.example.com/final.png" }, "png", 10_000)).rejects.toMatchObject({
+    const resultPromise = resolveProviderImageBinary({ url: "https://img.example.com/final.png" }, "png", 10_000);
+    const rejection = expect(resultPromise).rejects.toMatchObject({
+      code: "provider_image_download_failed",
+      retryable: true,
+      retryScope: "post_processing",
+    });
+    await vi.runAllTimersAsync();
+    await rejection;
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("rejects unsupported image content types without retrying", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response("GIF89a", {
+          status: 200,
+          headers: { "Content-Type": "image/gif" },
+        }),
+      ),
+    );
+
+    await expect(resolveProviderImageBinary({ url: "https://img.example.com/final.gif" }, "png", 10_000)).rejects.toMatchObject({
       code: "provider_image_download_invalid_content_type",
     });
     expect(fetch).toHaveBeenCalledTimes(1);
@@ -778,6 +887,8 @@ describe("prompt optimizer provider helpers", () => {
 
   it("maps image-only models to a Responses-capable model", () => {
     expect(resolveResponsesModel("image-2", "gpt-5.5")).toBe("gpt-5.5");
+    expect(resolveResponsesModel("gpt-image-2.5-flare", "gpt-5.5")).toBe("gpt-5.5");
+    expect(resolveResponsesModel("gpt-image-2.5-sunburst", "gpt-5.5")).toBe("gpt-5.5");
     expect(resolveResponsesModel("gpt-image-2", "gpt-5.5")).toBe("gpt-5.5");
     expect(resolveResponsesModel("gpt-image-2", "gpt-image-1")).toBe("gpt-5.5");
     expect(resolveResponsesModel("gpt-5.4-mini", "gpt-5.5")).toBe("gpt-5.4-mini");

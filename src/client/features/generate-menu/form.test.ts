@@ -34,6 +34,7 @@ import {
   shouldDismissImagePreviewAfterAction,
   shouldPollGeneration,
   shouldShowComposerOptimizeBeam,
+  resolveComposerPopupPlacement,
   updateGenerateForm,
   buildFlowChips,
 } from "./GenerateMenuView";
@@ -43,7 +44,7 @@ const source = readFileSync(fileURLToPath(new URL("./GenerateMenuView.tsx", impo
 
 const baseForm = {
   prompt: "",
-  model: "gpt-image-2",
+  model: "gpt-image-2.5-flare",
   aspectRatio: "16:9",
   resolution: "1K",
   width: 1536,
@@ -55,6 +56,12 @@ const baseForm = {
 };
 
 describe("generate menu form helpers", () => {
+  it("opens the model menu toward the side with enough viewport space", () => {
+    expect(resolveComposerPopupPlacement({ top: 120, bottom: 152 }, 120, 800)).toBe("below");
+    expect(resolveComposerPopupPlacement({ top: 680, bottom: 712 }, 120, 800)).toBe("above");
+    expect(resolveComposerPopupPlacement({ top: 400, bottom: 432 }, 500, 800)).toBe("above");
+  });
+
   it("shows successful and failed image counts separately for terminal jobs", () => {
     const chips = buildFlowChips({
       id: "job_1",
@@ -312,6 +319,7 @@ describe("generate menu form helpers", () => {
 
     expect(JSON.parse(body as string)).toMatchObject({
       prompt: "继续补充细节",
+      model: "gpt-image-2.5-flare",
       conversationId: "job_root",
     });
   });

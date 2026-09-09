@@ -2,6 +2,7 @@ import "dotenv/config";
 import { createPostgresDatabase, PostgresD1Database } from "./postgres-d1";
 import { createBullQueues, BullQueues } from "./queue";
 import { createR2Store } from "./r2-store";
+import { DEFAULT_IMAGE_MODEL } from "../image-models";
 import { envNumber } from "../worker/http";
 import type { Env } from "../worker/types";
 
@@ -37,11 +38,9 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions = {}): NodeR
     TURNSTILE_SECRET_KEY: process.env.TURNSTILE_SECRET_KEY ?? "",
     TURNSTILE_SITE_KEY: process.env.TURNSTILE_SITE_KEY ?? "",
     TURNSTILE_REQUIRED: process.env.TURNSTILE_REQUIRED ?? "false",
-    DEFAULT_IMAGE_MODEL: process.env.DEFAULT_IMAGE_MODEL ?? "gpt-image-2",
+    DEFAULT_IMAGE_MODEL: process.env.DEFAULT_IMAGE_MODEL ?? DEFAULT_IMAGE_MODEL,
     PROMPT_OPTIMIZER_MODEL: process.env.PROMPT_OPTIMIZER_MODEL ?? "gpt-5.5",
     MAX_IMAGES_PER_REQUEST: process.env.MAX_IMAGES_PER_REQUEST ?? "4",
-    MAX_DAILY_IMAGES_PER_SPACE: process.env.MAX_DAILY_IMAGES_PER_SPACE ?? process.env.MAX_DAILY_JOBS_PER_SPACE ?? "50",
-    MAX_DAILY_JOBS_PER_SPACE: process.env.MAX_DAILY_JOBS_PER_SPACE,
     MAX_RUNNING_JOBS_PER_SPACE: process.env.MAX_RUNNING_JOBS_PER_SPACE ?? "12",
     REQUEST_TIMEOUT_MS: process.env.REQUEST_TIMEOUT_MS ?? "600000",
     GENERATION_JOB_MAX_RUNTIME_MS: process.env.GENERATION_JOB_MAX_RUNTIME_MS ?? "840000",

@@ -35,7 +35,7 @@ import { Button } from "./components/ui/button";
 import { Calendar } from "./components/ui/calendar";
 import { Input, type InputProps } from "./components/ui/input";
 import { Popover, PopoverPopup, PopoverTrigger } from "./components/ui/popover";
-import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem, ProviderSettings, SettingsProviders } from "./api";
+import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem, ImageProviderProfile, ProviderSettings, SettingsProviders } from "./api";
 import { EntryField, EntryFormSection, EntryNoticeStack, EntryShell, EntryStatusScreen } from "./features/auth/EntryScreens";
 import { GenerateMenuView, HoverImageActionBar, ImagePreview, type HoverImageAction } from "./features/generate-menu/GenerateMenuView";
 import { AppShell } from "./features/generate-shell/AppShell";
@@ -45,6 +45,7 @@ import { CossBadge, CossButton, CossInput, CossSelect, CossSeparator } from "./f
 import { buildGalleryGroups, galleryHasHiddenDefaultRangeItems, normalizeGalleryDateFilter, type GalleryDateFilter } from "./gallery-utils";
 import { generationProgressSummary } from "./generation-progress";
 import { isTerminalGenerationJobStatus, mergePolledJobState } from "./generation-state";
+import { DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS, imageModelLabel } from "../image-models";
 import addIcon from "./assets/figma/add.svg";
 import figmaLogo from "./assets/figma/logo.png";
 import generationContinueIcon from "./assets/figma/generation-continue.svg";
@@ -63,9 +64,6 @@ type View = "generate" | "gallery" | "settings" | "inspiration";
 interface MeState {
   space: { id: string; name: string };
   providerConfigured: boolean;
-  dailyLimitExempt?: boolean;
-  dailyRemaining?: number;
-  dailyLimit?: number;
 }
 
 interface GalleryJumpTarget {
@@ -114,7 +112,6 @@ const FIGMA_RATIOS = ["16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "1:1"] as cons
 const RESOLUTIONS = ["1K", "2K", "4K"] as const;
 const QUALITY_OPTIONS = ["auto", "low", "medium", "high"] as const;
 const FORMAT_OPTIONS = ["png", "jpeg", "webp"] as const;
-const IMAGE_MODEL_OPTIONS = ["gpt-image-2"] as const;
 const PROMPT_OPTIMIZER_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4"] as const;
 const REFERENCE_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 const MAX_REFERENCE_IMAGES = 6;
@@ -191,10 +188,9 @@ const defaultForm: GenerateForm = {
 };
 
 const fallbackConfig: AppConfig = {
-  model: "gpt-image-2",
+  model: DEFAULT_IMAGE_MODEL,
   promptOptimizerModel: "gpt-5.5",
   maxImagesPerRequest: 4,
-  maxDailyImagesPerSpace: 50,
   generationTimeoutSeconds: 600,
   ratios: [...FIGMA_RATIOS],
   qualities: ["auto", "low", "medium", "high"],
@@ -256,14 +252,10 @@ export function App() {
       ok: true;
       space: MeState["space"];
       providerConfigured: boolean;
-      dailyRemaining?: number;
-      dailyLimit?: number;
     }>("/api/me");
     setMe({
       space: result.space,
       providerConfigured: result.providerConfigured,
-      dailyRemaining: result.dailyRemaining,
-      dailyLimit: result.dailyLimit,
     });
   }, []);
   const editImageFromGallery = useCallback((image: ImageItem, draft?: GenerateForm, mask?: ImageSelectionMask) => {
@@ -295,8 +287,6 @@ export function App() {
         ok: true;
         space: MeState["space"];
         providerConfigured: boolean;
-        dailyRemaining?: number;
-        dailyLimit?: number;
       }>("/api/me").catch(() => null),
     ]).then(([appConfig, user]) => {
       if (!mounted) return;
@@ -306,8 +296,6 @@ export function App() {
           ? {
               space: user.space,
               providerConfigured: user.providerConfigured,
-              dailyRemaining: user.dailyRemaining,
-              dailyLimit: user.dailyLimit,
             }
           : null,
       );
@@ -919,7 +907,7 @@ function GenerateView({
             <div className="grid size-6 shrink-0 place-items-center rounded-[6px] bg-white/10">
               <img src={openaiIcon} alt="" className="size-4" />
             </div>
-            <p className="min-w-0 flex-1 truncate text-xs font-semibold leading-none text-white">{config.model || "gpt-image-2"}</p>
+            <p className="min-w-0 flex-1 truncate text-xs font-semibold leading-none text-white">{imageModelLabel(config.model || DEFAULT_IMAGE_MODEL)}</p>
             {providerConfigured ? (
               <span className="shrink-0 text-xs leading-[18px] text-white/60">已配置</span>
             ) : (
@@ -1831,6 +1819,9 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
   const [imageApiKey, setImageApiKey] = useState("");
   const [imageApiKeyHint, setImageApiKeyHint] = useState("");
   const [imageModel, setImageModel] = useState(optionOrFallback(config.model, IMAGE_MODEL_OPTIONS));
+  const [imageProviderName, setImageProviderName] = useState("默认配置");
+  const [imageProviders, setImageProviders] = useState<ImageProviderProfile[]>([]);
+  const [activeImageProviderId, setActiveImageProviderId] = useState<string | null>(null);
   const [promptBaseURL, setPromptBaseURL] = useState("");
   const [promptApiKey, setPromptApiKey] = useState("");
   const [promptApiKeyHint, setPromptApiKeyHint] = useState("");
@@ -1840,25 +1831,78 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
   const [savingKind, setSavingKind] = useState<"image" | "prompt" | null>(null);
   const [testingKind, setTestingKind] = useState<"image" | "prompt" | null>(null);
 
+  function applySettingsResult(result: SettingsProviders) {
+    const profiles = result.imageProviders ?? [];
+    const activeId = result.activeImageProviderId ?? profiles[0]?.id ?? null;
+    setImageProviders(profiles);
+    setActiveImageProviderId(activeId);
+    const activeProfile = profiles.find((profile) => profile.id === activeId);
+    setImageProviderName(activeProfile?.name ?? "默认配置");
+    if (result.imageProvider) {
+      setImageBaseURL(result.imageProvider.baseURL);
+      setImageApiKeyHint(result.imageProvider.apiKeyHint);
+      setImageModel(optionOrFallback(result.imageProvider.model, IMAGE_MODEL_OPTIONS));
+    }
+    if (result.promptProvider) {
+      setPromptBaseURL(result.promptProvider.baseURL);
+      setPromptApiKeyHint(result.promptProvider.apiKeyHint);
+      setPromptModel(optionOrFallback(result.promptProvider.model, PROMPT_OPTIMIZER_MODEL_OPTIONS));
+    }
+  }
+
   useEffect(() => {
     let mounted = true;
     api<{ ok: true } & SettingsProviders>("/api/settings/provider").then((result) => {
       if (!mounted) return;
-      if (result.imageProvider) {
-        setImageBaseURL(result.imageProvider.baseURL);
-        setImageApiKeyHint(result.imageProvider.apiKeyHint);
-        setImageModel(optionOrFallback(result.imageProvider.model, IMAGE_MODEL_OPTIONS));
-      }
-      if (result.promptProvider) {
-        setPromptBaseURL(result.promptProvider.baseURL);
-        setPromptApiKeyHint(result.promptProvider.apiKeyHint);
-        setPromptModel(optionOrFallback(result.promptProvider.model, PROMPT_OPTIMIZER_MODEL_OPTIONS));
-      }
+      applySettingsResult(result);
     });
     return () => {
       mounted = false;
     };
   }, []);
+
+  function startNewImageProvider() {
+    setActiveImageProviderId(null);
+    setImageProviderName("新配置");
+    setImageBaseURL("");
+    setImageApiKey("");
+    setImageApiKeyHint("");
+    setImageModel(IMAGE_MODEL_OPTIONS[1]);
+    setMessage("");
+    setError("");
+  }
+
+  async function selectImageProvider(providerId: string) {
+    setError("");
+    setMessage("");
+    try {
+      const result = await api<{ ok: true } & SettingsProviders>("/api/settings/provider/select", {
+        method: "POST",
+        body: JSON.stringify({ providerId }),
+      });
+      applySettingsResult(result);
+      setImageApiKey("");
+      setMessage("生图 Provider 已切换。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "切换失败。");
+    }
+  }
+
+  async function deleteImageProvider() {
+    if (!activeImageProviderId) return;
+    setError("");
+    setMessage("");
+    try {
+      const result = await api<{ ok: true } & SettingsProviders>(`/api/settings/provider/profiles/${encodeURIComponent(activeImageProviderId)}`, {
+        method: "DELETE",
+      });
+      applySettingsResult(result);
+      setImageApiKey("");
+      setMessage("生图 Provider 配置已删除。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除失败。");
+    }
+  }
 
   async function save(kind: "image" | "prompt") {
     setSavingKind(kind);
@@ -1871,6 +1915,8 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
           ...(kind === "image"
             ? {
                 imageProvider: {
+                  providerId: activeImageProviderId && activeImageProviderId !== "legacy" ? activeImageProviderId : null,
+                  name: imageProviderName.trim(),
                   baseURL: imageBaseURL.trim(),
                   ...(imageApiKey.trim() ? { apiKey: imageApiKey.trim() } : {}),
                   model: imageModel,
@@ -1885,12 +1931,7 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
               }),
         }),
       });
-      setImageApiKeyHint(result.imageProvider?.apiKeyHint ?? imageApiKeyHint);
-      setPromptApiKeyHint(result.promptProvider?.apiKeyHint ?? promptApiKeyHint);
-      setImageBaseURL(result.imageProvider?.baseURL ?? imageBaseURL.trim());
-      setPromptBaseURL(result.promptProvider?.baseURL ?? promptBaseURL.trim());
-      setImageModel(optionOrFallback(result.imageProvider?.model, IMAGE_MODEL_OPTIONS));
-      setPromptModel(optionOrFallback(result.promptProvider?.model, PROMPT_OPTIMIZER_MODEL_OPTIONS));
+      applySettingsResult(result);
       if (kind === "image") {
         setImageApiKey("");
       } else {
@@ -1947,6 +1988,14 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
             model={imageModel}
             modelOptions={IMAGE_MODEL_OPTIONS}
             modelLabel="生图模型"
+            modelOptionLabel={imageModelLabel}
+            providerProfiles={imageProviders}
+            activeProviderId={activeImageProviderId}
+            providerName={imageProviderName}
+            onProviderNameChange={setImageProviderName}
+            onProviderSelect={(value) => void selectImageProvider(value)}
+            onNewProvider={startNewImageProvider}
+            onDeleteProvider={() => void deleteImageProvider()}
             onBaseURLChange={setImageBaseURL}
             onApiKeyChange={setImageApiKey}
             onModelChange={(value) => setImageModel(optionOrFallback(value, IMAGE_MODEL_OPTIONS))}
@@ -1992,6 +2041,14 @@ function SettingsProviderSection({
   model,
   modelOptions,
   modelLabel,
+  modelOptionLabel,
+  providerProfiles,
+  activeProviderId,
+  providerName,
+  onProviderNameChange,
+  onProviderSelect,
+  onNewProvider,
+  onDeleteProvider,
   onBaseURLChange,
   onApiKeyChange,
   onModelChange,
@@ -2008,6 +2065,14 @@ function SettingsProviderSection({
   model: string;
   modelOptions: readonly string[];
   modelLabel: string;
+  modelOptionLabel?: (value: string) => string;
+  providerProfiles?: ImageProviderProfile[];
+  activeProviderId?: string | null;
+  providerName?: string;
+  onProviderNameChange?: (value: string) => void;
+  onProviderSelect?: (value: string) => void;
+  onNewProvider?: () => void;
+  onDeleteProvider?: () => void;
   onBaseURLChange: (value: string) => void;
   onApiKeyChange: (value: string) => void;
   onModelChange: (value: string) => void;
@@ -2030,6 +2095,35 @@ function SettingsProviderSection({
       <CossSeparator className="mb-5 bg-white/8" />
 
       <div className="flex flex-col gap-3">
+        {providerProfiles && onProviderSelect && onNewProvider && (
+          <div className="flex items-end gap-2">
+            <label className="flex min-w-0 flex-1 flex-col gap-2">
+              <span className="text-xs leading-none text-white/60">当前配置</span>
+              <CossSelect
+                value={activeProviderId ?? ""}
+                onChange={(event) => onProviderSelect(event.target.value)}
+                className="h-10 min-w-0 justify-start rounded-[12px] border-white/15 bg-transparent px-4 text-sm font-semibold text-white/90"
+              >
+                {providerProfiles.map((profile) => (
+                  <option key={profile.id} value={profile.id} className="bg-[#191919] text-white">
+                    {profile.name}
+                  </option>
+                ))}
+              </CossSelect>
+            </label>
+            <CossButton type="button" variant="outline" className="h-10 shrink-0 rounded-[12px] border-white/15 px-3 text-xs" onClick={onNewProvider}>
+              新增
+            </CossButton>
+            {providerProfiles.length > 1 && onDeleteProvider && (
+              <CossButton type="button" variant="outline" className="h-10 shrink-0 rounded-[12px] border-red-200/20 px-3 text-xs text-red-100/80 hover:bg-red-400/10" onClick={onDeleteProvider}>
+                删除
+              </CossButton>
+            )}
+          </div>
+        )}
+        {providerProfiles && onProviderNameChange && (
+          <SettingsTextField id={`${title}-name`} label="配置名称" value={providerName ?? ""} onChange={(event) => onProviderNameChange(event.target.value)} placeholder="例如：主 Provider" />
+        )}
         <SettingsTextField id={`${title}-base-url`} label="BaseURL" value={baseURL} onChange={(event) => onBaseURLChange(event.target.value)} placeholder="请输入 baseURL" />
         <SettingsTextField
           id={`${title}-api-key`}
@@ -2040,7 +2134,7 @@ function SettingsProviderSection({
           autoComplete="new-password"
           placeholder={apiKeyHint ? `已保存：${apiKeyHint}` : "请输入 API Key"}
         />
-        <SettingsSelectField label={modelLabel} value={model} values={modelOptions} onChange={onModelChange} />
+        <SettingsSelectField label={modelLabel} value={model} values={modelOptions} optionLabel={modelOptionLabel} onChange={onModelChange} />
       </div>
 
       <div className="mt-4 flex flex-wrap items-center gap-3">
@@ -2095,11 +2189,13 @@ function SettingsSelectField({
   label,
   value,
   values,
+  optionLabel,
   onChange,
 }: {
   label: string;
   value: string;
   values: readonly string[];
+  optionLabel?: (value: string) => string;
   onChange: (value: string) => void;
 }) {
   return (
@@ -2108,7 +2204,7 @@ function SettingsSelectField({
       <CossSelect value={value} onChange={(event) => onChange(event.target.value)} className="h-10 justify-start rounded-[12px] border-white/15 bg-transparent px-4 text-sm font-semibold text-white/90">
         {values.map((item) => (
           <option key={item} value={item} className="bg-[#191919] text-white">
-            {item}
+            {optionLabel?.(item) ?? item}
           </option>
         ))}
       </CossSelect>

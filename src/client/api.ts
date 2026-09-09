@@ -4,8 +4,6 @@ export interface AppConfig {
   models?: string[];
   promptOptimizerModel: string;
   maxImagesPerRequest: number;
-  maxDailyImagesPerSpace: number;
-  maxDailyJobsPerSpace?: number;
   generationTimeoutSeconds: number;
   ratios: string[];
   qualities: string[];
@@ -22,8 +20,15 @@ export interface ProviderSettings {
   lastTestedAt: string | null;
 }
 
+export interface ImageProviderProfile extends ProviderSettings {
+  id: string;
+  name: string;
+}
+
 export interface SettingsProviders {
   imageProvider: ProviderSettings | null;
+  imageProviders?: ImageProviderProfile[];
+  activeImageProviderId?: string | null;
   promptProvider: ProviderSettings | null;
 }
 

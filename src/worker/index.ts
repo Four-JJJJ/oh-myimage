@@ -1,9 +1,11 @@
 import { Hono } from "hono";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { cors } from "hono/cors";
+import { DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS } from "../image-models";
 import {
+  activateImageProviderProfile,
   countActiveJobs,
-  countDailyImageUsage,
+  createImageProviderProfile,
   createGenerationJob,
   deleteGenerationJob,
   createSession,
@@ -12,6 +14,7 @@ import {
   deleteSession,
   getCredential,
   getGenerationJob,
+  getImageProviderProfile,
   getImage,
   getSession,
   getSpaceByKey,
@@ -23,10 +26,13 @@ import {
   listImages,
   listImagesForJob,
   listImagesForJobs,
+  listImageProviderProfiles,
   markCredentialTested,
   StoredReferenceImage,
   updateJobStatus,
+  updateImageProviderProfile,
   upsertCredential,
+  deleteImageProviderProfile,
 } from "./db";
 import { apiKeyHint, decryptSecret, encryptSecret, hashPassword, makeSessionToken, sha256Hex, verifyPassword } from "./crypto";
 import { daysFromNow, envNumber, jsonError, randomId } from "./http";
@@ -50,7 +56,15 @@ import {
   recordInspirationUse,
   toggleInspirationFavorite,
 } from "./inspiration";
-import { AppBindings, CredentialRecord, Env, GenerationJobRecord, GenerationMessage, SpaceRecord } from "./types";
+import {
+  AppBindings,
+  CredentialRecord,
+  Env,
+  GenerationJobRecord,
+  GenerationMessage,
+  ImageProviderProfileRecord,
+  SpaceRecord,
+} from "./types";
 import { GenerationInput, parseGenerationInput, parsePromptOptimizationInput, RATIO_TO_SIZE } from "./validation";
 
 const SESSION_COOKIE = "image2_session";
@@ -64,7 +78,6 @@ const MAX_REFERENCE_IMAGES = 8;
 const MASK_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 const REFERENCE_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const MASK_IMAGE_MIME_TYPES = new Set(["image/png"]);
-const IMAGE_MODEL_OPTIONS = ["gpt-image-2"] as const;
 const PROMPT_OPTIMIZER_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4"] as const;
 const DEFAULT_PROVIDER_RETRY_ATTEMPTS = 0;
 const MAX_PROVIDER_RETRY_ATTEMPTS = 4;
@@ -251,23 +264,11 @@ function safeReferenceImageName(value: string, extension: string): string {
 }
 
 async function assertGenerationLimitsForRequest(env: Env, spaceId: string, requestedImages: number): Promise<void> {
-  const dailyLimit = dailyImageLimit(env);
   const runningLimit = envNumber(env.MAX_RUNNING_JOBS_PER_SPACE, 2);
-  const usage = await countDailyImageUsage(env.DB, spaceId);
-  if (usage.total + requestedImages > dailyLimit) {
-    const remaining = Math.max(0, dailyLimit - usage.total);
-    await insertRateLimitEvent(env.DB, spaceId, "daily_generation_limit");
-    throw jsonError(429, "daily_limit_reached", `今日剩余张数不足，还剩 ${remaining} 张，本次请求 ${requestedImages} 张。`);
-  }
   if ((await countActiveJobs(env.DB, spaceId)) >= runningLimit) {
     await insertRateLimitEvent(env.DB, spaceId, "active_generation_limit");
     throw jsonError(429, "active_limit_reached", `同时运行任务最多 ${runningLimit} 个。`);
   }
-}
-
-export function hasUnlimitedDailyImageQuota(credential: Pick<CredentialRecord, "base_url">): boolean {
-  void credential;
-  return false;
 }
 
 function hasImageProviderConfigured(credential: CredentialRecord | null): credential is CredentialRecord {
@@ -278,8 +279,50 @@ function hasPromptProviderConfigured(credential: CredentialRecord | null): crede
   return Boolean(credential?.prompt_base_url && credential.prompt_encrypted_api_key);
 }
 
-function dailyImageLimit(env: Env): number {
-  return Math.max(0, Math.trunc(envNumber(env.MAX_DAILY_IMAGES_PER_SPACE ?? env.MAX_DAILY_JOBS_PER_SPACE, 50)));
+function publicImageProviderProfile(profile: ImageProviderProfileRecord) {
+  return {
+    id: profile.id,
+    name: profile.name,
+    baseURL: profile.base_url,
+    model: optionOrFallback(profile.model, IMAGE_MODEL_OPTIONS),
+    apiKeyHint: profile.api_key_hint,
+    lastTestOk: Boolean(profile.last_test_ok),
+    lastTestedAt: profile.last_tested_at,
+  };
+}
+
+async function settingsProviderResponse(env: Env, spaceId: string) {
+  const credential = await getCredential(env.DB, spaceId);
+  const profiles = await listImageProviderProfiles(env.DB, spaceId);
+  const imageProvider = hasImageProviderConfigured(credential)
+    ? {
+        baseURL: credential.base_url,
+        model: optionOrFallback(credential.model, IMAGE_MODEL_OPTIONS),
+        apiKeyHint: credential.api_key_hint,
+        lastTestOk: Boolean(credential.last_test_ok),
+        lastTestedAt: credential.last_tested_at,
+      }
+    : null;
+  const visibleProfiles = profiles.length > 0
+    ? profiles.map(publicImageProviderProfile)
+    : imageProvider
+      ? [{ id: credential?.active_image_provider_id ?? "legacy", name: "默认配置", ...imageProvider }]
+      : [];
+  return {
+    ok: true as const,
+    imageProvider,
+    imageProviders: visibleProfiles,
+    activeImageProviderId: credential?.active_image_provider_id ?? visibleProfiles[0]?.id ?? null,
+    promptProvider: hasPromptProviderConfigured(credential)
+      ? {
+          baseURL: credential.prompt_base_url ?? "",
+          model: optionOrFallback(credential.prompt_optimizer_model ?? env.PROMPT_OPTIMIZER_MODEL, PROMPT_OPTIMIZER_MODEL_OPTIONS),
+          apiKeyHint: credential.prompt_api_key_hint ?? "",
+          lastTestOk: Boolean(credential.prompt_last_test_ok),
+          lastTestedAt: credential.prompt_last_tested_at,
+        }
+      : null,
+  };
 }
 
 function generationInputFromJob(job: GenerationJobRecord): GenerationInput {
@@ -443,15 +486,13 @@ async function cloneMaskImage(
 }
 
 app.get("/api/config", (c) => {
-  const maxDailyImagesPerSpace = dailyImageLimit(c.env);
   return c.json({
     ok: true,
     config: {
-      model: optionOrFallback(c.env.DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS),
+      model: optionOrFallback(c.env.DEFAULT_IMAGE_MODEL ?? DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS),
+      modelOptions: [...IMAGE_MODEL_OPTIONS],
       promptOptimizerModel: optionOrFallback(c.env.PROMPT_OPTIMIZER_MODEL, PROMPT_OPTIMIZER_MODEL_OPTIONS),
       maxImagesPerRequest: envNumber(c.env.MAX_IMAGES_PER_REQUEST, 4),
-      maxDailyImagesPerSpace,
-      maxDailyJobsPerSpace: maxDailyImagesPerSpace,
       generationTimeoutSeconds: Math.round(resolveGenerationTimeoutMs(c.env.REQUEST_TIMEOUT_MS) / 1000),
       ratios: [...Object.keys(RATIO_TO_SIZE), "custom"],
       qualities: ["auto", "low", "medium", "high"],
@@ -530,45 +571,16 @@ app.use("/api/*", async (c, next) => {
 
 app.get("/api/me", async (c) => {
   const space = c.get("space");
-  const dailyLimit = dailyImageLimit(c.env);
-  const [credential, usage] = await Promise.all([
-    getCredential(c.env.DB, space.id),
-    countDailyImageUsage(c.env.DB, space.id),
-  ]);
+  const credential = await getCredential(c.env.DB, space.id);
   return c.json({
     ok: true,
     space: { id: space.id, name: space.space_name },
     providerConfigured: hasImageProviderConfigured(credential),
-    dailyRemaining: Math.max(0, dailyLimit - usage.total),
-    dailyLimit,
-    dailyUsed: usage.generated,
-    dailyPending: usage.pending,
   });
 });
 
 app.get("/api/settings/provider", async (c) => {
-  const credential = await getCredential(c.env.DB, c.get("space").id);
-  return c.json({
-    ok: true,
-    imageProvider: hasImageProviderConfigured(credential)
-      ? {
-          baseURL: credential.base_url,
-          model: optionOrFallback(credential.model, IMAGE_MODEL_OPTIONS),
-          apiKeyHint: credential.api_key_hint,
-          lastTestOk: Boolean(credential.last_test_ok),
-          lastTestedAt: credential.last_tested_at,
-        }
-      : null,
-    promptProvider: hasPromptProviderConfigured(credential)
-      ? {
-          baseURL: credential.prompt_base_url ?? "",
-          model: optionOrFallback(credential.prompt_optimizer_model ?? c.env.PROMPT_OPTIMIZER_MODEL, PROMPT_OPTIMIZER_MODEL_OPTIONS),
-          apiKeyHint: credential.prompt_api_key_hint ?? "",
-          lastTestOk: Boolean(credential.prompt_last_test_ok),
-          lastTestedAt: credential.prompt_last_tested_at,
-        }
-      : null,
-  });
+  return c.json(await settingsProviderResponse(c.env, c.get("space").id));
 });
 
 app.post("/api/settings/provider", async (c) => {
@@ -581,6 +593,17 @@ app.post("/api/settings/provider", async (c) => {
   const existingCredential = await getCredential(c.env.DB, c.get("space").id);
   const imageInput = imageProvider && typeof imageProvider === "object" ? (imageProvider as Record<string, unknown>) : null;
   const promptInput = promptProvider && typeof promptProvider === "object" ? (promptProvider as Record<string, unknown>) : null;
+  const spaceId = c.get("space").id;
+  const hasImageProfileSelection = Boolean(imageInput && Object.prototype.hasOwnProperty.call(imageInput, "providerId"));
+  const requestedImageProfileId = imageInput && typeof imageInput.providerId === "string" ? imageInput.providerId.trim() : "";
+  const activeImageProfile = existingCredential?.active_image_provider_id
+    ? await getImageProviderProfile(c.env.DB, spaceId, existingCredential.active_image_provider_id)
+    : null;
+  const requestedImageProfile = requestedImageProfileId
+    ? await getImageProviderProfile(c.env.DB, spaceId, requestedImageProfileId)
+    : null;
+  if (requestedImageProfileId && !requestedImageProfile) throw jsonError(404, "provider_profile_missing", "所选生图 Provider 配置不存在。");
+  const imageProfile = requestedImageProfile ?? (hasImageProfileSelection ? null : activeImageProfile);
   if (imageInput && typeof imageInput.baseURL !== "string") throw jsonError(400, "invalid_base_url", "请输入生图 Provider 的 baseURL。");
   if (promptInput && typeof promptInput.baseURL !== "string") throw jsonError(400, "invalid_prompt_base_url", "请输入提示词 Provider 的 baseURL。");
   if (!imageInput && !hasImageProviderConfigured(existingCredential)) throw jsonError(400, "invalid_image_provider", "请填写生图 Provider。");
@@ -597,12 +620,14 @@ app.post("/api/settings/provider", async (c) => {
   const rawPromptApiKey = promptInput && typeof promptInput.apiKey === "string" ? promptInput.apiKey.trim() : "";
   if (rawImageApiKey && rawImageApiKey.length < 8) throw jsonError(400, "invalid_api_key", "请输入有效的生图 Provider API Key。");
   if (rawPromptApiKey && rawPromptApiKey.length < 8) throw jsonError(400, "invalid_prompt_api_key", "请输入有效的提示词 Provider API Key。");
-  if (!rawImageApiKey && !existingCredential?.encrypted_api_key) throw jsonError(400, "invalid_api_key", "请输入有效的生图 Provider API Key。");
+  if (!rawImageApiKey && !imageProfile?.encrypted_api_key && !existingCredential?.encrypted_api_key) {
+    throw jsonError(400, "invalid_api_key", "请输入有效的生图 Provider API Key。");
+  }
   if (promptInput && !rawPromptApiKey && !existingCredential?.prompt_encrypted_api_key) {
     throw jsonError(400, "invalid_prompt_api_key", "请输入有效的提示词 Provider API Key。");
   }
   const selectedImageModel = optionOrFallback(
-    imageInput && typeof imageInput.model === "string" ? imageInput.model : existingCredential?.model ?? c.env.DEFAULT_IMAGE_MODEL,
+    imageInput && typeof imageInput.model === "string" ? imageInput.model : imageProfile?.model ?? existingCredential?.model ?? c.env.DEFAULT_IMAGE_MODEL,
     IMAGE_MODEL_OPTIONS,
   );
   const selectedPromptOptimizerModel = optionOrFallback(
@@ -613,8 +638,8 @@ app.post("/api/settings/provider", async (c) => {
   );
   const encryptedImageApiKey = rawImageApiKey
     ? await encryptSecret(rawImageApiKey, c.env.APP_ENCRYPTION_KEY ?? "")
-    : existingCredential?.encrypted_api_key;
-  const savedImageApiKeyHint = rawImageApiKey ? apiKeyHint(rawImageApiKey) : existingCredential?.api_key_hint;
+    : imageProfile?.encrypted_api_key ?? existingCredential?.encrypted_api_key;
+  const savedImageApiKeyHint = rawImageApiKey ? apiKeyHint(rawImageApiKey) : imageProfile?.api_key_hint ?? existingCredential?.api_key_hint;
   const encryptedPromptApiKey = rawPromptApiKey
     ? await encryptSecret(rawPromptApiKey, c.env.APP_ENCRYPTION_KEY ?? "")
     : existingCredential?.prompt_encrypted_api_key;
@@ -624,9 +649,34 @@ app.post("/api/settings/provider", async (c) => {
     throw jsonError(400, "invalid_prompt_api_key", "请输入有效的提示词 Provider API Key。");
   }
 
+  if (imageInput) {
+    const profileInput = {
+      name: (typeof imageInput.name === "string" ? imageInput.name.trim() : "") || imageProfile?.name || "默认配置",
+      base_url: imageValidation.normalized,
+      model: selectedImageModel,
+      encrypted_api_key: encryptedImageApiKey,
+      api_key_hint: savedImageApiKeyHint,
+    };
+    const existingProfiles = await listImageProviderProfiles(c.env.DB, spaceId);
+    if (existingProfiles.some((profile) => profile.name === profileInput.name && profile.id !== imageProfile?.id)) {
+      throw jsonError(409, "provider_profile_name_taken", "Provider 配置名称已存在，请换一个名称。");
+    }
+    if (imageProfile) {
+      await updateImageProviderProfile(c.env.DB, spaceId, imageProfile.id, profileInput);
+    } else {
+      await createImageProviderProfile(c.env.DB, {
+        id: randomId("ipp"),
+        space_id: spaceId,
+        ...profileInput,
+        last_test_ok: 0,
+        last_tested_at: null,
+      });
+    }
+  }
+
   await upsertCredential(
     c.env.DB,
-    c.get("space").id,
+    spaceId,
     {
       imageBaseURL: imageValidation.normalized,
       imageModel: selectedImageModel,
@@ -638,25 +688,42 @@ app.post("/api/settings/provider", async (c) => {
       promptApiKeyHint: savedPromptApiKeyHint ?? null,
     },
   );
-  return c.json({
-    ok: true,
-    imageProvider: {
-      baseURL: imageValidation.normalized,
-      model: selectedImageModel,
-      apiKeyHint: savedImageApiKeyHint,
-      lastTestOk: false,
-      lastTestedAt: null,
-    },
-    promptProvider: promptValidation?.normalized && savedPromptApiKeyHint
-      ? {
-          baseURL: promptValidation.normalized,
-          model: selectedPromptOptimizerModel,
-          apiKeyHint: savedPromptApiKeyHint,
-          lastTestOk: false,
-          lastTestedAt: null,
-        }
-      : null,
-  });
+  if (imageInput) {
+    const profiles = await listImageProviderProfiles(c.env.DB, spaceId);
+    const profileToActivate = requestedImageProfile ?? profiles.at(-1);
+    if (profileToActivate) await activateImageProviderProfile(c.env.DB, spaceId, profileToActivate.id);
+  }
+  return c.json(await settingsProviderResponse(c.env, spaceId));
+});
+
+app.post("/api/settings/provider/select", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const profileId = body && typeof body === "object" && typeof (body as Record<string, unknown>).providerId === "string"
+    ? ((body as Record<string, unknown>).providerId as string).trim()
+    : "";
+  if (!profileId) throw jsonError(400, "invalid_provider_profile", "请选择 Provider 配置。");
+  const spaceId = c.get("space").id;
+  const profile = await getImageProviderProfile(c.env.DB, spaceId, profileId);
+  if (!profile) throw jsonError(404, "provider_profile_missing", "所选生图 Provider 配置不存在。");
+  await activateImageProviderProfile(c.env.DB, spaceId, profile.id);
+  return c.json(await settingsProviderResponse(c.env, spaceId));
+});
+
+app.delete("/api/settings/provider/profiles/:profileId", async (c) => {
+  const spaceId = c.get("space").id;
+  const profileId = c.req.param("profileId");
+  const profiles = await listImageProviderProfiles(c.env.DB, spaceId);
+  if (profiles.length <= 1) throw jsonError(400, "provider_profile_required", "至少需要保留一个生图 Provider 配置。");
+  if (!profiles.some((profile) => profile.id === profileId)) {
+    throw jsonError(404, "provider_profile_missing", "生图 Provider 配置不存在。");
+  }
+  const credential = await getCredential(c.env.DB, spaceId);
+  await deleteImageProviderProfile(c.env.DB, spaceId, profileId);
+  if (credential?.active_image_provider_id === profileId) {
+    const nextProfile = profiles.find((profile) => profile.id !== profileId);
+    if (nextProfile) await activateImageProviderProfile(c.env.DB, spaceId, nextProfile.id);
+  }
+  return c.json(await settingsProviderResponse(c.env, spaceId));
 });
 
 app.delete("/api/settings/provider", async (c) => {
@@ -757,7 +824,7 @@ app.post("/api/generations", async (c) => {
     c.env.DB,
     space.id,
     parsed.input,
-    credential.model,
+    optionOrFallback(parsed.input.model ?? credential.model ?? c.env.DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS),
     await sha256Hex(credential.base_url),
     referenceImages,
     maskImage,

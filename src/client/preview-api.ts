@@ -1,4 +1,5 @@
 import type { AppConfig, GenerationJob, GenerationRecord, GenerationReferenceImage, ImageItem } from "./api";
+import { DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS } from "../image-models";
 
 const previewStorageKey = "oh-myimage.preview";
 const previewDemoImageUrl = "/demo-preview.png";
@@ -18,10 +19,10 @@ const previewRatioSizes: Record<string, [number, number]> = {
 };
 
 const previewConfig: AppConfig = {
-  model: "gpt-image-2",
+  model: DEFAULT_IMAGE_MODEL,
+  modelOptions: [...IMAGE_MODEL_OPTIONS],
   promptOptimizerModel: "gpt-5.5",
   maxImagesPerRequest: 4,
-  maxDailyImagesPerSpace: 50,
   generationTimeoutSeconds: 600,
   ratios: ["16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "1:1"],
   qualities: ["auto", "low", "medium", "high"],
@@ -96,8 +97,6 @@ async function handlePreviewApi(request: Request, url: URL): Promise<unknown> {
       ok: true,
       space: { id: "preview_space", name: "Preview acceptance" },
       providerConfigured: true,
-      dailyRemaining: 48,
-      dailyLimit: 50,
     };
   }
 

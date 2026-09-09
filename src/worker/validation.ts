@@ -17,6 +17,7 @@ const MODERATIONS = new Set(["auto", "low"]);
 
 export interface GenerationInput {
   prompt: string;
+  model?: string;
   aspectRatio: string;
   width: number;
   height: number;
@@ -47,6 +48,7 @@ export function parseGenerationInput(raw: unknown, maxImagesValue?: string): { i
   const body = raw as Record<string, unknown>;
   const maxImages = Math.min(envNumber(maxImagesValue, 4), 10);
   const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
+  const model = typeof body.model === "string" ? body.model.trim() : "";
   if (!prompt) return { error: "请输入提示词。" };
   if (prompt.length > 32_000) return { error: "提示词最多 32000 个字符。" };
 
@@ -78,6 +80,7 @@ export function parseGenerationInput(raw: unknown, maxImagesValue?: string): { i
   return {
     input: {
       prompt,
+      ...(model ? { model } : {}),
       aspectRatio,
       width,
       height,

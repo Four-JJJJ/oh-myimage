@@ -284,7 +284,7 @@ describe("generate menu mappers", () => {
 
     expect(draft).toMatchObject({
       prompt: "继续加强光影",
-      selectedModel: "gpt-image-2",
+      selectedModel: "gpt-image-2.5-flare",
       selectedQuality: "auto",
       mode: "remix",
       sourceRecordId: "job_continue",
