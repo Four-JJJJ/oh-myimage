@@ -1,0 +1,10 @@
+import { forwardRef, type SVGProps } from "react";
+import { CentralIcon } from "./icon";
+
+export const IconCursor1 = forwardRef<SVGSVGElement, SVGProps<SVGSVGElement>>(function IconCursor1(props, ref) {
+  return (
+    <CentralIcon ref={ref} {...props}>
+      <path d="M3.50746 5.41564L8.63387 20.2487C9.08538 21.5551 10.9137 21.6073 11.439 20.3288L13.7897 14.6076C13.942 14.2368 14.2363 13.9425 14.6071 13.7902L20.3283 11.4395C21.6068 10.9142 21.5546 9.08587 20.2482 8.63436L5.41515 3.50795C4.23246 3.0992 3.09871 4.23295 3.50746 5.41564Z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+    </CentralIcon>
+  );
+});

@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { cors } from "hono/cors";
 import { DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS } from "../image-models";
@@ -28,6 +29,7 @@ import {
   listImagesForJobs,
   listImageProviderProfiles,
   markCredentialTested,
+  markImageProviderProfileDiscovered,
   StoredReferenceImage,
   updateJobStatus,
   updateImageProviderProfile,
@@ -40,9 +42,12 @@ import { buildProviderEndpoint, normalizeSpaceName, validateBaseURL, verifyTurns
 import {
   optimizePrompt,
   processGenerationMessage,
+  imageProviderModelCatalog,
+  serializeProviderModelCatalog,
   providerResultCheckpointStorageKey,
   ProviderError,
   resolveGenerationTimeoutMs,
+  selectImageProviderForModel,
   testProvider,
 } from "./provider";
 import {
@@ -284,11 +289,25 @@ function publicImageProviderProfile(profile: ImageProviderProfileRecord) {
     id: profile.id,
     name: profile.name,
     baseURL: profile.base_url,
-    model: optionOrFallback(profile.model, IMAGE_MODEL_OPTIONS),
+    model: resolveStoredImageModel(profile.model),
     apiKeyHint: profile.api_key_hint,
     lastTestOk: Boolean(profile.last_test_ok),
     lastTestedAt: profile.last_tested_at,
+    ...imageProviderModelCatalog(profile),
   };
+}
+
+function resolveStoredImageModel(model: string | null | undefined): string {
+  const trimmed = model?.trim();
+  return trimmed || DEFAULT_IMAGE_MODEL;
+}
+
+function availableImageModels(profiles: ImageProviderProfileRecord[], fallbackModel: string | null | undefined): string[] {
+  const discovered = profiles.flatMap((profile) => imageProviderModelCatalog(profile).models);
+  const models = [...new Set(discovered)];
+  if (models.length > 0) return models;
+  const fallback = fallbackModel?.trim();
+  return fallback ? [fallback] : [...IMAGE_MODEL_OPTIONS];
 }
 
 async function settingsProviderResponse(env: Env, spaceId: string) {
@@ -297,7 +316,7 @@ async function settingsProviderResponse(env: Env, spaceId: string) {
   const imageProvider = hasImageProviderConfigured(credential)
     ? {
         baseURL: credential.base_url,
-        model: optionOrFallback(credential.model, IMAGE_MODEL_OPTIONS),
+        model: resolveStoredImageModel(credential.model),
         apiKeyHint: credential.api_key_hint,
         lastTestOk: Boolean(credential.last_test_ok),
         lastTestedAt: credential.last_tested_at,
@@ -495,8 +514,8 @@ app.get("/api/config", (c) => {
       maxImagesPerRequest: envNumber(c.env.MAX_IMAGES_PER_REQUEST, 4),
       generationTimeoutSeconds: Math.round(resolveGenerationTimeoutMs(c.env.REQUEST_TIMEOUT_MS) / 1000),
       ratios: [...Object.keys(RATIO_TO_SIZE), "custom"],
-      qualities: ["auto", "low", "medium", "high"],
-      formats: ["png", "webp", "jpeg"],
+      qualities: ["auto", "low", "medium", "high", "xhigh", "max"],
+      formats: ["png", "webp", "jpeg", "gif", "svg"],
       turnstileSiteKey: c.env.TURNSTILE_SITE_KEY ?? "",
       turnstileRequired: c.env.TURNSTILE_REQUIRED === "true",
     },
@@ -572,16 +591,47 @@ app.use("/api/*", async (c, next) => {
 app.get("/api/me", async (c) => {
   const space = c.get("space");
   const credential = await getCredential(c.env.DB, space.id);
+  const profiles = await listImageProviderProfiles(c.env.DB, space.id);
+  const modelOptions = availableImageModels(profiles, credential?.model ?? c.env.DEFAULT_IMAGE_MODEL);
   return c.json({
     ok: true,
     space: { id: space.id, name: space.space_name },
     providerConfigured: hasImageProviderConfigured(credential),
+    model: modelOptions[0] ?? resolveStoredImageModel(credential?.model ?? c.env.DEFAULT_IMAGE_MODEL),
+    modelOptions,
   });
 });
 
 app.get("/api/settings/provider", async (c) => {
   return c.json(await settingsProviderResponse(c.env, c.get("space").id));
 });
+
+app.post("/api/settings/provider/discover-models", async (c) => {
+  const spaceId = c.get("space").id;
+  const profiles = await listImageProviderProfiles(c.env.DB, spaceId);
+  const requestedIds = await requestedProviderIds(c);
+  const targets = profiles.filter((profile) => requestedIds === null || requestedIds.has(profile.id));
+  await Promise.all(
+    targets.map(async (profile) => {
+      try {
+        const apiKey = await decryptSecret(profile.encrypted_api_key, c.env.APP_ENCRYPTION_KEY ?? "");
+        const result = await testProvider(profile.base_url, apiKey);
+        if (!result.ok) return;
+        await markImageProviderProfileDiscovered(c.env.DB, spaceId, profile.id, result.modelSource !== "preset" || result.status === 200, serializeProviderModelCatalog(result));
+      } catch {
+        // A single unreachable provider must not block the rest of the list.
+      }
+    }),
+  );
+  return c.json(await settingsProviderResponse(c.env, spaceId));
+});
+
+async function requestedProviderIds(c: Context<AppBindings>): Promise<Set<string> | null> {
+  const body = await c.req.json().catch(() => null);
+  const ids = body && typeof body === "object" ? (body as Record<string, unknown>).providerIds : null;
+  if (!Array.isArray(ids)) return null;
+  return new Set(ids.filter((id): id is string => typeof id === "string" && id.trim().length > 0));
+}
 
 app.post("/api/settings/provider", async (c) => {
   const body = await c.req.json().catch(() => null);
@@ -626,9 +676,8 @@ app.post("/api/settings/provider", async (c) => {
   if (promptInput && !rawPromptApiKey && !existingCredential?.prompt_encrypted_api_key) {
     throw jsonError(400, "invalid_prompt_api_key", "请输入有效的提示词 Provider API Key。");
   }
-  const selectedImageModel = optionOrFallback(
+  const selectedImageModel = resolveStoredImageModel(
     imageInput && typeof imageInput.model === "string" ? imageInput.model : imageProfile?.model ?? existingCredential?.model ?? c.env.DEFAULT_IMAGE_MODEL,
-    IMAGE_MODEL_OPTIONS,
   );
   const selectedPromptOptimizerModel = optionOrFallback(
     promptInput && typeof promptInput.model === "string"
@@ -649,6 +698,7 @@ app.post("/api/settings/provider", async (c) => {
     throw jsonError(400, "invalid_prompt_api_key", "请输入有效的提示词 Provider API Key。");
   }
 
+  let savedImageProfileId: string | null = null;
   if (imageInput) {
     const profileInput = {
       name: (typeof imageInput.name === "string" ? imageInput.name.trim() : "") || imageProfile?.name || "默认配置",
@@ -662,10 +712,12 @@ app.post("/api/settings/provider", async (c) => {
       throw jsonError(409, "provider_profile_name_taken", "Provider 配置名称已存在，请换一个名称。");
     }
     if (imageProfile) {
+      savedImageProfileId = imageProfile.id;
       await updateImageProviderProfile(c.env.DB, spaceId, imageProfile.id, profileInput);
     } else {
+      savedImageProfileId = randomId("ipp");
       await createImageProviderProfile(c.env.DB, {
-        id: randomId("ipp"),
+        id: savedImageProfileId,
         space_id: spaceId,
         ...profileInput,
         last_test_ok: 0,
@@ -673,6 +725,13 @@ app.post("/api/settings/provider", async (c) => {
       });
     }
   }
+
+  // 设置里保存的是“正在编辑的配置”，不一定是用中的那个；只有用中的配置（或还没有任何启用项时）
+  // 才把内容同步到 credential 并设为启用。启用项由对话框里的 Provider 选择决定。
+  const enabledImageProfileId = existingCredential?.active_image_provider_id ?? null;
+  const activatesImageProfile = Boolean(
+    savedImageProfileId && (!enabledImageProfileId || savedImageProfileId === enabledImageProfileId),
+  );
 
   await upsertCredential(
     c.env.DB,
@@ -686,12 +745,12 @@ app.post("/api/settings/provider", async (c) => {
       promptModel: selectedPromptOptimizerModel,
       promptEncryptedApiKey: encryptedPromptApiKey ?? null,
       promptApiKeyHint: savedPromptApiKeyHint ?? null,
+      syncImageFields: Boolean(imageInput) && activatesImageProfile,
+      syncPromptFields: Boolean(promptInput),
     },
   );
-  if (imageInput) {
-    const profiles = await listImageProviderProfiles(c.env.DB, spaceId);
-    const profileToActivate = requestedImageProfile ?? profiles.at(-1);
-    if (profileToActivate) await activateImageProviderProfile(c.env.DB, spaceId, profileToActivate.id);
+  if (activatesImageProfile && savedImageProfileId) {
+    await activateImageProviderProfile(c.env.DB, spaceId, savedImageProfileId);
   }
   return c.json(await settingsProviderResponse(c.env, spaceId));
 });
@@ -747,9 +806,15 @@ app.post("/api/provider/test", async (c) => {
     if (rawApiKey) {
       apiKey = rawApiKey;
     } else {
+      // 没重填 Key 时，按 providerId 取对应配置的 Key；设置里查看的可能不是用中的那个。
+      const requestedProfileId = typeof raw.providerId === "string" ? raw.providerId.trim() : "";
+      const requestedProfile = requestedProfileId
+        ? await getImageProviderProfile(c.env.DB, spaceId, requestedProfileId)
+        : null;
       const credential = await getCredential(c.env.DB, spaceId);
-      if (!credential) throw jsonError(400, "invalid_api_key", "请输入 API Key。");
-      const encryptedApiKey = kind === "prompt" ? credential.prompt_encrypted_api_key : credential.encrypted_api_key;
+      const encryptedApiKey = requestedProfile
+        ? requestedProfile.encrypted_api_key
+        : kind === "prompt" ? credential?.prompt_encrypted_api_key : credential?.encrypted_api_key;
       if (!encryptedApiKey) throw jsonError(400, "invalid_api_key", "请输入 API Key。");
       apiKey = await decryptSecret(encryptedApiKey, c.env.APP_ENCRYPTION_KEY ?? "");
     }
@@ -764,9 +829,20 @@ app.post("/api/provider/test", async (c) => {
     apiKey = await decryptSecret(encryptedApiKey, c.env.APP_ENCRYPTION_KEY ?? "");
   }
 
-  const result = await testProvider(baseURL, apiKey);
-  if (!(body && typeof body === "object" && typeof (body as Record<string, unknown>).baseURL === "string")) {
-    await markCredentialTested(c.env.DB, spaceId, kind, result.ok);
+  const result = await testProvider(baseURL, apiKey, 15000, kind === "image");
+  const discoveredModels = kind === "image" && result.ok ? serializeProviderModelCatalog(result) : null;
+  const requestBody = body && typeof body === "object" ? (body as Record<string, unknown>) : null;
+  const testedUnsavedDraft = Boolean(requestBody && typeof requestBody.baseURL === "string" && typeof requestBody.apiKey === "string" && requestBody.apiKey.trim());
+  if (!testedUnsavedDraft) {
+    const authenticated = result.ok && (result.modelSource !== "preset" || result.status === 200);
+    await markCredentialTested(c.env.DB, spaceId, kind, authenticated);
+    if (kind === "image" && result.ok) {
+      const credential = await getCredential(c.env.DB, spaceId);
+      const profileId = typeof requestBody?.providerId === "string" && requestBody.providerId.trim()
+        ? requestBody.providerId.trim()
+        : credential?.active_image_provider_id;
+      if (profileId) await markImageProviderProfileDiscovered(c.env.DB, spaceId, profileId, authenticated, discoveredModels);
+    }
   }
   return c.json({ ok: true, result });
 });
@@ -804,6 +880,12 @@ app.post("/api/generations", async (c) => {
   const space = c.get("space");
   const credential = await getCredential(c.env.DB, space.id);
   if (!hasImageProviderConfigured(credential)) throw jsonError(400, "provider_missing", "请先在设置中配置生图 Provider。");
+  const profiles = await listImageProviderProfiles(c.env.DB, space.id);
+  const requestedModel = resolveStoredImageModel(parsed.input.model ?? credential.model ?? c.env.DEFAULT_IMAGE_MODEL);
+  const routedProvider = selectImageProviderForModel(profiles, requestedModel, credential.active_image_provider_id);
+  if (profiles.some((profile) => imageProviderModelCatalog(profile).models.length > 0) && !profiles.some((profile) => imageProviderModelCatalog(profile).models.includes(requestedModel))) {
+    throw jsonError(400, "model_provider_missing", "没有能处理这个模型的 Provider。请先测试对应 Key 的连接。");
+  }
   await assertGenerationLimitsForRequest(c.env, space.id, parsed.input.quantity);
 
   const sourceImageCount = sourceImageId ? 1 : 0;
@@ -824,8 +906,8 @@ app.post("/api/generations", async (c) => {
     c.env.DB,
     space.id,
     parsed.input,
-    optionOrFallback(parsed.input.model ?? credential.model ?? c.env.DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS),
-    await sha256Hex(credential.base_url),
+    requestedModel,
+    await sha256Hex(routedProvider?.base_url ?? credential.base_url),
     referenceImages,
     maskImage,
     jobId,
@@ -855,6 +937,9 @@ app.get("/api/generations", async (c) => {
     resultsByJob.set(result.job_id, group);
   }
 
+  c.header("Cache-Control", "private, no-store, no-cache, must-revalidate, max-age=0");
+  c.header("Pragma", "no-cache");
+  c.header("Expires", "0");
   return c.json({
     ok: true,
     records: visibleJobs.map((job) => {
@@ -874,6 +959,9 @@ app.get("/api/generations/:jobId", async (c) => {
   if (!job) throw jsonError(404, "job_not_found", "任务不存在。");
   const images = await listImagesForJob(c.env.DB, c.get("space").id, job.id);
   const results = await listGenerationResultsForJob(c.env.DB, c.get("space").id, job.id);
+  c.header("Cache-Control", "private, no-store, no-cache, must-revalidate, max-age=0");
+  c.header("Pragma", "no-cache");
+  c.header("Expires", "0");
   return c.json({
     ok: true,
     job: serializeGenerationJob(job, results),
@@ -915,7 +1003,7 @@ app.delete("/api/generations/:jobId", async (c) => {
     const imageId = `img_${job.id}_${resultIndex}`;
     return [
       providerResultCheckpointStorageKey(job, resultIndex),
-      ...["png", "jpeg", "webp"].map((format) => `${spaceId}/${job.id}/${imageId}.${format}`),
+      ...["png", "jpeg", "webp", "gif", "svg"].map((format) => `${spaceId}/${job.id}/${imageId}.${format}`),
       `${spaceId}/${job.id}/thumb_${imageId}.webp`,
     ];
   }).flat();
@@ -949,7 +1037,7 @@ app.post("/api/generations/:jobId/regenerate", async (c) => {
     c.env.DB,
     space.id,
     generationInputFromJob(sourceJob),
-    credential.model,
+    resolveStoredImageModel(sourceJob.model),
     await sha256Hex(credential.base_url),
     referenceImages,
     maskImage,
@@ -989,7 +1077,7 @@ app.get("/api/images/:imageId/download", async (c) => {
       headers: cachedHeaders,
     });
   }
-  if (c.env.IMAGES.createPresignedGetUrl) {
+  if (c.env.IMAGES.createPresignedGetUrl && image.mime_type !== "image/svg+xml") {
     const url = await c.env.IMAGES.createPresignedGetUrl(image.storage_key, {
       expiresInSeconds: 300,
       contentType: image.mime_type,
@@ -1218,19 +1306,21 @@ function serializeGenerationJob(job: GenerationJobRecord, results: Awaited<Retur
   };
 }
 
-function normalizeGenerationResults(job: GenerationJobRecord, results: Awaited<ReturnType<typeof listGenerationResultsForJob>>) {
+export function normalizeGenerationResults(job: GenerationJobRecord, results: Awaited<ReturnType<typeof listGenerationResultsForJob>>) {
   const byIndex = new Map(results.map((result) => [result.result_index, result]));
   return Array.from({ length: job.quantity }, (_, index) => {
     const result = byIndex.get(index);
     if (result) {
+      const staleActiveResult = (job.status === "failed" || job.status === "cancelled" || job.status === "partial_succeeded") &&
+        !result.image_asset_id && (result.status === "queued" || result.status === "running");
       return {
         index,
-        status: result.status,
+        status: staleActiveResult ? "failed" : result.status,
         imageId: result.image_asset_id,
-        errorCode: result.error_code,
-        errorMessage: result.error_message,
+        errorCode: staleActiveResult ? result.error_code ?? job.error_code : result.error_code,
+        errorMessage: staleActiveResult ? result.error_message ?? job.error_message : result.error_message,
         startedAt: result.started_at,
-        completedAt: result.completed_at,
+        completedAt: result.completed_at ?? (staleActiveResult ? job.completed_at : null),
       };
     }
     return {
@@ -1300,7 +1390,11 @@ function imageResponseHeaders(contentType: string, contentDisposition: string, e
     "Cache-Control": IMAGE_CACHE_CONTROL,
     "Content-Disposition": contentDisposition,
     "ETag": etag,
+    "X-Content-Type-Options": "nosniff",
   };
+  if (contentType === "image/svg+xml") {
+    headers["Content-Security-Policy"] = "sandbox; default-src 'none'; img-src data: https:; style-src 'unsafe-inline'; font-src data: https:";
+  }
   if (typeof contentLength === "number" && Number.isFinite(contentLength) && contentLength >= 0) {
     headers["Content-Length"] = String(contentLength);
   }
@@ -1318,6 +1412,8 @@ function referenceImageETag(storageKey: string, byteSize: number): string {
 function formatFromMimeType(mimeType: string): string {
   if (mimeType === "image/jpeg") return "jpg";
   if (mimeType === "image/webp") return "webp";
+  if (mimeType === "image/gif") return "gif";
+  if (mimeType === "image/svg+xml") return "svg";
   return "png";
 }
 

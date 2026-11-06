@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-REMOTE_ALIAS="${REMOTE_ALIAS:-token-new}"
+REMOTE_ALIAS="${REMOTE_ALIAS:-token-us}"
 REMOTE_BASE_DIR="${REMOTE_BASE_DIR:-/opt/oh-myimage-dev}"
 REMOTE_ENV_FILE="${REMOTE_ENV_FILE:-/etc/oh-myimage-dev/oh-myimage-dev.env}"
 REMOTE_COMPOSE_FILE="${REMOTE_COMPOSE_FILE:-deploy/docker-compose.oh-myimage-dev.yml}"

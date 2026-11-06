@@ -137,6 +137,7 @@ export interface ImageProviderProfileRecord {
   api_key_hint: string;
   last_test_ok: number;
   last_tested_at: string | null;
+  discovered_models_json?: string | null;
   created_at: string;
   updated_at: string;
 }

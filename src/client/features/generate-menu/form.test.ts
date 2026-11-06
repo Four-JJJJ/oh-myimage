@@ -10,7 +10,9 @@ import {
   remainingReferenceSlots,
   resolveImagePreviewChromeState,
   resolveImagePreviewProgressPercent,
+  shouldRetryImagePreviewRequest,
   generationRequestBody,
+  generationFailureMessageForDisplay,
   composerOptimizeBeamClassName,
   composerOptimizeBeamProps,
   createQueuedGenerationJob,
@@ -36,8 +38,10 @@ import {
   shouldShowComposerOptimizeBeam,
   resolveComposerPopupPlacement,
   updateGenerateForm,
+  submittedGenerateForm,
   buildFlowChips,
 } from "./GenerateMenuView";
+import { normalizeCustomSize } from "./options";
 import { claimGenerationSubmitLock, mergePolledJobState } from "../../generation-state";
 
 const source = readFileSync(fileURLToPath(new URL("./GenerateMenuView.tsx", import.meta.url)), "utf8");
@@ -62,6 +66,13 @@ describe("generate menu form helpers", () => {
     expect(resolveComposerPopupPlacement({ top: 400, bottom: 432 }, 500, 800)).toBe("above");
   });
 
+  it("turns legacy fetch failed job messages into readable copy", () => {
+    expect(generationFailureMessageForDisplay("fetch failed")).toBe("网络连接中断，本次生成没有完成，请重新生成。");
+    expect(generationFailureMessageForDisplay("模型已返回图片链接，但下载失败：fetch failed")).toBe("模型已返回图片链接，但下载失败：网络连接中断");
+    expect(generationFailureMessageForDisplay("模型服务鉴权失败")).toBe("模型服务鉴权失败");
+    expect(generationFailureMessageForDisplay(null)).toBe("生成失败，请稍后重新生成。");
+  });
+
   it("shows successful and failed image counts separately for terminal jobs", () => {
     const chips = buildFlowChips({
       id: "job_1",
@@ -75,6 +86,7 @@ describe("generate menu form helpers", () => {
         progress_current: 3,
         progress_total: 3,
         prompt: "test",
+        model: "grok-imagine-image-2.0",
         aspect_ratio: "1:1",
         width: 1024,
         height: 1024,
@@ -98,8 +110,46 @@ describe("generate menu form helpers", () => {
       },
     });
 
+    expect(chips[0]).toBe("grok-imagine-image-2.0");
     expect(chips).toContain("成功 0/3 · 失败 3/3");
     expect(chips).not.toContain("3/3");
+  });
+
+  it("shows the actual asset format when the provider returns GIF despite a PNG request", () => {
+    const chips = buildFlowChips({
+      id: "job_gif",
+      status: "success",
+      elapsedSeconds: 34,
+      images: [{
+        id: "img_gif",
+        jobId: "job_gif",
+        url: "/api/images/img_gif/download?raw=1",
+        width: 508,
+        height: 337,
+        format: "gif",
+        createdAt: "2026-11-05T07:23:17.000Z",
+      }],
+      job: {
+        id: "job_gif",
+        status: "succeeded",
+        prompt: "生成跳舞的小猫 gif 图片",
+        model: "gpt-image-2.6-flare-lite",
+        aspect_ratio: "16:9",
+        width: 1536,
+        height: 864,
+        quality: "auto",
+        quantity: 1,
+        output_format: "png",
+        background: "auto",
+        compression: 100,
+        error_code: null,
+        error_message: null,
+        created_at: "2026-11-05T07:22:43.000Z",
+      },
+    } as never);
+
+    expect(chips).toContain("GIF");
+    expect(chips).not.toContain("PNG");
   });
 
   it("keeps the composer prompt field to a single visible vertical scrollbar", () => {
@@ -138,7 +188,8 @@ describe("generate menu form helpers", () => {
   it("streams the full-size preview image through fetch so loading progress can update", () => {
     const previewSource = source.slice(source.indexOf("export function ImagePreview"), source.indexOf("function LocalEditDialog"));
 
-    expect(previewSource).toContain("fetch(image.url");
+    expect(previewSource).toContain("fetch(generatedImageRetryUrl(image.url, loadAttempt)");
+    expect(previewSource).toContain('cache: "no-store"');
     expect(previewSource).toContain("getReader()");
     expect(previewSource).toContain("URL.createObjectURL");
     expect(previewSource).not.toContain("new XMLHttpRequest");
@@ -154,6 +205,13 @@ describe("generate menu form helpers", () => {
     expect(previewSource).toContain("setLoadAttempt((attempt) => attempt + 1)");
   });
 
+  it("retries a transient preview fetch once before showing an error", () => {
+    expect(shouldRetryImagePreviewRequest(new TypeError("Failed to fetch"), 0, false)).toBe(true);
+    expect(shouldRetryImagePreviewRequest(new Error("Image preview request failed with 503"), 0, false)).toBe(true);
+    expect(shouldRetryImagePreviewRequest(new Error("Image preview request failed with 404"), 0, false)).toBe(false);
+    expect(shouldRetryImagePreviewRequest(new TypeError("Failed to fetch"), 1, false)).toBe(false);
+  });
+
   it("overlays the full-size preview placeholder and loading image without shifting horizontally", () => {
     const previewSource = source.slice(source.indexOf("export function ImagePreview"), source.indexOf("function LocalEditDialog"));
 
@@ -167,8 +225,8 @@ describe("generate menu form helpers", () => {
   it("falls back from a broken generated thumbnail to the original image", () => {
     const stageSource = source.slice(source.indexOf("function GenerationStageImageCell"), source.indexOf("function buildGeneratedImageActions"));
 
-    expect(stageSource).toContain("image.thumbnailUrl ?? image.url");
-    expect(stageSource).toContain("if (displayImageUrl !== image.url) setDisplayImageUrl(image.url)");
+    expect(stageSource).toContain("generatedImageDisplayUrl(image)");
+    expect(stageSource).toContain("setDisplayImageUrl(image.url)");
   });
 
   it("exposes eight in-progress loading lines without start or finish phrasing", () => {
@@ -206,9 +264,35 @@ describe("generate menu form helpers", () => {
     });
   });
 
-  it("normalizes custom dimensions to multiples of 16", () => {
-    expect(updateGenerateForm({ ...baseForm, aspectRatio: "custom" }, "width", 1611).width).toBe(1616);
+  it("keeps the typed custom dimension while editing instead of snapping each keystroke", () => {
+    const typed = updateGenerateForm({ ...baseForm, aspectRatio: "custom" }, "width", 1611);
+    expect(typed.width).toBe(1611);
+
+    const submitted = submittedGenerateForm(typed);
+    expect(submitted.width).toBe(1616);
+    expect(submitted.height % 16).toBe(0);
+  });
+
+  it("snaps custom dimensions to the 16px grid only when they are committed", () => {
+    expect(normalizeCustomSize(1611)).toBe(1616);
+    expect(normalizeCustomSize(7)).toBe(16);
+    expect(normalizeCustomSize(9000)).toBe(3840);
     expect(updateGenerateForm({ ...baseForm, aspectRatio: "custom" }, "height", 7).height).toBe(16);
+  });
+
+  it("resets GIF and SVG when switching away from image-2.6", () => {
+    const animated = { ...baseForm, model: "gpt-image-2.6", outputFormat: "gif" };
+
+    expect(updateGenerateForm(animated, "model", "gpt-image-2.5-flare").outputFormat).toBe("png");
+    expect(updateGenerateForm(animated, "model", "gpt-image-2.6").outputFormat).toBe("gif");
+    expect(updateGenerateForm(animated, "model", "gpt-image-2.6-flare-lite").outputFormat).toBe("gif");
+    expect(submittedGenerateForm({ ...baseForm, outputFormat: "svg" }).outputFormat).toBe("png");
+  });
+
+  it("clamps quality to auto when switching to a model that does not support it", () => {
+    const withXhigh = { ...baseForm, quality: "xhigh" };
+    expect(updateGenerateForm(withXhigh, "model", "gpt-image-2").quality).toBe("auto");
+    expect(updateGenerateForm(withXhigh, "model", "gpt-image-2.5-sunburst").quality).toBe("xhigh");
   });
 
   afterEach(() => {

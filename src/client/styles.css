@@ -29,6 +29,42 @@
 @tailwind components;
 @tailwind utilities;
 
+.canvas-node {
+  border-radius: 18px;
+  box-shadow: none;
+}
+
+.canvas-node-generating {
+  --canvas-border-angle: 0deg;
+  border-color: transparent;
+  background:
+    linear-gradient(#171717, #171717) padding-box,
+    conic-gradient(
+        from var(--canvas-border-angle),
+        rgb(255 255 255 / 0.16),
+        rgb(255 255 255 / 0.72),
+        rgb(255 255 255 / 0.2),
+        rgb(255 255 255 / 0.16)
+      )
+      border-box;
+  animation: canvas-border-flow 2.4s linear infinite;
+}
+
+.canvas-select {
+  height: 1.75rem;
+  width: 7.5rem;
+  border-radius: 0.5rem;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  padding: 0 0.5rem;
+  color: rgba(255, 255, 255, 0.86);
+  outline: none;
+}
+
+.canvas-select:focus {
+  border-color: rgba(255, 255, 255, 0.4);
+}
+
 @layer base {
   :root {
     color-scheme: dark;
@@ -634,6 +670,18 @@
   syntax: "<angle>";
   inherits: false;
   initial-value: 0deg;
+}
+
+@property --canvas-border-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes canvas-border-flow {
+  to {
+    --canvas-border-angle: 360deg;
+  }
 }
 
 @keyframes record-border-flow {

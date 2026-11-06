@@ -1,4 +1,4 @@
-import type { AppConfig, GenerationJob, GenerationRecord, GenerationReferenceImage, ImageItem } from "./api";
+import type { AppConfig, GenerationJob, GenerationRecord, GenerationReferenceImage, ImageItem, ImageProviderProfile } from "./api";
 import { DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS } from "../image-models";
 
 const previewStorageKey = "oh-myimage.preview";
@@ -18,6 +18,39 @@ const previewRatioSizes: Record<string, [number, number]> = {
   "1:1": [1024, 1024],
 };
 
+const previewImageProviders: ImageProviderProfile[] = [
+  {
+    id: "preview-openai",
+    name: "OpenAI",
+    baseURL: "https://api.openai.com/v1",
+    model: "gpt-image-2.5-flare",
+    apiKeyHint: "sk-****",
+    lastTestOk: true,
+    lastTestedAt: null,
+    models: ["gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"],
+  },
+  {
+    id: "preview-grok",
+    name: "xAI",
+    baseURL: "https://api.x.ai/v1",
+    model: "grok-imagine-image",
+    apiKeyHint: "xai-****",
+    lastTestOk: true,
+    lastTestedAt: null,
+    models: ["grok-imagine-image", "grok-imagine-image-2.0"],
+  },
+  {
+    id: "preview-gemini",
+    name: "Gemini",
+    baseURL: "https://generativelanguage.googleapis.com",
+    model: "gemini-2.5-flash-image",
+    apiKeyHint: "AIza-****",
+    lastTestOk: true,
+    lastTestedAt: null,
+    models: ["gemini-2.5-flash-image", "gemini-3-pro-image", "gemini-3.1-flash-image", "gemini-nano-banana-2.1"],
+  },
+];
+
 const previewConfig: AppConfig = {
   model: DEFAULT_IMAGE_MODEL,
   modelOptions: [...IMAGE_MODEL_OPTIONS],
@@ -25,15 +58,33 @@ const previewConfig: AppConfig = {
   maxImagesPerRequest: 4,
   generationTimeoutSeconds: 600,
   ratios: ["16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "1:1"],
-  qualities: ["auto", "low", "medium", "high"],
-  formats: ["png", "jpeg", "webp"],
+  qualities: ["auto", "low", "medium", "high", "xhigh", "max"],
+  formats: ["png", "jpeg", "webp", "gif", "svg"],
   turnstileSiteKey: "",
   turnstileRequired: false,
 };
 
+function previewProviderSettings(activeId?: string) {
+  const active = previewImageProviders.find((profile) => profile.id === activeId) ?? previewImageProviders[0];
+  return {
+    ok: true as const,
+    imageProvider: {
+      baseURL: active.baseURL,
+      model: active.model,
+      apiKeyHint: active.apiKeyHint,
+      lastTestOk: true,
+      lastTestedAt: null,
+    },
+    imageProviders: previewImageProviders,
+    activeImageProviderId: active.id,
+    promptProvider: null,
+  };
+}
+
 let previewInstalled = false;
 let previewRecords: GenerationRecord[] | null = null;
 let previewReadyAtByJobId: Record<string, number> = {};
+let previewActiveProviderId: string | undefined;
 
 export function installPreviewApi(): void {
   if (previewInstalled || !isLocalPreviewAllowed()) return;
@@ -90,6 +141,33 @@ export function previewModeFromInputs(search: string, storedMode: string | null,
 async function handlePreviewApi(request: Request, url: URL): Promise<unknown> {
   if (request.method === "GET" && url.pathname === "/api/config") {
     return { ok: true, config: previewConfig };
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/settings/provider") {
+    return previewProviderSettings(previewActiveProviderId);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/settings/provider/select") {
+    const body = objectBody(await request.json().catch(() => ({})));
+    const providerId = typeof body.providerId === "string" ? body.providerId : "";
+    if (previewImageProviders.some((profile) => profile.id === providerId)) previewActiveProviderId = providerId;
+    return previewProviderSettings(previewActiveProviderId);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/settings/provider/discover-models") {
+    return previewProviderSettings(previewActiveProviderId);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/provider/test") {
+    return {
+      ok: true,
+      result: {
+        ok: true,
+        status: 200,
+        message: `连接成功，发现 ${previewImageProviders[0].models?.length ?? 0} 个可用图片模型。`,
+        models: previewImageProviders[0].models ?? [],
+      },
+    };
   }
 
   if (request.method === "GET" && url.pathname === "/api/me") {

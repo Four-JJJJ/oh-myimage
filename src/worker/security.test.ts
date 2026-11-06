@@ -27,6 +27,31 @@ describe("baseURL safety", () => {
     );
   });
 
+  it.each([
+    ["https://api.xyaigc.xyz", "https://api.xyaigc.xyz/v1"],
+    [" https://api.xyaigc.xyz/ ", "https://api.xyaigc.xyz/v1"],
+    ["https://api.xyaigc.xyz///", "https://api.xyaigc.xyz/v1"],
+    ["https://api.xyaigc.xyz/v1/", "https://api.xyaigc.xyz/v1"],
+    ["https://provider.example/api/v1/", "https://provider.example/api/v1"],
+    ["https://provider.example/openai", "https://provider.example/openai"],
+    ["https://provider.example/v1beta/", "https://provider.example/v1beta"],
+    ["https://provider.example:8443", "https://provider.example:8443/v1"],
+  ])("normalizes %s without changing explicit API paths", (input, normalized) => {
+    expect(validateBaseURL(input)).toEqual({ ok: true, normalized });
+    expect(validateBaseURL(normalized).normalized).toBe(normalized);
+    for (const endpoint of ["/models", "/images/generations", "/images/edits", "/responses"]) {
+      expect(buildProviderEndpoint(input, endpoint)).toBe(`${normalized}${endpoint}`);
+    }
+  });
+
+  it.each([
+    "http://provider.example", "https://localhost", "https://127.0.0.1",
+    "https://user:pass@provider.example", "https://provider.example?key=secret",
+    "https://provider.example#fragment", "not-a-url",
+  ])("still rejects unsafe or invalid domain-only URLs: %s", (input) => {
+    expect(validateBaseURL(input).ok).toBe(false);
+  });
+
   it("detects Small Token provider URLs", () => {
     expect(isTokenFourjBaseURL("https://token.fourj.space/v1")).toBe(true);
     expect(isTokenFourjBaseURL("https://image.fourj.space/v1")).toBe(true);

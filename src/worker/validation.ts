@@ -1,3 +1,4 @@
+import { clampQualityForModel, isOutputFormatSupportedForModel } from "../image-models";
 import { envNumber } from "./http";
 
 export const RATIO_TO_SIZE = {
@@ -10,8 +11,8 @@ export const RATIO_TO_SIZE = {
   "1:1": [1024, 1024],
 } as const;
 
-const QUALITIES = new Set(["auto", "low", "medium", "high"]);
-const FORMATS = new Set(["png", "webp", "jpeg"]);
+const QUALITIES = new Set(["auto", "low", "medium", "high", "xhigh", "max"]);
+const FORMATS = new Set(["png", "webp", "jpeg", "gif", "svg"]);
 const BACKGROUNDS = new Set(["auto", "opaque", "transparent"]);
 const MODERATIONS = new Set(["auto", "low"]);
 
@@ -21,9 +22,9 @@ export interface GenerationInput {
   aspectRatio: string;
   width: number;
   height: number;
-  quality: "auto" | "low" | "medium" | "high";
+  quality: "auto" | "low" | "medium" | "high" | "xhigh" | "max";
   quantity: number;
-  outputFormat: "png" | "webp" | "jpeg";
+  outputFormat: "png" | "webp" | "jpeg" | "gif" | "svg";
   background: "auto" | "opaque" | "transparent";
   compression: number;
   moderation: "auto" | "low";
@@ -58,9 +59,13 @@ export function parseGenerationInput(raw: unknown, maxImagesValue?: string): { i
   let width = hasExplicitSize ? toInt(body.width, ratioSize?.[0] ?? 1024) : ratioSize?.[0] ?? toInt(body.width, 1024);
   let height = hasExplicitSize ? toInt(body.height, ratioSize?.[1] ?? 1024) : ratioSize?.[1] ?? toInt(body.height, 1024);
 
-  const quality = typeof body.quality === "string" && QUALITIES.has(body.quality) ? body.quality : "auto";
+  const rawQuality = typeof body.quality === "string" && QUALITIES.has(body.quality) ? body.quality : "auto";
+  const quality = clampQualityForModel(model, rawQuality);
   const quantity = toInt(body.quantity, 1);
   const outputFormat = typeof body.outputFormat === "string" && FORMATS.has(body.outputFormat) ? body.outputFormat : "png";
+  if (!isOutputFormatSupportedForModel(model, outputFormat)) {
+    return { error: "GIF 和 SVG 输出目前仅支持 image-2.6。" };
+  }
   const background = typeof body.background === "string" && BACKGROUNDS.has(body.background) ? body.background : "auto";
   const compression = toInt(body.compression, 100);
   const moderation = typeof body.moderation === "string" && MODERATIONS.has(body.moderation) ? body.moderation : "auto";

@@ -1,0 +1,10 @@
+import { forwardRef, type SVGProps } from "react";
+import { CentralIcon } from "./icon";
+
+export const IconFocusZoomIn = forwardRef<SVGSVGElement, SVGProps<SVGSVGElement>>(function IconFocusZoomIn(props, ref) {
+  return (
+    <CentralIcon ref={ref} {...props}>
+      <path d="M3.75 8V6.75C3.75 5.09315 5.09315 3.75 6.75 3.75H8M3.75 16V17.25C3.75 18.9069 5.09315 20.25 6.75 20.25H8M16 3.75H17.25C18.9069 3.75 20.25 5.09315 20.25 6.75V8M20.25 16V17.25C20.25 18.9069 18.9069 20.25 17.25 20.25H16M8.75 12H15.25" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    </CentralIcon>
+  );
+});

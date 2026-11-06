@@ -8,6 +8,8 @@ import {
   FileText,
   Images,
   LogOut,
+  Plus,
+  RefreshCw,
   RotateCcw,
   Trash2,
   X,
@@ -31,21 +33,32 @@ import {
 import type { DateRange } from "react-day-picker";
 import { BorderBeam } from "border-beam";
 import { Alert, AlertDescription } from "./components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "./components/ui/alert-dialog";
 import { Button } from "./components/ui/button";
 import { Calendar } from "./components/ui/calendar";
 import { Input, type InputProps } from "./components/ui/input";
 import { Popover, PopoverPopup, PopoverTrigger } from "./components/ui/popover";
-import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem, ImageProviderProfile, ProviderSettings, SettingsProviders } from "./api";
+import { api, AppConfig, generatedImageDisplayUrl, GenerationJob, GenerationRecord, getGenerationStatus, ImageItem, ImageProviderProfile, ProviderSettings, SettingsProviders, supportsGeneratedImageEditing } from "./api";
 import { EntryField, EntryFormSection, EntryNoticeStack, EntryShell, EntryStatusScreen } from "./features/auth/EntryScreens";
-import { GenerateMenuView, HoverImageActionBar, ImagePreview, type HoverImageAction } from "./features/generate-menu/GenerateMenuView";
-import { AppShell } from "./features/generate-shell/AppShell";
+import { GenerateMenuView, HoverImageActionBar, ImagePreview, resolveGenerationPollIntervalMs, shouldPollGeneration, type HoverImageAction } from "./features/generate-menu/GenerateMenuView";
+import { AppShell, type WorkspaceView } from "./features/generate-shell/AppShell";
+import { InfiniteCanvasView } from "./features/infinite-canvas/InfiniteCanvasView";
 import { GenerationFormFooter, ParameterSection, PromptPlaceholderThumbnail, PromptSection } from "./features/shared/generation-form-sections";
+import { GeneratedImage } from "./features/shared/GeneratedImage";
 import { GenerationDotMatrixLoader, generationDotMatrixColumns, generationDotMatrixRows } from "./features/shared/generation-loading";
 import { CossBadge, CossButton, CossInput, CossSelect, CossSeparator } from "./features/shared/coss";
 import { buildGalleryGroups, galleryHasHiddenDefaultRangeItems, normalizeGalleryDateFilter, type GalleryDateFilter } from "./gallery-utils";
 import { generationProgressSummary } from "./generation-progress";
 import { isTerminalGenerationJobStatus, mergePolledJobState } from "./generation-state";
-import { DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS, imageModelLabel } from "../image-models";
+import { DEFAULT_IMAGE_MODEL, imageModelLabel, outputFormatsForModel } from "../image-models";
 import addIcon from "./assets/figma/add.svg";
 import figmaLogo from "./assets/figma/logo.png";
 import generationContinueIcon from "./assets/figma/generation-continue.svg";
@@ -59,7 +72,7 @@ import openaiIcon from "./assets/figma/openai.svg";
 import referenceDeleteIcon from "./assets/figma/reference-delete.svg";
 import { cn } from "./lib/utils";
 
-type View = "generate" | "gallery" | "settings" | "inspiration";
+type View = WorkspaceView;
 
 interface MeState {
   space: { id: string; name: string };
@@ -110,8 +123,8 @@ type LoadGenerationRecords = (cursor?: string, options?: { background?: boolean 
 
 const FIGMA_RATIOS = ["16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "1:1"] as const;
 const RESOLUTIONS = ["1K", "2K", "4K"] as const;
-const QUALITY_OPTIONS = ["auto", "low", "medium", "high"] as const;
-const FORMAT_OPTIONS = ["png", "jpeg", "webp"] as const;
+const QUALITY_OPTIONS = ["auto", "low", "medium", "high", "xhigh", "max"] as const;
+const FORMAT_OPTIONS = ["png", "jpeg", "webp", "gif", "svg"] as const;
 const PROMPT_OPTIMIZER_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4"] as const;
 const REFERENCE_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 const MAX_REFERENCE_IMAGES = 6;
@@ -156,19 +169,22 @@ const baseRatioSizes: Record<string, [number, number]> = {
 };
 
 const qualityLabels: Record<string, string> = {
-  auto: "自动",
-  low: "低",
-  medium: "中",
-  high: "高",
+  auto: "Auto",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "XHigh",
+  max: "Max",
 };
 
 const formatLabels: Record<string, string> = {
   png: "PNG",
   jpeg: "JPEG",
   webp: "WEBP",
+  gif: "GIF",
+  svg: "SVG",
 };
 
-const GENERATION_POLL_INTERVAL_MS = 2000;
 const IMAGE_PREVIEW_VIEWPORT_GAP = 24;
 const IMAGE_PREVIEW_IMAGE_INSET = 61;
 const IMAGE_PREVIEW_EDITOR_WIDTH = 400;
@@ -193,8 +209,8 @@ const fallbackConfig: AppConfig = {
   maxImagesPerRequest: 4,
   generationTimeoutSeconds: 600,
   ratios: [...FIGMA_RATIOS],
-  qualities: ["auto", "low", "medium", "high"],
-  formats: ["png", "jpeg", "webp"],
+  qualities: ["auto", "low", "medium", "high", "xhigh", "max"],
+  formats: ["png", "jpeg", "webp", "gif", "svg"],
   turnstileSiteKey: "",
   turnstileRequired: false,
 };
@@ -237,7 +253,10 @@ export function App() {
     setGenerationRecordsError("");
     try {
       const path = cursor ? `/api/generations?cursor=${encodeURIComponent(cursor)}` : "/api/generations";
-      const result = await api<{ ok: true; records: GenerationRecord[]; nextCursor: string | null }>(path);
+      const result = await api<{ ok: true; records: GenerationRecord[]; nextCursor: string | null }>(path, {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache" },
+      });
       setGenerationRecords((current) => mergeGenerationRecordList(current, result.records, cursor ? "append" : "replace"));
       setGenerationNextCursor(result.nextCursor);
     } catch (err) {
@@ -252,11 +271,23 @@ export function App() {
       ok: true;
       space: MeState["space"];
       providerConfigured: boolean;
+      model?: string;
+      modelOptions?: string[];
     }>("/api/me");
     setMe({
       space: result.space,
       providerConfigured: result.providerConfigured,
     });
+    if (result.modelOptions?.length) {
+      setConfig((current) => {
+        const base = current ?? fallbackConfig;
+        return {
+          ...base,
+          model: result.modelOptions?.includes(base.model) ? base.model : result.model ?? base.model,
+          modelOptions: result.modelOptions,
+        };
+      });
+    }
   }, []);
   const editImageFromGallery = useCallback((image: ImageItem, draft?: GenerateForm, mask?: ImageSelectionMask) => {
     setImageToEdit(image);
@@ -287,10 +318,17 @@ export function App() {
         ok: true;
         space: MeState["space"];
         providerConfigured: boolean;
+        model?: string;
+        modelOptions?: string[];
       }>("/api/me").catch(() => null),
     ]).then(([appConfig, user]) => {
       if (!mounted) return;
-      setConfig(appConfig);
+      setConfig({
+        ...appConfig,
+        ...(user?.modelOptions?.length
+          ? { model: user.modelOptions.includes(appConfig.model) ? appConfig.model : user.model ?? appConfig.model, modelOptions: user.modelOptions }
+          : {}),
+      });
       setMe(
         user
           ? {
@@ -330,6 +368,20 @@ export function App() {
   }
   if (shouldShowGenerateBooting(view, me, generationRecordsReady)) {
     return <EntryStatusScreen label="正在加载会话消息" detail="会话记录与生成状态正在进入新的 coss 工作区。" />;
+  }
+  if (view === "canvas") {
+    return (
+      <InfiniteCanvasView
+        config={effectiveConfig}
+        providerConfigured={me.providerConfigured}
+        onNavigate={setView}
+        onProviderNeeded={() => setView("settings")}
+        onLogout={async () => {
+          await api("/api/auth/logout", { method: "POST" });
+          setMe(null);
+        }}
+      />
+    );
   }
   if (view === "generate") {
     return (
@@ -400,7 +452,7 @@ function registerImageCacheServiceWorker(): void {
 }
 
 export function usesAppShellFrame(view: View) {
-  return view === "generate" || view === "gallery" || view === "settings" || view === "inspiration";
+  return view === "generate" || view === "canvas" || view === "gallery" || view === "settings" || view === "inspiration";
 }
 
 export function shouldShowWorkspaceSidebar(view: View) {
@@ -539,12 +591,15 @@ function GenerateView({
     [config.qualities],
   );
   const formatOptions = useMemo(
-    () => FORMAT_OPTIONS.filter((format) => config.formats.includes(format) || fallbackConfig.formats.includes(format)),
-    [config.formats],
+    () => FORMAT_OPTIONS.filter((format) => outputFormatsForModel(config.model).includes(format) && (config.formats.includes(format) || fallbackConfig.formats.includes(format))),
+    [config.formats, config.model],
   );
   const refreshUsage = useCallback(() => {
     void onUsageChanged().catch(() => undefined);
   }, [onUsageChanged]);
+  useEffect(() => {
+    setForm((current) => outputFormatsForModel(config.model).includes(current.outputFormat) ? current : { ...current, outputFormat: "png" });
+  }, [config.model]);
   useEffect(() => {
     if (promptTextareaRef.current) resizePromptTextarea(promptTextareaRef.current);
   }, [form.prompt]);
@@ -687,23 +742,30 @@ function GenerateView({
 
   useEffect(() => {
     if (!job || isTerminalJobStatus(job.status)) return;
-    const timer = window.setInterval(async () => {
+    let cancelled = false;
+    let timer: number | undefined;
+    let inFlight = false;
+    const clearTimer = () => { if (timer !== undefined) window.clearTimeout(timer); timer = undefined; };
+    const poll = async () => {
+      if (cancelled) return;
+      clearTimer();
+      if (!shouldPollGeneration(document.visibilityState)) { timer = window.setTimeout(poll, 5000); return; }
+      if (inFlight) return;
+      inFlight = true;
       try {
-        const result = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${job.id}`);
-        setJob(result.job);
-        setImages(result.images);
-        upsertRecord(result.job, result.images);
-        if (isTerminalJobStatus(result.job.status)) {
-          window.clearInterval(timer);
-          refreshUsage();
-          void loadRecords(undefined, { background: true });
-        }
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "刷新任务状态失败。");
-      }
-    }, GENERATION_POLL_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, [job?.id, job?.status, loadRecords, refreshUsage, upsertRecord]);
+        const result = await getGenerationStatus(job.id);
+        if (cancelled) return;
+        const nextJob = mergePolledJobState(job, result.job);
+        setJob(nextJob); setImages(result.images); upsertRecord(nextJob, result.images);
+        if (isTerminalJobStatus(nextJob.status)) { refreshUsage(); void loadRecords(undefined, { background: true }); return; }
+      } catch (err) { if (!cancelled) setError(err instanceof Error ? err.message : "刷新任务状态失败。"); }
+      finally { inFlight = false; if (!cancelled) timer = window.setTimeout(poll, resolveGenerationPollIntervalMs(job.created_at)); }
+    };
+    const refresh = () => { if (shouldPollGeneration(document.visibilityState)) void poll(); };
+    document.addEventListener("visibilitychange", refresh); window.addEventListener("focus", refresh); window.addEventListener("online", refresh);
+    void poll();
+    return () => { cancelled = true; clearTimer(); document.removeEventListener("visibilitychange", refresh); window.removeEventListener("focus", refresh); window.removeEventListener("online", refresh); };
+  }, [job?.id, job?.status, job?.created_at, loadRecords, refreshUsage, upsertRecord]);
 
   useEffect(() => {
     if (!job || isTerminalJobStatus(job.status)) {
@@ -783,7 +845,7 @@ function GenerateView({
       });
       refreshUsage();
       setForm((current) => (current.prompt === submittedPrompt ? { ...current, prompt: "" } : current));
-      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+      const firstPoll = await getGenerationStatus(result.jobId);
       setJob(firstPoll.job);
       setImages(firstPoll.images);
       upsertRecord(firstPoll.job, firstPoll.images);
@@ -825,7 +887,7 @@ function GenerateView({
         method: "POST",
       });
       refreshUsage();
-      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+      const firstPoll = await getGenerationStatus(result.jobId);
       setJob(firstPoll.job);
       setImages(firstPoll.images);
       upsertRecord(firstPoll.job, firstPoll.images);
@@ -880,7 +942,7 @@ function GenerateView({
       refreshUsage();
       void (async () => {
         try {
-          const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+          const firstPoll = await getGenerationStatus(result.jobId);
           setJob(firstPoll.job);
           setImages(firstPoll.images);
           upsertRecord(firstPoll.job, firstPoll.images);
@@ -949,7 +1011,7 @@ function GenerateView({
                   <div className="thin-scrollbar flex min-w-0 flex-1 gap-2 overflow-x-auto">
                     {referenceImages.map((referenceImage, index) => (
                       <div key={`${referenceImage.url}-${index}`} className="relative h-16 w-12 shrink-0 overflow-hidden rounded-[6px] border border-white/10 bg-white/10">
-                        <img src={referenceImage.url} alt={referenceImage.name} className="size-full object-cover" />
+                        <img src={referenceImage.url} alt={referenceImage.name} loading="lazy" decoding="async" className="size-full object-cover" />
                         <CossButton
                           type="button"
                           variant="secondary"
@@ -1294,6 +1356,7 @@ function GenerationReferenceSnapshots({ job }: { job: GenerationJob }) {
             src={reference.url}
             alt={reference.name || `参考图 ${index + 1}`}
             loading="lazy"
+            decoding="async"
             className="h-12 w-9 shrink-0 rounded-[6px] border border-white/10 bg-white/10 object-cover"
           />
         ))}
@@ -1355,7 +1418,7 @@ function GenerationThumbnail({ image, onOpen }: { image: ImageItem; onOpen: () =
       aria-label="查看大图"
       onClick={onOpen}
     >
-      <img key={image.id} src={image.thumbnailUrl ?? image.url} alt={image.prompt ?? "生成图片"} loading="lazy" className="size-full object-cover" />
+      <GeneratedImage key={image.id} src={generatedImageDisplayUrl(image)} fallbackSrc={image.url} alt={image.prompt ?? "生成图片"} loading="lazy" decoding="async" className="size-full object-cover" />
     </CossButton>
   );
 }
@@ -1387,7 +1450,7 @@ function buildRecordPreviewActions(
         confirmLabel: "删除",
       },
     },
-  ];
+  ].filter((action) => supportsGeneratedImageEditing(image) || (action.key !== "continue" && action.key !== "local-edit"));
 }
 
 function GalleryView({
@@ -1435,8 +1498,8 @@ function GalleryView({
     [config.qualities],
   );
   const formatOptions = useMemo(
-    () => FORMAT_OPTIONS.filter((format) => config.formats.includes(format) || fallbackConfig.formats.includes(format)),
-    [config.formats],
+    () => FORMAT_OPTIONS.filter((format) => outputFormatsForModel(config.model).includes(format) && (config.formats.includes(format) || fallbackConfig.formats.includes(format))),
+    [config.formats, config.model],
   );
   const refreshUsage = useCallback(() => {
     void onUsageChanged().catch(() => undefined);
@@ -1478,23 +1541,30 @@ function GalleryView({
 
   useEffect(() => {
     if (!activeJob || isTerminalJobStatus(activeJob.status)) return;
-    const timer = window.setInterval(async () => {
+    let cancelled = false;
+    let timer: number | undefined;
+    let inFlight = false;
+    const clearTimer = () => { if (timer !== undefined) window.clearTimeout(timer); timer = undefined; };
+    const poll = async () => {
+      if (cancelled) return;
+      clearTimer();
+      if (!shouldPollGeneration(document.visibilityState)) { timer = window.setTimeout(poll, 5000); return; }
+      if (inFlight) return;
+      inFlight = true;
       try {
-        const result = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${activeJob.id}`);
-        setActiveJob(result.job);
-        setActiveImages(result.images);
-        upsertRecord(result.job, result.images);
-        if (isTerminalJobStatus(result.job.status)) {
-          window.clearInterval(timer);
-          refreshUsage();
-          void loadRecords(undefined, { background: true });
-        }
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "刷新任务状态失败。");
-      }
-    }, GENERATION_POLL_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, [activeJob?.id, activeJob?.status, loadRecords, refreshUsage, upsertRecord]);
+        const result = await getGenerationStatus(activeJob.id);
+        if (cancelled) return;
+        const nextJob = mergePolledJobState(activeJob, result.job);
+        setActiveJob(nextJob); setActiveImages(result.images); upsertRecord(nextJob, result.images);
+        if (isTerminalJobStatus(nextJob.status)) { refreshUsage(); void loadRecords(undefined, { background: true }); return; }
+      } catch (err) { if (!cancelled) setError(err instanceof Error ? err.message : "刷新任务状态失败。"); }
+      finally { inFlight = false; if (!cancelled) timer = window.setTimeout(poll, resolveGenerationPollIntervalMs(activeJob.created_at)); }
+    };
+    const refresh = () => { if (shouldPollGeneration(document.visibilityState)) void poll(); };
+    document.addEventListener("visibilitychange", refresh); window.addEventListener("focus", refresh); window.addEventListener("online", refresh);
+    void poll();
+    return () => { cancelled = true; clearTimer(); document.removeEventListener("visibilitychange", refresh); window.removeEventListener("focus", refresh); window.removeEventListener("online", refresh); };
+  }, [activeJob?.id, activeJob?.status, activeJob?.created_at, loadRecords, refreshUsage, upsertRecord]);
 
   useEffect(() => {
     if (!activeJob || isTerminalJobStatus(activeJob.status)) {
@@ -1539,7 +1609,7 @@ function GalleryView({
         method: "POST",
       });
       refreshUsage();
-      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+      const firstPoll = await getGenerationStatus(result.jobId);
       setActiveJob(firstPoll.job);
       setActiveImages(firstPoll.images);
       upsertRecord(firstPoll.job, firstPoll.images);
@@ -1591,7 +1661,7 @@ function GalleryView({
       refreshUsage();
       void (async () => {
         try {
-          const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+          const firstPoll = await getGenerationStatus(result.jobId);
           setActiveJob(firstPoll.job);
           setActiveImages(firstPoll.images);
           upsertRecord(firstPoll.job, firstPoll.images);
@@ -1770,7 +1840,7 @@ function buildGalleryImageActions(
         confirmLabel: "删除",
       },
     },
-  ];
+  ].filter((action) => supportsGeneratedImageEditing(item.image) || (action.key !== "continue" && action.key !== "local-edit"));
 }
 
 function GalleryImageCard({
@@ -1795,7 +1865,7 @@ function GalleryImageCard({
   return (
     <div data-image-action-host className="group relative overflow-hidden rounded-[24px] border border-white/10 bg-white/[0.04]">
       <CossButton type="button" variant="ghost" className="block aspect-square h-auto w-full rounded-none border-0 bg-transparent p-0 hover:bg-transparent" onClick={onOpen}>
-        <img src={item.image.thumbnailUrl ?? item.image.url} alt={item.job.prompt || "生成图片"} className="h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]" />
+        <GeneratedImage src={generatedImageDisplayUrl(item.image)} fallbackSrc={item.image.url} alt={item.job.prompt || "生成图片"} loading="lazy" decoding="async" className="h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]" />
       </CossButton>
       <div className="pointer-events-none absolute bottom-3 right-3 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
         <HoverImageActionBar actions={actions} />
@@ -1818,9 +1888,10 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
   const [imageBaseURL, setImageBaseURL] = useState("");
   const [imageApiKey, setImageApiKey] = useState("");
   const [imageApiKeyHint, setImageApiKeyHint] = useState("");
-  const [imageModel, setImageModel] = useState(optionOrFallback(config.model, IMAGE_MODEL_OPTIONS));
+  const [imageModel, setImageModel] = useState(config.model || DEFAULT_IMAGE_MODEL);
   const [imageProviderName, setImageProviderName] = useState("默认配置");
   const [imageProviders, setImageProviders] = useState<ImageProviderProfile[]>([]);
+  // 正在查看/编辑的配置（纯本地状态，点一下不会启用它）。
   const [activeImageProviderId, setActiveImageProviderId] = useState<string | null>(null);
   const [promptBaseURL, setPromptBaseURL] = useState("");
   const [promptApiKey, setPromptApiKey] = useState("");
@@ -1831,22 +1902,71 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
   const [savingKind, setSavingKind] = useState<"image" | "prompt" | null>(null);
   const [testingKind, setTestingKind] = useState<"image" | "prompt" | null>(null);
 
-  function applySettingsResult(result: SettingsProviders) {
-    const profiles = result.imageProviders ?? [];
-    const activeId = result.activeImageProviderId ?? profiles[0]?.id ?? null;
-    setImageProviders(profiles);
-    setActiveImageProviderId(activeId);
-    const activeProfile = profiles.find((profile) => profile.id === activeId);
-    setImageProviderName(activeProfile?.name ?? "默认配置");
-    if (result.imageProvider) {
-      setImageBaseURL(result.imageProvider.baseURL);
-      setImageApiKeyHint(result.imageProvider.apiKeyHint);
-      setImageModel(optionOrFallback(result.imageProvider.model, IMAGE_MODEL_OPTIONS));
+  const [loadingSettings, setLoadingSettings] = useState(true);
+  const [changingProfile, setChangingProfile] = useState(false);
+  const [discoveringModels, setDiscoveringModels] = useState(false);
+  const [pendingDeleteProfile, setPendingDeleteProfile] = useState<ImageProviderProfile | null>(null);
+  const operationInFlight = useRef(false);
+  // 删除/新增取消会改动列表本身，仍需短暂禁用表单。
+  const busy = loadingSettings || changingProfile || savingKind !== null || testingKind !== null;
+
+  function applySettingsResult(result: SettingsProviders, kind?: "image" | "prompt") {
+    if (kind !== "prompt") {
+      const profiles = result.imageProviders ?? [];
+      const activeId = result.activeImageProviderId ?? profiles[0]?.id ?? null;
+      setImageProviders(profiles);
+      // 当前查看的配置若还在列表里就保持不动，否则回落到启用项。
+      const viewedId = profiles.some((profile) => profile.id === activeImageProviderId) ? activeImageProviderId : activeId;
+      const viewedProfile = profiles.find((profile) => profile.id === viewedId);
+      setActiveImageProviderId(viewedId);
+      if (viewedProfile) {
+        setImageProviderName(viewedProfile.name);
+        setImageBaseURL(viewedProfile.baseURL);
+        setImageApiKeyHint(viewedProfile.apiKeyHint);
+        setImageModel(viewedProfile.model || DEFAULT_IMAGE_MODEL);
+      }
     }
-    if (result.promptProvider) {
+    if (kind !== "image" && result.promptProvider) {
       setPromptBaseURL(result.promptProvider.baseURL);
       setPromptApiKeyHint(result.promptProvider.apiKeyHint);
       setPromptModel(optionOrFallback(result.promptProvider.model, PROMPT_OPTIMIZER_MODEL_OPTIONS));
+    }
+  }
+
+  function applyDiscoveredModels(result: SettingsProviders) {
+    const profiles = result.imageProviders ?? [];
+    setImageProviders(profiles);
+    return profiles.find((profile) => profile.id === activeImageProviderId)?.models ?? [];
+  }
+
+  async function refreshModelCatalog(options: { providerIds?: string[]; announce?: boolean } = {}) {
+    setDiscoveringModels(true);
+    try {
+      const result = await api<{ ok: true } & SettingsProviders>("/api/settings/provider/discover-models", {
+        method: "POST",
+        body: JSON.stringify(options.providerIds?.length ? { providerIds: options.providerIds } : {}),
+      });
+      const models = applyDiscoveredModels(result);
+      if (options.announce) {
+        const source = result.imageProviders?.find((profile) => profile.id === activeImageProviderId)?.modelSource;
+        setMessage(source === "preset" ? "服务商未返回模型列表，已提供官方 ID 预置模型；尚未验证该服务商是否支持。" : models.length > 0 ? `服务商返回 ${models.length} 个模型，尚未验证生图能力。` : "探测完成，但 provider 没有返回可用模型。");
+      }
+      return models;
+    } finally {
+      setDiscoveringModels(false);
+    }
+  }
+
+  async function discoverModels(options: { providerIds?: string[]; announce?: boolean } = {}) {
+    if (operationInFlight.current) return;
+    operationInFlight.current = true;
+    try {
+      await refreshModelCatalog(options);
+      await onSaved().catch(() => undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "探测模型失败。");
+    } finally {
+      operationInFlight.current = false;
     }
   }
 
@@ -1855,56 +1975,104 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
     api<{ ok: true } & SettingsProviders>("/api/settings/provider").then((result) => {
       if (!mounted) return;
       applySettingsResult(result);
+      const profiles = result.imageProviders ?? [];
+      const activeId = result.activeImageProviderId ?? profiles[0]?.id ?? null;
+      const activeProfile = profiles.find((profile) => profile.id === activeId);
+      if (activeId && activeProfile && !(activeProfile.models?.length)) {
+        void discoverModels({ providerIds: [activeId] });
+      }
+    }).catch((err) => {
+      if (mounted) setError(err instanceof Error ? err.message : "加载 Provider 配置失败。");
+    }).finally(() => {
+      if (mounted) setLoadingSettings(false);
     });
     return () => {
       mounted = false;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function startNewImageProvider() {
+    if (busy || operationInFlight.current) return;
     setActiveImageProviderId(null);
-    setImageProviderName("新配置");
+    let suffix = 1;
+    while (imageProviders.some((profile) => profile.name === `新配置 ${suffix}`)) suffix += 1;
+    setImageProviderName(`新配置 ${suffix}`);
     setImageBaseURL("");
     setImageApiKey("");
     setImageApiKeyHint("");
-    setImageModel(IMAGE_MODEL_OPTIONS[1]);
+    setImageModel(DEFAULT_IMAGE_MODEL);
     setMessage("");
     setError("");
   }
 
-  async function selectImageProvider(providerId: string) {
+  function applyProfileToForm(profile: ImageProviderProfile) {
+    setActiveImageProviderId(profile.id);
+    setImageProviderName(profile.name);
+    setImageBaseURL(profile.baseURL);
+    setImageApiKeyHint(profile.apiKeyHint);
+    setImageApiKey("");
+    setImageModel(profile.model || DEFAULT_IMAGE_MODEL);
+  }
+
+  // 设置里的配置列表只用于查看/编辑，切换生效由对话框里的配置选择负责。
+  function selectImageProvider(providerId: string) {
+    const profile = imageProviders.find((item) => item.id === providerId);
+    if (!profile || providerId === activeImageProviderId) return;
+    if (busy) return;
+    setError("");
+    setMessage("");
+    applyProfileToForm(profile);
+  }
+
+  async function deleteImageProvider(profile: ImageProviderProfile) {
+    if (busy || operationInFlight.current) return;
+    operationInFlight.current = true;
+    setChangingProfile(true);
     setError("");
     setMessage("");
     try {
-      const result = await api<{ ok: true } & SettingsProviders>("/api/settings/provider/select", {
-        method: "POST",
-        body: JSON.stringify({ providerId }),
+      const result = await api<{ ok: true } & SettingsProviders>(`/api/settings/provider/profiles/${encodeURIComponent(profile.id)}`, {
+        method: "DELETE",
       });
-      applySettingsResult(result);
+      applySettingsResult(result, "image");
       setImageApiKey("");
-      setMessage("生图 Provider 已切换。");
+      setMessage(`生图 Provider 配置「${profile.name}」已删除。`);
+      await onSaved().catch(() => setError("配置已删除，但页面状态刷新失败，请刷新页面。"));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "切换失败。");
+      setError(err instanceof Error ? err.message : "删除失败。");
+    } finally {
+      operationInFlight.current = false;
+      setChangingProfile(false);
     }
   }
 
-  async function deleteImageProvider() {
-    if (!activeImageProviderId) return;
+  async function cancelNewImageProvider() {
+    if (busy || operationInFlight.current) return;
+    operationInFlight.current = true;
+    setChangingProfile(true);
     setError("");
     setMessage("");
     try {
-      const result = await api<{ ok: true } & SettingsProviders>(`/api/settings/provider/profiles/${encodeURIComponent(activeImageProviderId)}`, {
-        method: "DELETE",
-      });
-      applySettingsResult(result);
+      const result = await api<{ ok: true } & SettingsProviders>("/api/settings/provider");
+      applySettingsResult(result, "image");
       setImageApiKey("");
-      setMessage("生图 Provider 配置已删除。");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除失败。");
+      setError(err instanceof Error ? err.message : "恢复配置失败，请刷新页面。");
+    } finally {
+      operationInFlight.current = false;
+      setChangingProfile(false);
     }
   }
 
   async function save(kind: "image" | "prompt") {
+    if (busy || operationInFlight.current) return;
+    if (kind === "image" && !activeImageProviderId && !imageApiKey.trim()) {
+      setError("新增配置时请输入 API Key。");
+      setMessage("");
+      return;
+    }
+    operationInFlight.current = true;
     setSavingKind(kind);
     setError("");
     setMessage("");
@@ -1931,32 +2099,46 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
               }),
         }),
       });
-      applySettingsResult(result);
+      applySettingsResult(result, kind);
       if (kind === "image") {
         setImageApiKey("");
-      } else {
-        setPromptApiKey("");
+        setMessage("生图 Provider 配置已保存，正在探测可用模型…");
+        await onSaved().catch(() => setError("配置已保存，但页面状态刷新失败，请刷新页面。"));
+        await refreshModelCatalog({ announce: true }).catch((err) => {
+          setError(err instanceof Error ? err.message : "配置已保存，但模型探测失败。");
+        });
+        return;
       }
-      setMessage(`${kind === "image" ? "生图" : "提示词"} Provider 配置已保存。`);
-      await onSaved();
+      setPromptApiKey("");
+      setMessage("提示词 Provider 配置已保存。");
+      await onSaved().catch(() => setError("配置已保存，但页面状态刷新失败，请刷新页面。"));
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存失败。");
     } finally {
+      operationInFlight.current = false;
       setSavingKind(null);
     }
   }
 
   async function test(kind: "image" | "prompt") {
+    if (busy || operationInFlight.current) return;
+    if (kind === "image" && !activeImageProviderId && !imageApiKey.trim()) {
+      setError("新增配置时请输入 API Key。");
+      setMessage("");
+      return;
+    }
+    operationInFlight.current = true;
     setTestingKind(kind);
     setError("");
     setMessage("");
     try {
-      const result = await api<{ ok: true; result: { ok: boolean; message: string; status: number } }>("/api/provider/test", {
+      const result = await api<{ ok: true; result: { ok: boolean; message: string; status: number; models?: string[]; modelSource?: "discovered" | "preset" } }>("/api/provider/test", {
         method: "POST",
         body: JSON.stringify(
           kind === "image"
             ? {
                 kind,
+                providerId: activeImageProviderId && activeImageProviderId !== "legacy" ? activeImageProviderId : undefined,
                 baseURL: imageBaseURL.trim(),
                 ...(imageApiKey.trim() ? { apiKey: imageApiKey.trim() } : {}),
               }
@@ -1967,10 +2149,21 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
               },
         ),
       });
+      if (kind === "image" && result.result.models?.length) {
+        const models = result.result.models;
+        setImageProviders((current) =>
+          current.map((profile) => (profile.id === activeImageProviderId ? { ...profile, models, modelSource: result.result.modelSource } : profile)),
+        );
+        setImageModel((current) => (models.includes(current) ? current : models[0]));
+      }
       setMessage(`${kind === "image" ? "生图" : "提示词"} Provider：${result.result.message}`);
+      if (kind === "image" && result.result.ok) {
+        await onSaved().catch(() => setError("模型列表已更新，但页面状态刷新失败，请刷新页面。"));
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "测试失败。");
     } finally {
+      operationInFlight.current = false;
       setTestingKind(null);
     }
   }
@@ -1981,24 +2174,35 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
         <div className="grid gap-5 xl:grid-cols-2">
           <SettingsProviderSection
             kind="image"
+            disabled={busy}
             title="生图 Provider"
             baseURL={imageBaseURL}
             apiKey={imageApiKey}
             apiKeyHint={imageApiKeyHint}
             model={imageModel}
-            modelOptions={IMAGE_MODEL_OPTIONS}
+            modelCatalog={discoveredModelOptions(imageProviders, activeImageProviderId)}
+            modelCatalogSource={imageProviders.find((profile) => profile.id === activeImageProviderId)?.modelSource}
+            modelCatalogLoading={discoveringModels}
             modelLabel="生图模型"
-            modelOptionLabel={imageModelLabel}
+            onRefreshModelCatalog={() => void discoverModels()}
             providerProfiles={imageProviders}
             activeProviderId={activeImageProviderId}
             providerName={imageProviderName}
             onProviderNameChange={setImageProviderName}
             onProviderSelect={(value) => void selectImageProvider(value)}
             onNewProvider={startNewImageProvider}
-            onDeleteProvider={() => void deleteImageProvider()}
+            onCancelNewProvider={() => void cancelNewImageProvider()}
+            onDeleteProvider={(profile) => {
+              if (imageProviders.length <= 1) {
+                setMessage("");
+                setError("至少需要保留一个生图 Provider 配置。请先新增并保存一个配置，再删除当前配置。");
+                return;
+              }
+              setPendingDeleteProfile(profile);
+            }}
             onBaseURLChange={setImageBaseURL}
             onApiKeyChange={setImageApiKey}
-            onModelChange={(value) => setImageModel(optionOrFallback(value, IMAGE_MODEL_OPTIONS))}
+            onModelChange={setImageModel}
             onTest={() => void test("image")}
             onSave={() => void save("image")}
             saving={savingKind === "image"}
@@ -2006,6 +2210,7 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
           />
           <SettingsProviderSection
             kind="prompt"
+            disabled={busy}
             title="提示词 Provider"
             baseURL={promptBaseURL}
             apiKey={promptApiKey}
@@ -2028,12 +2233,46 @@ function SettingsView({ config, onSaved }: { config: AppConfig; onSaved: () => P
           {error && <Notice tone="error" text={error} />}
         </div>
       </div>
+
+      <AlertDialog open={pendingDeleteProfile !== null} onOpenChange={(open) => { if (!open) setPendingDeleteProfile(null); }}>
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-[20px] font-semibold leading-6 text-white">
+              删除配置「{pendingDeleteProfile?.name}」？
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-[16px] leading-7 text-white/55">
+              {pendingDeleteProfile && pendingDeleteProfile.id === activeImageProviderId
+                ? "这是当前正在使用的生图配置，删除后会自动切换到其他配置。保存的 API Key 会一并删除，此操作不能撤销。"
+                : "将删除该配置及其保存的 API Key，此操作不能撤销。"}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="ghost" className="h-8 border-transparent text-white shadow-none hover:bg-white/[0.08] focus-visible:ring-0" />}>
+              取消
+            </AlertDialogClose>
+            <AlertDialogClose
+              render={
+                <Button
+                  variant="destructive"
+                  className="h-8 min-w-[88px]"
+                  onClick={() => {
+                    if (pendingDeleteProfile) void deleteImageProvider(pendingDeleteProfile);
+                  }}
+                />
+              }
+            >
+              删除
+            </AlertDialogClose>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
     </section>
   );
 }
 
 function SettingsProviderSection({
   kind,
+  disabled,
   title,
   baseURL,
   apiKey,
@@ -2042,12 +2281,17 @@ function SettingsProviderSection({
   modelOptions,
   modelLabel,
   modelOptionLabel,
+  modelCatalog,
+  modelCatalogSource,
+  modelCatalogLoading,
+  onRefreshModelCatalog,
   providerProfiles,
   activeProviderId,
   providerName,
   onProviderNameChange,
   onProviderSelect,
   onNewProvider,
+  onCancelNewProvider,
   onDeleteProvider,
   onBaseURLChange,
   onApiKeyChange,
@@ -2058,21 +2302,27 @@ function SettingsProviderSection({
   testing,
 }: {
   kind: "image" | "prompt";
+  disabled: boolean;
   title: string;
   baseURL: string;
   apiKey: string;
   apiKeyHint: string;
   model: string;
-  modelOptions: readonly string[];
+  modelOptions?: readonly string[];
   modelLabel: string;
   modelOptionLabel?: (value: string) => string;
+  modelCatalog?: readonly string[];
+  modelCatalogSource?: "discovered" | "preset";
+  modelCatalogLoading?: boolean;
+  onRefreshModelCatalog?: () => void;
   providerProfiles?: ImageProviderProfile[];
   activeProviderId?: string | null;
   providerName?: string;
   onProviderNameChange?: (value: string) => void;
   onProviderSelect?: (value: string) => void;
   onNewProvider?: () => void;
-  onDeleteProvider?: () => void;
+  onCancelNewProvider?: () => void;
+  onDeleteProvider?: (profile: ImageProviderProfile) => void;
   onBaseURLChange: (value: string) => void;
   onApiKeyChange: (value: string) => void;
   onModelChange: (value: string) => void;
@@ -2081,6 +2331,7 @@ function SettingsProviderSection({
   saving: boolean;
   testing: boolean;
 }) {
+  const showModelCatalog = modelCatalog !== undefined;
   return (
     <section className="rounded-[24px] border border-white/10 bg-white/[0.04] p-5">
       <div className="mb-5 flex items-start justify-between gap-3">
@@ -2094,31 +2345,89 @@ function SettingsProviderSection({
 
       <CossSeparator className="mb-5 bg-white/8" />
 
-      <div className="flex flex-col gap-3">
+      <fieldset disabled={disabled} className="flex min-w-0 flex-col gap-3">
         {providerProfiles && onProviderSelect && onNewProvider && (
-          <div className="flex items-end gap-2">
-            <label className="flex min-w-0 flex-1 flex-col gap-2">
-              <span className="text-xs leading-none text-white/60">当前配置</span>
-              <CossSelect
-                value={activeProviderId ?? ""}
-                onChange={(event) => onProviderSelect(event.target.value)}
-                className="h-10 min-w-0 justify-start rounded-[12px] border-white/15 bg-transparent px-4 text-sm font-semibold text-white/90"
+          <div className="flex min-w-0 flex-col gap-2">
+            <span className="text-xs leading-none text-white/60">配置列表</span>
+            <div className="flex flex-wrap items-center gap-2">
+              {providerProfiles.map((profile) => {
+                const isActive = profile.id === activeProviderId;
+                return (
+                  <span
+                    key={profile.id}
+                    className={cn(
+                      "inline-flex h-9 items-center gap-1.5 rounded-[12px] border pl-3 pr-1.5 text-xs",
+                      isActive
+                        ? "border-white/25 bg-white/10 font-semibold text-white"
+                        : "border-white/10 bg-white/[0.04] text-white/60 transition hover:border-white/20 hover:bg-white/[0.08] hover:text-white/85",
+                    )}
+                  >
+                    <CossButton
+                      type="button"
+                      variant="ghost"
+                      disabled={disabled || isActive}
+                      aria-label={`查看配置 ${profile.name}`}
+                      className="flex h-auto min-w-0 items-center gap-2 rounded-none border-0 bg-transparent p-0 text-xs font-normal text-inherit hover:bg-transparent disabled:opacity-100"
+                      onClick={() => onProviderSelect(profile.id)}
+                    >
+                      {isActive && <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-white/85" />}
+                      <span className="max-w-[140px] truncate">{profile.name}</span>
+                    </CossButton>
+                    {onDeleteProvider && (
+                      <CossButton
+                        type="button"
+                        variant="ghost"
+                        disabled={disabled}
+                        aria-label={`删除配置 ${profile.name}`}
+                        title={providerProfiles.length > 1 ? "删除该配置" : "至少需要保留一个配置"}
+                        className={cn(
+                          "grid size-5 shrink-0 place-items-center rounded-[6px] border-0 bg-transparent p-0 text-white/35 transition hover:bg-red-400/15 hover:text-red-200",
+                          providerProfiles.length <= 1 && "opacity-40",
+                        )}
+                        onClick={() => onDeleteProvider(profile)}
+                      >
+                        <X className="size-3" />
+                      </CossButton>
+                    )}
+                  </span>
+                );
+              })}
+              {!activeProviderId && (
+                <span className="inline-flex h-9 items-center gap-2 rounded-[12px] border border-dashed border-white/30 bg-white/[0.06] px-3 text-xs font-semibold text-white">
+                  {providerName?.trim() || "新配置"}（未保存）
+                </span>
+              )}
+              <CossButton
+                type="button"
+                variant="outline"
+                disabled={disabled || !activeProviderId}
+                className="h-9 gap-1.5 rounded-[12px] border-dashed border-white/20 px-3 text-xs font-normal text-white/70 hover:bg-white/10 hover:text-white"
+                onClick={onNewProvider}
               >
-                {providerProfiles.map((profile) => (
-                  <option key={profile.id} value={profile.id} className="bg-[#191919] text-white">
-                    {profile.name}
-                  </option>
-                ))}
-              </CossSelect>
-            </label>
-            <CossButton type="button" variant="outline" className="h-10 shrink-0 rounded-[12px] border-white/15 px-3 text-xs" onClick={onNewProvider}>
-              新增
-            </CossButton>
-            {providerProfiles.length > 1 && onDeleteProvider && (
-              <CossButton type="button" variant="outline" className="h-10 shrink-0 rounded-[12px] border-red-200/20 px-3 text-xs text-red-100/80 hover:bg-red-400/10" onClick={onDeleteProvider}>
-                删除
+                <Plus className="size-3.5" />
+                新增配置
               </CossButton>
-            )}
+            </div>
+            <p className="flex min-w-0 items-center gap-1 text-xs leading-[18px] text-white/40">
+              {activeProviderId ? (
+                "点选上方配置即可查看和编辑。"
+              ) : (
+                <>
+                  新配置尚未保存。
+                  {onCancelNewProvider && (
+                    <CossButton
+                      type="button"
+                      variant="link"
+                      disabled={disabled}
+                      className="h-auto p-0 text-xs leading-[18px] text-white/70"
+                      onClick={onCancelNewProvider}
+                    >
+                      取消新增
+                    </CossButton>
+                  )}
+                </>
+              )}
+            </p>
           </div>
         )}
         {providerProfiles && onProviderNameChange && (
@@ -2134,24 +2443,36 @@ function SettingsProviderSection({
           autoComplete="new-password"
           placeholder={apiKeyHint ? `已保存：${apiKeyHint}` : "请输入 API Key"}
         />
-        <SettingsSelectField label={modelLabel} value={model} values={modelOptions} optionLabel={modelOptionLabel} onChange={onModelChange} />
-      </div>
+        {showModelCatalog ? (
+          <SettingsModelCatalog
+            label={modelLabel}
+            models={modelCatalog}
+            source={modelCatalogSource}
+            loading={Boolean(modelCatalogLoading)}
+            onRefresh={onRefreshModelCatalog}
+          />
+        ) : (
+          <SettingsSelectField disabled={disabled} label={modelLabel} value={model} values={modelOptions ?? []} optionLabel={modelOptionLabel} onChange={onModelChange} />
+        )}
+      </fieldset>
 
       <div className="mt-4 flex flex-wrap items-center gap-3">
         <CossButton
           type="button"
           variant="default"
           className="h-10 rounded-[12px] border-white/10 bg-white/90 px-4 py-0 text-xs font-semibold leading-none text-[#121212] shadow-none hover:bg-white/90 hover:text-[#121212]"
+          disabled={disabled}
           loading={saving}
           onClick={onSave}
         >
-          {saving ? "保存中" : `保存${kind === "image" ? "生图" : "提示词"} Provider`}
+          {saving ? "保存中" : providerProfiles && !activeProviderId ? "保存并启用" : `保存${kind === "image" ? "生图" : "提示词"} Provider`}
         </CossButton>
         <CossButton
           type="button"
           variant="outline"
           className="h-10 rounded-[12px] border-white/20 bg-transparent px-4 py-0 text-xs font-semibold leading-none text-white/90 hover:bg-white/10 hover:text-white"
           onClick={onTest}
+          disabled={disabled}
           loading={testing}
         >
           {testing ? "测试中" : "测试连接"}
@@ -2185,31 +2506,104 @@ function SettingsTextField({
   );
 }
 
+function SettingsModelCatalog({
+  label,
+  models,
+  source,
+  loading,
+  onRefresh,
+}: {
+  label: string;
+  models: readonly string[];
+  source?: "discovered" | "preset";
+  loading: boolean;
+  onRefresh?: () => void;
+}) {
+  return (
+    <div className="flex min-w-0 flex-col gap-2">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-xs leading-none text-white/60">{label}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] leading-none text-white/35">
+            {loading ? "探测中" : models.length > 0 ? `${models.length} 个${source === "preset" ? "预置" : "已返回"}` : "未探测到"}
+          </span>
+          {onRefresh && (
+            <CossButton
+              type="button"
+              variant="ghost"
+              disabled={loading}
+              aria-label="重新探测模型"
+              title="重新探测模型"
+              className="size-6 rounded-[8px] border-0 bg-transparent p-0 text-white/45 hover:bg-white/10 hover:text-white"
+              onClick={onRefresh}
+            >
+              <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
+            </CossButton>
+          )}
+        </div>
+      </div>
+      {source === "preset" && (
+        <p className="text-xs leading-5 text-amber-200/65">服务商未返回模型列表，以下为官方 ID 预置模型，尚未验证该服务商是否支持。</p>
+      )}
+      {models.length > 0 ? (
+        <ul aria-label={label} className="flex flex-wrap gap-1.5">
+          {models.map((model) => {
+            const label = imageModelLabel(model);
+            const showId = label !== model;
+            return (
+              <li
+                key={model}
+                title={model}
+                className="flex min-w-0 max-w-full items-center gap-1.5 rounded-[8px] border border-white/10 bg-white/[0.03] px-2.5 py-1.5 text-white/60"
+              >
+                <span className="size-1.5 shrink-0 rounded-full bg-white/25" />
+                <span className="truncate text-xs font-medium leading-4">{label}</span>
+                {showId && <span className="shrink-0 text-[10px] leading-4 text-white/30">{model}</span>}
+              </li>
+            );
+          })}
+        </ul>
+      ) : (
+        <p className="rounded-[12px] border border-dashed border-white/12 bg-white/[0.02] px-3 py-3 text-xs leading-5 text-white/40">
+          {loading ? "正在读取 provider 的 /models 列表…" : "还没有探测到模型。填好 BaseURL 和 API Key 后保存，或点「测试连接」重新探测。"}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function SettingsSelectField({
   label,
   value,
   values,
   optionLabel,
   onChange,
+  disabled,
 }: {
   label: string;
   value: string;
   values: readonly string[];
   optionLabel?: (value: string) => string;
   onChange: (value: string) => void;
+  disabled?: boolean;
 }) {
   return (
-    <label className="flex flex-col gap-2">
+    <div className="flex min-w-0 flex-col gap-2">
       <span className="text-xs leading-none text-white/60">{label}</span>
-      <CossSelect value={value} onChange={(event) => onChange(event.target.value)} className="h-10 justify-start rounded-[12px] border-white/15 bg-transparent px-4 text-sm font-semibold text-white/90">
-        {values.map((item) => (
-          <option key={item} value={item} className="bg-[#191919] text-white">
-            {optionLabel?.(item) ?? item}
-          </option>
-        ))}
-      </CossSelect>
-    </label>
+      <CossSelect
+        label={label}
+        value={value}
+        disabled={disabled}
+        onValueChange={onChange}
+        items={values.map((item) => ({ value: item, label: optionLabel?.(item) ?? item }))}
+      />
+    </div>
   );
+}
+
+function discoveredModelOptions(profiles: ImageProviderProfile[], activeProviderId: string | null): readonly string[] {
+  const active = profiles.find((profile) => profile.id === activeProviderId);
+  return active?.models ?? [];
 }
 
 function optionOrFallback<T extends readonly string[]>(value: string | undefined, options: T): T[number] {

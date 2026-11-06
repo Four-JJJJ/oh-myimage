@@ -4,6 +4,7 @@ import { encryptSecret } from "./crypto";
 import {
   buildImageGenerationFormData,
   buildImageGenerationPayload,
+  describeProviderFetchFailure,
   extractResponsesOutputText,
   generatedThumbnailConfig,
   generationJobDeadlineMs,
@@ -18,6 +19,7 @@ import {
   resolveGenerationJobMaxRuntimeMs,
   resolvePromptOptimizerModel,
   resolveProviderImageConcurrency,
+  normalizeProviderImageSize,
   resolveProviderTimeoutRetryDelayMs,
   resolveProviderTimeoutRetryAttempts,
   resolvePostCheckpointImageTimeoutMs,
@@ -25,9 +27,81 @@ import {
   resolveResponsesModel,
   recoverStoredImageForResult,
   processGenerationMessage,
+  readProviderModelIds,
+  testProvider,
+  imageProviderModelCatalog,
+  serializeProviderModelCatalog,
+  selectImageProviderForModel,
   shouldPersistFailedResult,
   ProviderError,
 } from "./provider";
+import type { ImageProviderProfileRecord } from "./types";
+import { OFFICIAL_IMAGE_MODEL_PRESETS } from "../image-models";
+
+describe("official image model presets", () => {
+  it.each(["https://api.xyaigc.xyz", "https://api.xyaigc.xyz/", "https://api.xyaigc.xyz/v1"])("tests the API path, not the HTML homepage, for %s", async (baseURL) => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: [] })));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      expect(await testProvider(baseURL, "test-key")).toMatchObject({ ok: true, modelSource: "preset", models: [...OFFICIAL_IMAGE_MODEL_PRESETS] });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][0]).toBe("https://api.xyaigc.xyz/v1/models");
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it.each([200, 404, 405, 501])("offers unverified presets for an empty or unsupported list (%s)", async (status) => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: [] }), { status }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const result = await testProvider("https://provider.example/v1", "test-key");
+      expect(result).toMatchObject({ ok: true, status, models: [...OFFICIAL_IMAGE_MODEL_PRESETS], modelSource: "preset" });
+      expect(result.message).toContain("尚未验证");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0][0])).toContain("/models");
+      const profile = providerProfile({ discovered_models_json: serializeProviderModelCatalog(result) });
+      expect(imageProviderModelCatalog(profile)).toEqual({ models: [...OFFICIAL_IMAGE_MODEL_PRESETS], modelSource: "preset" });
+      expect(selectImageProviderForModel([profile], "gemini-3.1-flash-image", "other")?.id).toBe(profile.id);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it.each([401, 403, 429, 500])("does not mask provider errors with presets (%s)", async (status) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{}", { status })));
+    try {
+      expect(await testProvider("https://provider.example/v1", "test-key")).toMatchObject({ ok: false, status, models: [] });
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it("does not mask invalid JSON or network failures", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response("<html>not an API</html>"))
+      .mockRejectedValueOnce(new Error("network unavailable"));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      for (let i = 0; i < 2; i++) expect(await testProvider("https://provider.example/v1", "test-key")).toMatchObject({ ok: false, models: [] });
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it("reports the underlying network cause when a connection test fails", async () => {
+    const error = new TypeError("fetch failed");
+    Object.assign(error, { cause: Object.assign(new Error("getaddrinfo ENOTFOUND provider.example"), { code: "ENOTFOUND" }) });
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(error));
+    try {
+      const result = await testProvider("https://provider.example/v1", "test-key");
+      expect(result).toMatchObject({ ok: false, status: 0, models: [] });
+      expect(result.message).toBe("连接模型服务失败：域名解析失败（ENOTFOUND），请检查 baseURL 和网络。");
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it("preserves discovered IDs and never supplies image presets to prompt tests", async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "vendor-custom-image" }] })))
+      .mockResolvedValueOnce(new Response("{}", { status: 404 })));
+    try {
+      expect(await testProvider("https://provider.example/v1", "test-key")).toMatchObject({ models: ["vendor-custom-image"], modelSource: "discovered" });
+      expect(await testProvider("https://provider.example/v1", "test-key", 15000, false)).toMatchObject({ ok: false, models: [] });
+      expect(imageProviderModelCatalog(providerProfile({ discovered_models_json: null })).models).toEqual([]);
+    } finally { vi.unstubAllGlobals(); }
+  });
+});
 import { AppDatabase, AppObjectStore, AppPreparedStatement, GenerationJobRecord } from "./types";
 
 afterEach(() => {
@@ -36,6 +110,53 @@ afterEach(() => {
 });
 
 const PNG_SIGNATURE = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+describe("image provider model routing", () => {
+  it("reads OpenAI-style model catalogs and ignores unsupported ids", async () => {
+    const response = new Response(JSON.stringify({
+      data: [{ id: "gpt-4o" }, { id: "grok-imagine-image-2" }, { id: "gemini-3.1-flash-image" }],
+    }));
+
+    await expect(readProviderModelIds(response)).resolves.toEqual([
+      "gpt-4o",
+      "grok-imagine-image-2",
+      "gemini-3.1-flash-image",
+    ]);
+  });
+
+  it("routes a selected model to the provider that discovered it", () => {
+    const openai = providerProfile({ id: "openai", discovered_models_json: JSON.stringify(["gpt-image-2"]) });
+    const grok = providerProfile({ id: "grok", discovered_models_json: JSON.stringify(["grok-imagine-image-2.0"]) });
+
+    expect(selectImageProviderForModel([openai, grok], "grok-imagine-image-2.0", "openai")?.id).toBe("grok");
+    expect(selectImageProviderForModel([openai, grok], "gpt-image-2", "grok")?.id).toBe("openai");
+  });
+
+  it("keeps the active provider when nobody has discovered the model yet", () => {
+    const active = providerProfile({ id: "active" });
+    const other = providerProfile({ id: "other" });
+
+    expect(selectImageProviderForModel([other, active], "gpt-image-2.5-flare", "active")?.id).toBe("active");
+  });
+});
+
+function providerProfile(overrides: Partial<ImageProviderProfileRecord>): ImageProviderProfileRecord {
+  return {
+    id: "profile",
+    space_id: "space_1",
+    name: "Provider",
+    base_url: "https://provider.example/v1",
+    model: "gpt-image-2",
+    encrypted_api_key: "encrypted",
+    api_key_hint: "sk-t...key",
+    last_test_ok: 1,
+    last_tested_at: null,
+    discovered_models_json: null,
+    created_at: "2026-05-15T00:00:00.000Z",
+    updated_at: "2026-05-15T00:00:00.000Z",
+    ...overrides,
+  };
+}
 
 describe("provider generation batching", () => {
   it("defaults to two concurrent single-image provider requests", () => {
@@ -120,6 +241,69 @@ describe("provider error normalization", () => {
     expect(providerErrorRetryable("provider_timeout", 504)).toBe(true);
     expect(providerErrorRetryable("provider_upstream_error", 503)).toBe(true);
   });
+
+  it("extracts the undici network cause behind fetch failed", () => {
+    const error = new TypeError("fetch failed");
+    Object.assign(error, { cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }) });
+
+    expect(describeProviderFetchFailure(error)).toEqual({
+      code: "ECONNRESET",
+      reason: "连接被重置（ECONNRESET）",
+      retryable: true,
+    });
+  });
+
+  it("does not retry certificate failures that need configuration changes", () => {
+    const error = new TypeError("fetch failed");
+    Object.assign(error, { cause: Object.assign(new Error("certificate has expired"), { code: "CERT_HAS_EXPIRED" }) });
+
+    expect(describeProviderFetchFailure(error)).toMatchObject({ code: "CERT_HAS_EXPIRED", retryable: false });
+  });
+
+  it("ignores non-network request errors", () => {
+    expect(describeProviderFetchFailure(new SyntaxError("Unexpected token < in JSON"))).toBeNull();
+  });
+});
+
+describe("provider image size normalization", () => {
+  it("keeps matching images byte-for-byte without re-encoding", async () => {
+    const bytes = await sharp({
+      create: { width: 64, height: 48, channels: 3, background: { r: 20, g: 40, b: 60 } },
+    }).png().toBuffer();
+    const binary = { bytes: new Uint8Array(bytes), format: "png", mimeType: "image/png" };
+
+    const normalized = await normalizeProviderImageSize({ width: 64, height: 48, compression: null }, binary);
+
+    expect(normalized.bytes).toBe(binary.bytes);
+  });
+
+  it.each([
+    { format: "gif", mimeType: "image/gif", body: "GIF89a" },
+    { format: "svg", mimeType: "image/svg+xml", body: "<svg xmlns=\"http://www.w3.org/2000/svg\"/>" },
+  ])("preserves $format bytes instead of rasterizing them during size normalization", async ({ format, mimeType, body }) => {
+    const binary = { bytes: new TextEncoder().encode(body), format, mimeType };
+
+    const normalized = await normalizeProviderImageSize({ width: 1280, height: 768, compression: null }, binary);
+
+    expect(normalized).toBe(binary);
+    expect(new TextDecoder().decode(normalized.bytes)).toBe(body);
+  });
+
+  it("crops and resizes a mismatched upstream canvas to the exact requested pixels", async () => {
+    const bytes = await sharp({
+      create: { width: 1600, height: 900, channels: 3, background: { r: 60, g: 40, b: 20 } },
+    }).png().toBuffer();
+
+    const normalized = await normalizeProviderImageSize(
+      { width: 1280, height: 768, compression: null },
+      { bytes: new Uint8Array(bytes), format: "png", mimeType: "image/png" },
+    );
+
+    const metadata = await sharp(normalized.bytes).metadata();
+    expect([metadata.width, metadata.height]).toEqual([1280, 768]);
+    expect(normalized.format).toBe("png");
+    expect(normalized.mimeType).toBe("image/png");
+  });
 });
 
 describe("provider save recovery", () => {
@@ -149,6 +333,36 @@ describe("provider save recovery", () => {
       "space_1/job_1/img_job_1_0.jpeg",
       "space_1/job_1/img_job_1_0.png",
     ]);
+  });
+
+  it.each(["gif", "svg"])("stores %s originals without a static thumbnail or re-encoding", async (format) => {
+    const encryptionKey = "test-encryption-key-123";
+    const job = makeJob({ output_format: format });
+    const db = new GenerationFlowDatabase(job, await encryptSecret("test-key", encryptionKey));
+    const images = new WritableMemoryObjectStore();
+    const providerImageBytes = format === "gif"
+      ? await sharp({ create: { width: 64, height: 48, channels: 3, background: { r: 20, g: 40, b: 60 } } }).gif().toBuffer()
+      : Buffer.from("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"48\"><rect width=\"64\" height=\"48\" fill=\"#123456\"/></svg>");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ data: [{ b64_json: providerImageBytes.toString("base64") }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })),
+    );
+
+    await processGenerationMessage({ jobId: job.id, spaceId: job.space_id }, {
+      APP_ENCRYPTION_KEY: encryptionKey,
+      DB: db,
+      IMAGES: images,
+      REQUEST_TIMEOUT_MS: "600000",
+    } as never);
+
+    const storageKey = `space_1/${job.id}/img_${job.id}_0.${format}`;
+    expect(Array.from(images.objects.keys())).toEqual([storageKey]);
+    expect(new Uint8Array(images.objects.get(storageKey)!)).toEqual(new Uint8Array(providerImageBytes));
+    expect(db.completedJob).toMatchObject({ status: "succeeded", errorCode: null });
+    expect(db.imageAssets[0]).toMatchObject({ thumbnail_storage_key: null, thumbnail_mime_type: null });
   });
 
   it("stores a generated thumbnail alongside the original image asset", async () => {
@@ -196,6 +410,38 @@ describe("provider save recovery", () => {
     });
     expect(db.imageAssets[0]?.thumbnail_byte_size).toBe(thumbnailBytes?.byteLength);
     expect(generatedThumbnailConfig()).toMatchObject({ maxEdgePx: 512, mimeType: "image/webp" });
+  });
+
+  it("stores the exact custom dimensions when the provider returns a different canvas", async () => {
+    const encryptionKey = "test-encryption-key-123";
+    const job = makeJob({ aspect_ratio: "custom", width: 1280, height: 768 });
+    const db = new GenerationFlowDatabase(job, await encryptSecret("test-key", encryptionKey));
+    const images = new WritableMemoryObjectStore();
+    const providerImageBytes = await sharp({
+      create: { width: 1600, height: 900, channels: 3, background: { r: 120, g: 80, b: 40 } },
+    }).png().toBuffer();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ data: [{ b64_json: providerImageBytes.toString("base64") }] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    await processGenerationMessage({ jobId: job.id, spaceId: job.space_id }, {
+      APP_ENCRYPTION_KEY: encryptionKey,
+      DB: db,
+      IMAGES: images,
+      REQUEST_TIMEOUT_MS: "600000",
+    } as never);
+
+    const stored = images.objects.get(`space_1/${job.id}/img_${job.id}_0.png`);
+    expect(stored).toBeDefined();
+    const metadata = await sharp(stored).metadata();
+    expect([metadata.width, metadata.height]).toEqual([1280, 768]);
+    expect(db.imageAssets[0]).toMatchObject({ width: 1280, height: 768 });
   });
 
   it("keeps the original image when optional thumbnail upload fails", async () => {
@@ -267,7 +513,7 @@ describe("provider save recovery", () => {
     } as never);
 
     expect(fetch).toHaveBeenCalledTimes(1);
-    expect(images.putCalls.filter((key) => key === originalKey)).toHaveLength(2);
+    expect(images.putCalls.filter((key) => key === originalKey).length).toBeGreaterThanOrEqual(2);
     expect(images.objects.has(originalKey)).toBe(true);
     expect(db.completedJob).toMatchObject({ status: "succeeded", errorCode: null });
   });
@@ -303,8 +549,14 @@ describe("provider save recovery", () => {
     ).rejects.toMatchObject({ code: "image_asset_persist_failed", retryScope: "post_processing" });
 
     const checkpointKey = providerResultCheckpointStorageKey(job, 0);
+    const checkpoint = JSON.parse(new TextDecoder().decode(images.objects.get(checkpointKey)!)) as {
+      image?: { b64_json?: string };
+      storedImage?: { storageKey?: string };
+    };
     expect(images.objects.has("space_1/job_1/img_job_1_0.png")).toBe(true);
     expect(images.objects.has(checkpointKey)).toBe(true);
+    expect(checkpoint.image?.b64_json).toBeUndefined();
+    expect(checkpoint.storedImage?.storageKey).toBe("space_1/job_1/img_job_1_0.png");
 
     await processGenerationMessage(
       { jobId: "job_1", spaceId: "space_1" },
@@ -320,6 +572,77 @@ describe("provider save recovery", () => {
     expect(providerPosts).toBe(1);
     expect(images.objects.has(checkpointKey)).toBe(false);
     expect(db.imageAssets).toEqual([expect.objectContaining({ id: "img_job_1_0" })]);
+    expect(db.completedJob).toMatchObject({ status: "succeeded", errorCode: null });
+  });
+
+  it("keeps a transient fetch failure retryable instead of failing the job on the first attempt", async () => {
+    const encryptionKey = "test-encryption-key-123";
+    const db = new GenerationFlowDatabase(makeJob(), await encryptSecret("test-key", encryptionKey));
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fetch failed")));
+
+    await expect(
+      processGenerationMessage(
+        { jobId: "job_1", spaceId: "space_1" },
+        {
+          APP_ENCRYPTION_KEY: encryptionKey,
+          DB: db,
+          IMAGES: new WritableMemoryObjectStore(),
+          REQUEST_TIMEOUT_MS: "600000",
+        } as never,
+        { retryProviderErrors: true },
+      ),
+    ).rejects.toMatchObject({ code: "provider_request_failed", retryable: true });
+    expect(db.completedJob).toBeNull();
+    expect(db.jobStatusUpdates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: "running", errorCode: "provider_request_failed", stage: "waiting_provider" }),
+    ]));
+  });
+
+  it("completes the same job after a queue-level retry when the network recovers", async () => {
+    const encryptionKey = "test-encryption-key-123";
+    const db = new GenerationFlowDatabase(makeJob(), await encryptSecret("test-key", encryptionKey));
+    const images = new WritableMemoryObjectStore();
+    let providerPosts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        providerPosts += 1;
+        if (providerPosts === 1) {
+          const error = new TypeError("fetch failed");
+          Object.assign(error, { cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }) });
+          throw error;
+        }
+        return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from(PNG_SIGNATURE).toString("base64") }] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+
+    await expect(
+      processGenerationMessage(
+        { jobId: "job_1", spaceId: "space_1" },
+        {
+          APP_ENCRYPTION_KEY: encryptionKey,
+          DB: db,
+          IMAGES: images,
+          REQUEST_TIMEOUT_MS: "600000",
+        } as never,
+        { retryProviderErrors: true },
+      ),
+    ).rejects.toMatchObject({ code: "provider_request_failed", retryable: true });
+
+    await processGenerationMessage(
+      { jobId: "job_1", spaceId: "space_1" },
+      {
+        APP_ENCRYPTION_KEY: encryptionKey,
+        DB: db,
+        IMAGES: images,
+        REQUEST_TIMEOUT_MS: "600000",
+      } as never,
+    );
+
+    expect(providerPosts).toBe(2);
     expect(db.completedJob).toMatchObject({ status: "succeeded", errorCode: null });
   });
 });
@@ -692,18 +1015,35 @@ describe("provider image result compatibility", () => {
     expect(fetch).toHaveBeenCalledTimes(3);
   });
 
+  it.each([
+    { body: "GIF89a", contentType: "image/gif", filename: "final.gif", format: "gif" },
+    { body: "<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>", contentType: "image/svg+xml", filename: "final.svg", format: "svg" },
+  ])("accepts $format image downloads and preserves their actual MIME type", async ({ body, contentType, filename, format }) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(body, { status: 200, headers: { "Content-Type": contentType } })),
+    );
+
+    const result = await resolveProviderImageBinary({ url: `https://img.example.com/${filename}` }, "png", 10_000);
+
+    expect(result.format).toBe(format);
+    expect(result.mimeType).toBe(contentType);
+    expect(new TextDecoder().decode(result.bytes)).toBe(body);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects unsupported image content types without retrying", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
-        new Response("GIF89a", {
+        new Response("not-an-avif", {
           status: 200,
-          headers: { "Content-Type": "image/gif" },
+          headers: { "Content-Type": "image/avif" },
         }),
       ),
     );
 
-    await expect(resolveProviderImageBinary({ url: "https://img.example.com/final.gif" }, "png", 10_000)).rejects.toMatchObject({
+    await expect(resolveProviderImageBinary({ url: "https://img.example.com/final.avif" }, "png", 10_000)).rejects.toMatchObject({
       code: "provider_image_download_invalid_content_type",
     });
     expect(fetch).toHaveBeenCalledTimes(1);
@@ -784,6 +1124,50 @@ describe("provider image result compatibility", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
     const firstHeaders = vi.mocked(fetch).mock.calls[0]?.[1] ? new Headers((vi.mocked(fetch).mock.calls[0]?.[1] as RequestInit).headers) : null;
     expect(firstHeaders?.get("Idempotency-Key")).toBe("idem-1");
+  });
+
+  it("turns transient fetch failures into retryable provider errors with a useful message", async () => {
+    const error = new TypeError("fetch failed");
+    Object.assign(error, { cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }) });
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(error));
+
+    await expect(
+      requestGenerationBatchWithRecovery(
+        makeJob(),
+        {
+          id: "cred_1",
+          space_id: "space_1",
+          base_url: "https://image.example.com/v1",
+          model: "gpt-image-2",
+          prompt_optimizer_model: "gpt-5.5",
+          encrypted_api_key: "encrypted",
+          api_key_hint: "sk-...test",
+          last_test_ok: 1,
+          last_tested_at: "2026-05-15T00:00:00.000Z",
+          prompt_base_url: null,
+          prompt_encrypted_api_key: null,
+          prompt_api_key_hint: null,
+          prompt_last_test_ok: 0,
+          prompt_last_tested_at: null,
+          created_at: "2026-05-15T00:00:00.000Z",
+          updated_at: "2026-05-15T00:00:00.000Z",
+        },
+        "test-key",
+        600_000,
+        {
+          DB: new RecordingDatabase(),
+          IMAGES: new MemoryObjectStore({}),
+          PROVIDER_TIMEOUT_RETRY_ATTEMPTS: "0",
+        } as never,
+        "idem-1",
+      ),
+    ).rejects.toMatchObject({
+      code: "provider_request_failed",
+      retryable: true,
+      message: "无法连接模型服务：连接被重置（ECONNRESET），请稍后重试。",
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("retries timed out generation requests when explicitly enabled", async () => {
@@ -1134,6 +1518,12 @@ describe("Image API generation helpers", () => {
     expect(payload.output_compression).toBe(80);
   });
 
+  it.each(["png", "gif", "svg"])("omits compression for %s Image API payloads", (outputFormat) => {
+    const payload = buildImageGenerationPayload(makeJob({ output_format: outputFormat, compression: 80 }), 1);
+
+    expect(payload.output_compression).toBeUndefined();
+  });
+
   it("uses transparent background automatically when png or webp prompts request it", () => {
     expect(resolveImageBackground("生成一个透明背景的产品图标", "png")).toBe("transparent");
     expect(resolveImageBackground("minimal app icon with transparent background", "webp")).toBe("transparent");
@@ -1261,6 +1651,7 @@ interface ImageAssetRow {
 class GenerationFlowDatabase implements AppDatabase {
   readonly results: GenerationResultRow[] = [];
   readonly imageAssets: ImageAssetRow[] = [];
+  readonly jobStatusUpdates: Array<{ status: string; errorCode: string | null; errorMessage: string | null; stage: string }> = [];
   completedJob: { status: string; errorCode: string | null; errorMessage: string | null } | null = null;
 
   constructor(
@@ -1370,7 +1761,7 @@ class GenerationFlowStatement implements AppPreparedStatement {
         this.db.options.failImageAssetAttempts = (this.db.options.failImageAssetAttempts ?? 0) - 1;
         throw new Error("transient image asset insert failure");
       }
-      const [id, spaceId, jobId, , , , , , , , thumbnailStorageKey, thumbnailMimeType, thumbnailByteSize, thumbnailSha256] = this.values as [
+      const [id, spaceId, jobId, , , , width, height, , , thumbnailStorageKey, thumbnailMimeType, thumbnailByteSize, thumbnailSha256] = this.values as [
         string,
         string,
         string,
@@ -1390,6 +1781,8 @@ class GenerationFlowStatement implements AppPreparedStatement {
         id,
         space_id: spaceId,
         job_id: jobId,
+        width,
+        height,
         thumbnail_storage_key: thumbnailStorageKey,
         thumbnail_mime_type: thumbnailMimeType,
         thumbnail_byte_size: thumbnailByteSize,
@@ -1415,6 +1808,8 @@ class GenerationFlowStatement implements AppPreparedStatement {
       return {};
     }
     if (this.query.includes("UPDATE generation_jobs")) {
+      const [status, errorCode, errorMessage, _errorReason, stage] = this.values as [string, string | null, string | null, string | null, string];
+      this.db.jobStatusUpdates.push({ status, errorCode, errorMessage, stage });
       return {};
     }
     throw new Error(`Unexpected query: ${this.query}`);

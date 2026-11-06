@@ -109,27 +109,27 @@ tar -czf oh-myimage-dev-release.tar.gz \
 
 ```bash
 release_name="dev-$(date +%Y%m%d%H%M%S)"
-ssh token-new "mkdir -p /opt/oh-myimage-dev/releases/${release_name}"
-scp oh-myimage-dev-release.tar.gz token-new:/opt/oh-myimage-dev/releases/${release_name}/
-ssh token-new "cd /opt/oh-myimage-dev/releases/${release_name} && tar -xzf oh-myimage-dev-release.tar.gz && rm -f oh-myimage-dev-release.tar.gz"
+ssh token-us "mkdir -p /opt/oh-myimage-dev/releases/${release_name}"
+scp oh-myimage-dev-release.tar.gz token-us:/opt/oh-myimage-dev/releases/${release_name}/
+ssh token-us "cd /opt/oh-myimage-dev/releases/${release_name} && tar -xzf oh-myimage-dev-release.tar.gz && rm -f oh-myimage-dev-release.tar.gz"
 ```
 
 ### 4. 切换 `current`
 
 ```bash
-ssh token-new "ln -sfn /opt/oh-myimage-dev/releases/${release_name} /opt/oh-myimage-dev/current"
+ssh token-us "ln -sfn /opt/oh-myimage-dev/releases/${release_name} /opt/oh-myimage-dev/current"
 ```
 
 ### 5. 跑迁移
 
 ```bash
-ssh token-new "cd /opt/oh-myimage-dev/current && docker compose -p oh-myimage-dev --env-file /etc/oh-myimage-dev/oh-myimage-dev.env -f deploy/docker-compose.oh-myimage-dev.yml run --rm oh-myimage-dev-api npm run db:migrate:postgres"
+ssh token-us "cd /opt/oh-myimage-dev/current && docker compose -p oh-myimage-dev --env-file /etc/oh-myimage-dev/oh-myimage-dev.env -f deploy/docker-compose.oh-myimage-dev.yml run --rm oh-myimage-dev-api npm run db:migrate:postgres"
 ```
 
 ### 6. 重启 API 和 Worker
 
 ```bash
-ssh token-new "cd /opt/oh-myimage-dev/current && docker compose -p oh-myimage-dev --env-file /etc/oh-myimage-dev/oh-myimage-dev.env -f deploy/docker-compose.oh-myimage-dev.yml up -d --force-recreate oh-myimage-dev-api oh-myimage-dev-worker"
+ssh token-us "cd /opt/oh-myimage-dev/current && docker compose -p oh-myimage-dev --env-file /etc/oh-myimage-dev/oh-myimage-dev.env -f deploy/docker-compose.oh-myimage-dev.yml up -d --force-recreate oh-myimage-dev-api oh-myimage-dev-worker"
 ```
 
 默认不要在远端执行 `docker build`。当前仓库在远端重新安装依赖或构建时，可能因为缺少 `CENTRAL_LICENSE_KEY` 而失败。
@@ -151,20 +151,20 @@ curl -s https://dev-gen.fourj.space/api/config
 远端 symlink：
 
 ```bash
-ssh token-new "readlink -f /opt/oh-myimage-dev/current"
+ssh token-us "readlink -f /opt/oh-myimage-dev/current"
 ```
 
 容器状态：
 
 ```bash
-ssh token-new "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep oh-myimage-dev"
+ssh token-us "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep oh-myimage-dev"
 ```
 
 必要时再看日志：
 
 ```bash
-ssh token-new "docker logs --tail=50 oh-myimage-dev-api"
-ssh token-new "docker logs --tail=50 oh-myimage-dev-worker"
+ssh token-us "docker logs --tail=50 oh-myimage-dev-api"
+ssh token-us "docker logs --tail=50 oh-myimage-dev-worker"
 ```
 
 ### 8. 浏览器验收

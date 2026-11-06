@@ -2,15 +2,18 @@ import { ClipboardEvent, ChangeEvent, Dispatch, FormEvent, PointerEvent as React
 import { createPortal } from "react-dom";
 import { BorderBeam } from "border-beam";
 import {
+  Check,
   ChevronDown,
+  ChevronRight,
   CircleEllipsis,
+  KeyRound,
   Sparkle,
   WandSparkles,
   X,
   Redo2,
   Undo2,
 } from "lucide-react";
-import { api, AppConfig, GenerationJob, GenerationRecord, ImageItem } from "../../api";
+import { api, AppConfig, generatedImageDisplayUrl, generatedImageRetryUrl, GenerationJob, GenerationRecord, getGenerationStatus, ImageItem, SettingsProviders, supportsGeneratedImageEditing } from "../../api";
 import generationContinueIcon from "../../assets/figma/generation-continue.svg";
 import generationCopyIcon from "../../assets/figma/generation-copy.svg";
 import generationDeleteIcon from "../../assets/figma/generation-delete.svg";
@@ -22,7 +25,8 @@ import referenceDeleteIcon from "../../assets/figma/reference-delete.svg";
 import sidebarAdd from "../../assets/figma/sidebar-add.svg";
 import { claimGenerationSubmitLock, isTerminalGenerationJobStatus, mergePolledJobState, releaseGenerationSubmitLock } from "../../generation-state";
 import { generationProgressSummary } from "../../generation-progress";
-import { DEFAULT_IMAGE_MODEL, IMAGE_MODEL_OPTIONS, imageModelLabel } from "../../../image-models";
+import { clampQualityForModel, DEFAULT_IMAGE_MODEL, groupImageModelOptions, IMAGE_MODEL_OPTIONS, imageModelLabel, outputFormatsForModel, sizeForRatioResolution, type GroupedImageModelOptions } from "../../../image-models";
+import { composerModelProvidersFromProfiles, resolveComposerProviderSelection, type ComposerModelProvider } from "./model-providers";
 import {
   AlertDialog,
   AlertDialogClose,
@@ -40,8 +44,9 @@ import { Input } from "../../components/ui/input";
 import { Menu, MenuGroup, MenuItem, MenuPopup, MenuTrigger } from "../../components/ui/menu";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../../components/ui/tooltip";
-import { AppShell } from "../generate-shell/AppShell";
+import { AppShell, type WorkspaceView } from "../generate-shell/AppShell";
 import { CossButton, CossTextarea } from "../shared/coss";
+import { GeneratedImage } from "../shared/GeneratedImage";
 import { LoadersWtfStatusIcon, LoadingStatusText as SharedLoadingStatusText } from "../shared/generation-loading";
 import {
   collapsedPromptMaxHeightPx,
@@ -74,7 +79,25 @@ import {
   updateDraftConversationTitle,
   type ConversationListItem,
 } from "./mappers";
-import { formatGenerationSettingsSummary, formatLabels, formatOptions, generationSettingsSummaryParts, qualityLabels, qualityOptions, ratioLabels, ratioOptions, resolutionOptions } from "./options";
+import {
+  clampCustomSize,
+  customSizeHint,
+  formatGenerationSettingsSummary,
+  formatLabels,
+  formatOptions,
+  generationSettingsSummaryParts,
+  normalizeCustomSize,
+  parseCustomSizeText,
+  qualityLabels,
+  qualityOptionsForModel,
+  ratioLabels,
+  ratioOptions,
+  clampResolutionForForm,
+  resolutionOptionsForForm,
+  CUSTOM_SIZE_MAX,
+  CUSTOM_SIZE_MIN,
+  CUSTOM_SIZE_STEP,
+} from "./options";
 
 const generationStageMaxWidthPx = conversationPanelMaxWidthPx;
 const generationStageMaxHeightPx = 360;
@@ -88,14 +111,14 @@ interface GenerateMenuViewProps {
   nextCursor: string | null;
   loadRecords: (cursor?: string, options?: { background?: boolean }) => Promise<void>;
   onProviderNeeded: () => void;
-  onNavigate: (view: "generate" | "gallery" | "settings" | "inspiration") => void;
+  onNavigate: (view: WorkspaceView) => void;
   pendingJumpTarget?: { conversationId: string; jobId: string } | null;
   onJumpHandled?: () => void;
   onLogout: () => void;
   onUsageChanged: () => Promise<void>;
 }
 
-interface GenerateForm {
+export interface GenerateForm {
   prompt: string;
   model: string;
   aspectRatio: string;
@@ -132,7 +155,7 @@ interface ImageSelectionPoint {
   y: number;
 }
 
-interface ImageSelectionStroke {
+export interface ImageSelectionStroke {
   brushRatio: number;
   points: ImageSelectionPoint[];
 }
@@ -195,12 +218,6 @@ const ratioSizes: Record<string, [number, number]> = {
   "3:2": [1536, 1024],
   "2:3": [1024, 1536],
   "1:1": [1024, 1024],
-};
-
-const resolutionLongEdge: Record<string, number> = {
-  "1K": 1536,
-  "2K": 2048,
-  "4K": 3840,
 };
 
 function ComposerReferenceIcon({ className }: { className?: string }) {
@@ -316,8 +333,26 @@ const imagePreviewVisibleImageClassName = "relative col-start-1 row-start-1 max-
 const imagePreviewPreloadClassName = "pointer-events-none absolute size-px opacity-0";
 const IMAGE_PREVIEW_STALL_TIMEOUT_MS = 30_000;
 
+export function shouldRetryImagePreviewRequest(error: unknown, attempt: number, stalled: boolean): boolean {
+  if (attempt > 0) return false;
+  if (stalled || error instanceof TypeError) return true;
+  const status = error instanceof Error ? error.message.match(/Image preview request failed with (\d{3})/)?.[1] : undefined;
+  return Boolean(status && Number(status) >= 500);
+}
+
 export function imagePreviewActionKeys() {
   return [...imagePreviewActionOrder];
+}
+
+/**
+ * Older jobs stored the raw undici error message ("fetch failed"). Keep the
+ * history readable even before the backend starts returning friendly messages.
+ */
+export function generationFailureMessageForDisplay(message: string | null | undefined): string {
+  const trimmed = message?.trim();
+  if (!trimmed) return "生成失败，请稍后重新生成。";
+  if (/^fetch failed$/i.test(trimmed)) return "网络连接中断，本次生成没有完成，请重新生成。";
+  return trimmed.replace(/fetch failed/gi, "网络连接中断");
 }
 
 export function resolveImagePreviewChromeState({
@@ -516,6 +551,7 @@ export function GenerateMenuView({
   const [submittedReferenceImagesByJobId, setSubmittedReferenceImagesByJobId] = useState<Record<string, NonNullable<GenerationJob["referenceImages"]>>>({});
   const [sourceImageId, setSourceImageId] = useState<string | undefined>();
   const [error, setError] = useState("");
+  const [pollError, setPollError] = useState("");
   const [loading, setLoading] = useState(false);
   const [preparingReferences, setPreparingReferences] = useState(false);
   const [optimizing, setOptimizing] = useState(false);
@@ -526,6 +562,7 @@ export function GenerateMenuView({
   const objectUrlsRef = useRef<string[]>([]);
   const canvasScrollRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLFormElement | null>(null);
+  const composerPanelRef = useRef<HTMLDivElement | null>(null);
   const submitLockRef = useRef(false);
   const pollInFlightRef = useRef(false);
   const recordsRefreshInFlightRef = useRef(false);
@@ -535,6 +572,8 @@ export function GenerateMenuView({
   const lastAutoScrolledConversationIdRef = useRef<string | null>(null);
   const lastAutoScrolledFlowCountRef = useRef(0);
   const [composerHeight, setComposerHeight] = useState(170);
+  const [modelProviders, setModelProviders] = useState<ComposerModelProvider[]>([]);
+  const [selectedModelProviderId, setSelectedModelProviderId] = useState<string | null>(null);
 
   const conversations = useMemo(
     () => buildSidebarConversations(records, draftConversation, conversationIdsByRecordId),
@@ -561,6 +600,52 @@ export function GenerateMenuView({
     [activeConversationRecords, activeImages, activeJob],
   );
   const composerLayoutMode = useMemo(() => resolveComposerPanelMode(activeFlows.length), [activeFlows.length]);
+  const formModelRef = useRef(form.model);
+  formModelRef.current = form.model;
+  const selectedModelProviderIdRef = useRef(selectedModelProviderId);
+  selectedModelProviderIdRef.current = selectedModelProviderId;
+
+  const discoveredProviderIdsRef = useRef(new Set<string>());
+
+  useEffect(() => {
+    let cancelled = false;
+    const applyProviders = (providers: ComposerModelProvider[], preferredProviderId: string | null) => {
+      const selection = resolveComposerProviderSelection(providers, preferredProviderId, formModelRef.current);
+      if (!selection) return;
+      setSelectedModelProviderId(selection.providerId);
+      if (selection.model && selection.model !== formModelRef.current) {
+        setForm((current) => updateGenerateForm(current, "model", selection.model));
+      }
+    };
+
+    api<{ ok: true } & SettingsProviders>("/api/settings/provider")
+      .then((result) => {
+        if (cancelled) return;
+        const providers = composerModelProvidersFromProfiles(result.imageProviders, []);
+        setModelProviders(providers);
+        applyProviders(providers, result.activeImageProviderId ?? null);
+        const missingModelIds = providers
+          .filter((provider) => provider.models.length === 0 && !discoveredProviderIdsRef.current.has(provider.id))
+          .map((provider) => provider.id);
+        if (missingModelIds.length === 0) return;
+        missingModelIds.forEach((providerId) => discoveredProviderIdsRef.current.add(providerId));
+        return api<{ ok: true } & SettingsProviders>("/api/settings/provider/discover-models", {
+          method: "POST",
+          body: JSON.stringify({ providerIds: missingModelIds }),
+        }).then((discovered) => {
+          if (cancelled) return;
+          const nextProviders = composerModelProvidersFromProfiles(discovered.imageProviders, []);
+          setModelProviders(nextProviders);
+          applyProviders(nextProviders, selectedModelProviderIdRef.current ?? null);
+        });
+      })
+      .catch(() => {
+        if (!cancelled) setModelProviders([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [providerConfigured]);
 
   useEffect(() => {
     activeJobRef.current = activeJob;
@@ -717,7 +802,8 @@ export function GenerateMenuView({
       }
       pollInFlightRef.current = true;
       try {
-        const result = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${currentJob.id}`, resolveGenerationPollRequestInit());
+        const result = await getGenerationStatus(currentJob.id);
+        setPollError("");
         const fallbackReferenceImages = submittedReferenceImagesByJobId[currentJob.id] ?? currentJob.referenceImages;
         const mergedReferenceJob = mergeJobReferenceImages(result.job, fallbackReferenceImages ? { ...result.job, referenceImages: fallbackReferenceImages } : currentJob);
         const nextJob = mergePolledJobState(activeJobRef.current, mergedReferenceJob);
@@ -731,7 +817,7 @@ export function GenerateMenuView({
           void loadRecords(undefined, { background: true });
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "刷新任务状态失败。");
+        setPollError(err instanceof Error ? err.message : "刷新任务状态失败，系统会自动重试。");
       } finally {
         pollInFlightRef.current = false;
         schedulePoll();
@@ -750,7 +836,7 @@ export function GenerateMenuView({
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("focus", handleFocus);
     window.addEventListener("online", handleOnline);
-    schedulePoll();
+    void pollJob();
     return () => {
       cancelled = true;
       pollInFlightRef.current = false;
@@ -775,12 +861,12 @@ export function GenerateMenuView({
   useEffect(() => () => revokeObjectUrls(objectUrlsRef.current), []);
 
   useEffect(() => {
-    if (!composerRef.current) return;
-    const composer = composerRef.current;
-    const syncComposerHeight = () => setComposerHeight(composer.getBoundingClientRect().height);
+    if (!composerPanelRef.current) return;
+    const panel = composerPanelRef.current;
+    const syncComposerHeight = () => setComposerHeight(panel.getBoundingClientRect().height);
     syncComposerHeight();
     const observer = new ResizeObserver(syncComposerHeight);
-    observer.observe(composer);
+    observer.observe(panel);
     return () => observer.disconnect();
   }, []);
 
@@ -857,6 +943,13 @@ export function GenerateMenuView({
       setError("请先完成人机验证。");
       return;
     }
+    const requestForm = submittedGenerateForm(form);
+    const customSizeError = requestForm.aspectRatio === "custom" ? customSizeHint(requestForm.width, requestForm.height) : null;
+    if (customSizeError) {
+      releaseGenerationSubmitLock(submitLockRef);
+      setError(customSizeError);
+      return;
+    }
 
     setLoading(true);
     setError("");
@@ -870,7 +963,7 @@ export function GenerateMenuView({
       const result = await api<{ ok: true; jobId: string; status: "queued" }>("/api/generations", {
         method: "POST",
         body: generationRequestBody(
-          form,
+          requestForm,
           referenceImages,
           sourceImageId,
           turnstileToken,
@@ -879,7 +972,7 @@ export function GenerateMenuView({
         ),
       });
       void onUsageChanged();
-      let firstPollJob = createQueuedGenerationJob(result.jobId, form, submittedReferences);
+      let firstPollJob = createQueuedGenerationJob(result.jobId, requestForm, submittedReferences);
       let firstPollImages: ImageItem[] = [];
       try {
         const firstPoll = await loadInitialGenerationStatus(result.jobId);
@@ -900,7 +993,7 @@ export function GenerateMenuView({
       setActiveConversationId(conversationId);
       setDraftConversation(null);
       upsertRecord(setRecords, firstPollJob, firstPollImages);
-      setForm((current) => ({ ...current, prompt: "" }));
+      setForm((current) => ({ ...submittedGenerateForm(current), prompt: "" }));
       setReferenceImages([]);
       setSourceImageId(undefined);
       setSourceImagePreview(null);
@@ -925,16 +1018,17 @@ export function GenerateMenuView({
     }
     setOptimizing(true);
     setError("");
+    const requestForm = submittedGenerateForm(form);
     try {
       const result = await api<{ ok: true; optimizedPrompt: string }>("/api/prompts/optimize", {
         method: "POST",
         body: JSON.stringify({
-          prompt: form.prompt,
-          aspectRatio: form.aspectRatio,
-          width: form.width,
-          height: form.height,
-          quality: form.quality,
-          outputFormat: form.outputFormat,
+          prompt: requestForm.prompt,
+          aspectRatio: requestForm.aspectRatio,
+          width: requestForm.width,
+          height: requestForm.height,
+          quality: requestForm.quality,
+          outputFormat: requestForm.outputFormat,
           referenceImageCount: referenceImages.length + (sourceImageId ? 1 : 0),
           hasSourceImage: Boolean(sourceImageId),
           hasMaskImage: Boolean(referenceMask),
@@ -1017,7 +1111,7 @@ export function GenerateMenuView({
   function continueFromRecord(record: GenerationRecord, image?: ImageItem) {
     const draft = composerDraftFromRecord(record, image?.id);
     shouldStickToBottomRef.current = true;
-    setForm((current) => ({ ...current, prompt: draft.prompt, quality: draft.selectedQuality }));
+    setForm((current) => ({ ...current, prompt: draft.prompt, quality: clampQualityForModel(current.model, draft.selectedQuality) }));
     setSourceImageId(draft.sourceImageId);
     setSourceImagePreview(image ? { id: image.id, url: image.url, name: "参考图 1" } : null);
     setReferenceMask(null);
@@ -1040,7 +1134,7 @@ export function GenerateMenuView({
     setError("");
     try {
       const result = await api<{ ok: true; jobId: string; status: "queued" }>(`/api/generations/${record.job.id}/regenerate`, { method: "POST" });
-      const firstPoll = await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(`/api/generations/${result.jobId}`);
+      const firstPoll = await getGenerationStatus(result.jobId);
       const conversationId =
         conversationIdForRecord({ job: firstPoll.job, images: firstPoll.images, elapsedSeconds: null }, conversationIdsByRecordId)
         || conversationIdForRecord(record, conversationIdsByRecordId);
@@ -1133,7 +1227,7 @@ export function GenerateMenuView({
         composerHeight={composerHeight}
         composerLayoutMode={composerLayoutMode}
         flows={activeFlows}
-        error={error}
+        error={error || pollError}
         onPreview={setPreviewImage}
         onContinue={continueFromRecord}
         onLocalEdit={(image) => setLocalEditImage(image)}
@@ -1146,6 +1240,7 @@ export function GenerateMenuView({
       />
       <ComposerPanel
         formRef={composerRef}
+        panelRef={composerPanelRef}
         layoutMode={composerLayoutMode}
         form={form}
         config={config}
@@ -1153,6 +1248,19 @@ export function GenerateMenuView({
         referencePreparing={preparingReferences}
         optimizing={optimizing}
         providerConfigured={providerConfigured}
+        modelProviders={modelProviders}
+        selectedModelProviderId={selectedModelProviderId}
+        onModelProviderChange={(providerId) => {
+          const provider = modelProviders.find((item) => item.id === providerId);
+          setSelectedModelProviderId(providerId);
+          const nextModel = provider?.models[0]?.value;
+          if (nextModel) setForm((current) => updateGenerateForm(current, "model", nextModel));
+          // 对话框是选择 provider 的唯一入口：这里的选择会持久化为启用配置。
+          void api("/api/settings/provider/select", {
+            method: "POST",
+            body: JSON.stringify({ providerId }),
+          }).then(() => onUsageChanged()).catch(() => undefined);
+        }}
         showReferenceCarryoverHint={shouldShowReferenceCarryoverHint({
           hasConversationImage: activeFlows.some((flow) => flow.images.length > 0),
           hasCurrentReference: Boolean(sourceImagePreview || referenceMask || referenceImages.length > 0),
@@ -1185,6 +1293,7 @@ export function GenerateMenuView({
         }
         onOptimize={() => void optimizePrompt()}
         onUpdate={updateForm}
+        onConfigureProvider={onProviderNeeded}
         turnstileToken={turnstileToken}
         onTurnstileToken={setTurnstileToken}
       />
@@ -1249,7 +1358,7 @@ function ConversationSidebar({
                 onClick={() => onSelect(conversation.id)}
               >
                 <span className="grid size-8 shrink-0 place-items-center overflow-hidden rounded-[8px] bg-white/10">
-                  {conversation.previewImage ? <img src={conversation.previewImage} alt="" loading="lazy" decoding="async" className="size-full object-cover" /> : <Sparkle aria-hidden size={16} className="text-white/45" />}
+                  {conversation.previewImage ? <GeneratedImage src={conversation.previewImage} fallbackSrc={conversation.previewImageFallback} alt="" loading="lazy" decoding="async" className="size-full object-cover" /> : <Sparkle aria-hidden size={16} className="text-white/45" />}
                 </span>
                 <span className="block min-w-0 flex-1 truncate pr-3">{conversation.title}</span>
               </CossButton>
@@ -1298,6 +1407,9 @@ function GenerationCanvas({
       ref={scrollRef}
       className="thin-scrollbar absolute inset-0 overflow-y-auto"
       style={{
+        // 竖向滚动条出现时内容盒会变窄，居中面板因此整体左移；
+        // 两侧对称预留滚动条空间，保证画布内容与下方输入框始终同轴对齐。
+        scrollbarGutter: "stable both-edges",
         paddingTop: conversationTopPaddingPx,
         paddingRight: conversationHorizontalPaddingPx,
         paddingBottom: conversationCanvasBottomPadding(composerHeight, composerLayoutMode),
@@ -1402,7 +1514,7 @@ function GenerationCard({
                   })}
               >
                 <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[6px] border border-transparent bg-white/10">
-                  <img src={image.url} alt={image.name || `参考图 ${index + 1}`} loading="lazy" decoding="async" className="size-full object-cover" />
+                  <GeneratedImage src={image.url} alt={image.name || `参考图 ${index + 1}`} loading="lazy" decoding="async" className="size-full object-cover" />
                 </span>
                 <span className="whitespace-nowrap">{image.name || `参考图 ${index + 1}`}</span>
               </CossButton>
@@ -1446,7 +1558,11 @@ function GenerationCard({
           <span className="inline-flex size-[14px] items-center justify-center">
             <LoadersWtfStatusIcon />
           </span>
-          <LoadingStatusText />
+          {flow.job.error_message ? (
+            <span className="min-w-0 text-xs leading-5 text-amber-100/75">
+              上游暂时失败，正在重试：{generationFailureMessageForDisplay(flow.job.error_message)}
+            </span>
+          ) : <LoadingStatusText />}
         </div>
       )}
 
@@ -1486,8 +1602,12 @@ function GenerationCard({
             </div>
           )}
           {flow.status === "failed" && (
-            <div className="flex h-full items-center justify-center px-8 text-center text-sm leading-6 text-white/40">
-              {flow.job.error_message ?? "生成失败"}
+            <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center">
+              <p className="text-sm font-medium leading-5 text-white/72">生成失败</p>
+              <p className="max-w-sm text-xs leading-5 text-white/42">{generationFailureMessageForDisplay(flow.job.error_message)}</p>
+              <CossButton type="button" variant="outline" size="xs" className="mt-0.5" onClick={() => onRegenerate(record)}>
+                重新生成
+              </CossButton>
             </div>
           )}
         </div>
@@ -1520,12 +1640,16 @@ function GenerationStageImageCell({
   onCopyPrompt: (prompt: string) => void;
 }) {
   const [isPinnedOpen, setIsPinnedOpen] = useState(false);
-  const [displayImageUrl, setDisplayImageUrl] = useState(image.thumbnailUrl ?? image.url);
+  const [displayImageUrl, setDisplayImageUrl] = useState(() => generatedImageDisplayUrl(image));
+  const [imageRetryAttempt, setImageRetryAttempt] = useState(0);
+  const [imageLoadFailed, setImageLoadFailed] = useState(false);
   const actions = buildGeneratedImageActions(image, prompt, record, onContinue, onLocalEdit, onRegenerate, onDelete, onCopyPrompt);
 
   useEffect(() => {
-    setDisplayImageUrl(image.thumbnailUrl ?? image.url);
-  }, [image.thumbnailUrl, image.url]);
+    setDisplayImageUrl(generatedImageDisplayUrl(image));
+    setImageRetryAttempt(0);
+    setImageLoadFailed(false);
+  }, [image.format, image.thumbnailUrl, image.url]);
 
   return (
     <div data-image-action-host className={cn("group/image relative h-full min-w-0 flex-1 overflow-hidden bg-[#222]", showDivider && "border-l border-white/20")}>
@@ -1536,15 +1660,45 @@ function GenerationStageImageCell({
         onClick={() => onPreview({ url: image.url, thumbnailUrl: image.thumbnailUrl, prompt: image.prompt ?? prompt, actions })}
       >
         <img
-          src={displayImageUrl}
+          src={generatedImageRetryUrl(displayImageUrl, imageRetryAttempt)}
           alt={image.prompt ?? "生成图片"}
+          loading="eager"
           decoding="async"
+          fetchPriority="high"
           className="h-full w-full object-cover"
+          onLoad={() => setImageLoadFailed(false)}
           onError={() => {
-            if (displayImageUrl !== image.url) setDisplayImageUrl(image.url);
+            if (imageRetryAttempt === 0) {
+              setImageRetryAttempt(1);
+              return;
+            }
+            if (displayImageUrl !== image.url) {
+              setDisplayImageUrl(image.url);
+              setImageRetryAttempt(0);
+              return;
+            }
+            setImageLoadFailed(true);
           }}
         />
       </CossButton>
+      {imageLoadFailed && (
+        <div role="alert" className="absolute inset-0 z-10 grid place-items-center bg-black/55 px-4 text-center">
+          <div className="flex flex-col items-center gap-2 text-xs text-white/75">
+            <span>图片暂时无法加载</span>
+            <CossButton
+              type="button"
+              variant="outline"
+              size="xs"
+              onClick={() => {
+                setImageRetryAttempt((attempt) => attempt + 1);
+                setImageLoadFailed(false);
+              }}
+            >
+              重新加载
+            </CossButton>
+          </div>
+        </div>
+      )}
       <div
         className={cn(
           "pointer-events-none absolute bottom-3 right-3 opacity-0 transition-opacity group-hover/image:pointer-events-auto group-hover/image:opacity-100",
@@ -1584,7 +1738,7 @@ function buildGeneratedImageActions(
         confirmLabel: "删除",
       },
     },
-  ];
+  ].filter((action) => supportsGeneratedImageEditing(image) || (action.key !== "continue" && action.key !== "local-edit"));
 }
 
 export function HoverImageActionBar({
@@ -1912,19 +2066,95 @@ export function resolveComposerPopupPlacement(
   return spaceAbove > spaceBelow ? "above" : "below";
 }
 
+function ComposerModelMenu({
+  providers,
+  selectedProviderId,
+  fallbackOptions,
+  value,
+  onProviderChange,
+  onChange,
+}: {
+  providers: ComposerModelProvider[];
+  selectedProviderId: string | null;
+  fallbackOptions: Array<{ value: string; label: string }>;
+  value: string;
+  onProviderChange: (providerId: string) => void;
+  onChange: (value: string) => void;
+}) {
+  const grouped = providers.length > 0;
+  const selectedProvider = providers.find((provider) => provider.id === selectedProviderId) ?? providers[0] ?? null;
+  const rawOptions = grouped ? selectedProvider?.models ?? [] : fallbackOptions;
+  const groups = useMemo(() => groupImageModelOptions(rawOptions, (option) => option.value), [rawOptions]);
+  const options = rawOptions;
+  const selected = options.find((option) => option.value === value) ?? options[0];
+  const disabled = !grouped && options.length <= 1;
+
+  return (
+    <ComposerChoiceMenu
+      label="模型"
+      value={selected?.value ?? value}
+      disabled={disabled}
+      icon={<ComposerModelIcon className="size-4 text-white/90" />}
+      groups={groups}
+      options={options}
+      header={grouped ? (
+        <div className="border-b border-white/[0.08] px-0.5 pb-2.5">
+          <div className="mb-1.5 px-1 text-[11px] font-normal leading-4 text-white/38">生图配置</div>
+          <div
+            role="tablist"
+            aria-label="生图 Provider"
+            className="flex w-full gap-1 overflow-x-auto rounded-[12px] bg-white/[0.06] p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          >
+            {providers.map((provider) => {
+              const active = provider.id === selectedProvider?.id;
+              return (
+                <CossButton
+                  key={provider.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  variant="ghost"
+                  className={cn(
+                    "h-6 min-w-[64px] flex-1 shrink-0 truncate rounded-[8px] border-0 px-2 text-xs font-normal leading-5 text-white/50 transition-colors hover:bg-transparent hover:text-white/80",
+                    active && "bg-white/[0.16] font-medium text-white shadow-[0_1px_8px_rgb(255_255_255/0.08),0_6px_16px_rgb(0_0_0/0.18)]",
+                  )}
+                  onClick={() => onProviderChange(provider.id)}
+                >
+                  {provider.name}
+                </CossButton>
+              );
+            })}
+          </div>
+          {selectedProvider?.modelSource === "preset" && (
+            <p className="mt-2 px-1 text-[11px] leading-4 text-amber-200/65">官方 ID 预置模型，未验证此服务商是否支持。</p>
+          )}
+        </div>
+      ) : undefined}
+      emptyLabel={grouped && options.length === 0 ? "这个配置还没有可用模型，请先在设置里测试连接。" : undefined}
+      onChange={onChange}
+    />
+  );
+}
+
 function ComposerChoiceMenu({
   label,
   icon,
   value,
+  groups,
   options,
   disabled = false,
+  header,
+  emptyLabel,
   onChange,
 }: {
   label: string;
   icon?: ReactNode;
   value: string;
+  groups: GroupedImageModelOptions<{ value: string; label: string }>[];
   options: Array<{ value: string; label: string }>;
   disabled?: boolean;
+  header?: ReactNode;
+  emptyLabel?: string;
   onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -1966,6 +2196,7 @@ function ComposerChoiceMenu({
   }, [open, options.length]);
 
   const selected = options.find((option) => option.value === value) ?? options[0];
+  const triggerLabel = selected?.label ?? emptyLabel ?? label;
 
   return (
     <div ref={rootRef} className="relative shrink-0">
@@ -1985,37 +2216,50 @@ function ComposerChoiceMenu({
             }}
           >
             {icon && <span className="grid size-4 shrink-0 place-items-center text-white/90">{icon}</span>}
-            <span className="whitespace-nowrap">{selected.label}</span>
+            <span className="whitespace-nowrap">{triggerLabel}</span>
             <ChevronDown aria-hidden size={20} className={cn("shrink-0 text-white/60 transition-transform", open && "rotate-180")} />
       </CossButton>
       {open && (
         <div
           ref={popupRef}
           className={cn(
-            "absolute left-0 z-30 w-max min-w-full max-w-[calc(100vw-16px)] overflow-y-auto rounded-[8px] border border-white/15 bg-[#121212] p-1 shadow-[0_12px_32px_rgb(0_0_0/0.32)]",
+            "absolute left-0 z-30 w-[248px] max-w-[calc(100vw-16px)] overflow-y-auto rounded-[16px] border border-white/[0.08] bg-[#121212] p-1.5 shadow-[0_18px_44px_rgb(0_0_0/0.46)]",
             placement === "above" ? "bottom-[calc(100%+8px)]" : "top-[calc(100%+8px)]",
           )}
           style={popupMaxHeight === null ? undefined : { maxHeight: `${popupMaxHeight}px` }}
         >
-          <div role="listbox" aria-label={label} className="flex w-max min-w-full flex-col gap-1">
-            {options.map((option) => (
-              <CossButton
-                key={option.value}
-                type="button"
-                variant="ghost"
-                role="option"
-                aria-selected={option.value === selected.value}
-                className={cn(
-                  "h-auto justify-start rounded-[8px] border-0 px-3 py-1.5 text-left text-sm leading-[22px] text-white/78 transition hover:bg-white/10 hover:text-white",
-                  option.value === selected.value && "bg-white/10 text-white",
-                )}
-                onClick={() => {
-                  onChange(option.value);
-                  setOpen(false);
-                }}
-              >
-                {option.label}
-              </CossButton>
+          {header}
+          <div role="listbox" aria-label={label} className="flex w-full flex-col gap-0.5 pt-1">
+            {options.length === 0 && emptyLabel && (
+              <p className="max-w-[280px] px-3 py-2 text-xs leading-5 text-white/48">{emptyLabel}</p>
+            )}
+            {groups.map((group) => (
+              <div key={group.group} role="group" aria-label={group.group} className="flex flex-col gap-0.5">
+                <p className="px-3 pb-0.5 pt-2 text-xs font-normal leading-5 text-white/30">{group.group}</p>
+                {group.models.map((option) => {
+                  const active = option.value === selected?.value;
+                  return (
+                    <CossButton
+                      key={option.value}
+                      type="button"
+                      variant="ghost"
+                      role="option"
+                      aria-selected={active}
+                      className={cn(
+                        "h-auto w-full justify-start gap-2 rounded-[8px] border-0 px-3 py-2 text-left text-sm font-normal leading-[22px] text-white/68 transition-colors hover:bg-white/[0.06] hover:text-white",
+                        active && "bg-white/[0.08] text-white",
+                      )}
+                      onClick={() => {
+                        onChange(option.value);
+                        setOpen(false);
+                      }}
+                    >
+                      <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                      <Check aria-hidden size={14} className={cn("shrink-0 text-white/80", active ? "opacity-100" : "opacity-0")} />
+                    </CossButton>
+                  );
+                })}
+              </div>
             ))}
           </div>
         </div>
@@ -2091,20 +2335,20 @@ function ComposerGenerationSettingsMenu({
             />
             <SettingsOptionTabs
               label="生成质量"
-              value={form.quality}
-              options={qualityOptions.map((quality) => ({ value: quality, label: qualityLabels[quality] ?? quality }))}
+              value={qualityOptionsForModel(form.model).includes(form.quality) ? form.quality : "auto"}
+              options={qualityOptionsForModel(form.model).map((quality) => ({ value: quality, label: qualityLabels[quality] ?? quality }))}
               onValueChange={(value) => onUpdate("quality", value)}
             />
             <SettingsOptionTabs
               label="分辨率"
-              value={form.resolution}
-              options={resolutionOptions.map((resolution) => ({ value: resolution, label: resolution }))}
+              value={resolutionOptionsForForm(form).includes(form.resolution) ? form.resolution : resolutionOptionsForForm(form).at(-1) ?? "1K"}
+              options={resolutionOptionsForForm(form).map((resolution) => ({ value: resolution, label: resolution }))}
               onValueChange={(value) => onUpdate("resolution", value)}
             />
             <SettingsOptionTabs
               label="文件格式"
               value={form.outputFormat}
-              options={formatOptions.map((format) => ({ value: format, label: formatLabels[format] ?? format.toUpperCase() }))}
+              options={formatOptions.filter((format) => outputFormatsForModel(form.model).includes(format)).map((format) => ({ value: format, label: formatLabels[format] ?? format.toUpperCase() }))}
               onValueChange={(value) => onUpdate("outputFormat", value)}
             />
           </div>
@@ -2156,34 +2400,86 @@ function CustomSizeInputs({
   onWidthChange: (value: number) => void;
   onHeightChange: (value: number) => void;
 }) {
+  const [editing, setEditing] = useState(false);
+  const hint = editing ? null : customSizeHint(width, height);
   return (
-    <div className="flex items-center gap-2">
-      <SizeInput ariaLabel="自定义长度" value={width} onChange={onWidthChange} />
-      <X aria-hidden size={12} className="shrink-0 text-white/30" />
-      <SizeInput ariaLabel="自定义宽度" value={height} onChange={onHeightChange} />
-    </div>
+    <>
+      <div className="flex items-center gap-2">
+        <SizeInput ariaLabel="自定义宽度" value={width} onChange={onWidthChange} onEditingChange={setEditing} />
+        <X aria-hidden size={12} className="shrink-0 text-white/30" />
+        <SizeInput ariaLabel="自定义高度" value={height} onChange={onHeightChange} onEditingChange={setEditing} />
+      </div>
+      <p className={cn("mt-1 text-[11px] leading-4", hint ? "text-[#ffb4b4]" : "text-white/38")}>
+        {hint ?? `宽高按 ${CUSTOM_SIZE_STEP} 的倍数取整，范围 ${CUSTOM_SIZE_MIN}–${CUSTOM_SIZE_MAX}px。`}
+      </p>
+    </>
   );
 }
 
-function SizeInput({ ariaLabel, value, onChange }: { ariaLabel: string; value: number; onChange: (value: number) => void }) {
+function SizeInput({
+  ariaLabel,
+  value,
+  onChange,
+  onEditingChange,
+}: {
+  ariaLabel: string;
+  value: number;
+  onChange: (value: number) => void;
+  onEditingChange?: (editing: boolean) => void;
+}) {
+  // The field keeps the raw text while editing so typing is not rewritten on every keystroke;
+  // the value is snapped to the 16px grid when the user leaves the field or submits.
+  const [draft, setDraft] = useState(() => String(value));
+  const editingRef = useRef(false);
+
+  useEffect(() => {
+    if (!editingRef.current) setDraft(String(value));
+  }, [value]);
+
+  function commitDraft() {
+    const parsed = parseCustomSizeText(draft);
+    const next = parsed === null ? value : normalizeCustomSize(parsed);
+    setDraft(String(next));
+    if (next !== value) onChange(next);
+  }
+
   return (
     <Input
       aria-label={ariaLabel}
       type="number"
-      min={16}
-      step={16}
-      value={value}
+      inputMode="numeric"
+      min={CUSTOM_SIZE_MIN}
+      max={CUSTOM_SIZE_MAX}
+      step={CUSTOM_SIZE_STEP}
+      value={draft}
       className="h-8 min-w-0 flex-1 rounded-[8px] border-transparent bg-white/[0.06] px-3 py-0 text-sm leading-[22px] text-white outline-none transition placeholder:text-white/28 focus:border-transparent focus:bg-white/[0.08] focus-visible:ring-0"
+      onFocus={() => {
+        editingRef.current = true;
+        onEditingChange?.(true);
+      }}
+      onBlur={() => {
+        editingRef.current = false;
+        onEditingChange?.(false);
+        commitDraft();
+      }}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        commitDraft();
+      }}
       onChange={(event) => {
-        const next = Number(event.target.value);
-        if (Number.isFinite(next)) onChange(next);
+        const text = event.target.value;
+        setDraft(text);
+        const parsed = parseCustomSizeText(text);
+        if (parsed !== null) onChange(clampCustomSize(parsed));
       }}
     />
   );
 }
 
-function ComposerPanel({
+export function ComposerPanel({
   formRef,
+  panelRef,
   layoutMode,
   form,
   config,
@@ -2191,6 +2487,9 @@ function ComposerPanel({
   referencePreparing,
   optimizing,
   providerConfigured,
+  modelProviders,
+  selectedModelProviderId,
+  onModelProviderChange,
   showReferenceCarryoverHint,
   referenceImages,
   sourceImagePreview,
@@ -2206,10 +2505,12 @@ function ComposerPanel({
   onRemoveReference,
   onOptimize,
   onUpdate,
+  onConfigureProvider,
   turnstileToken,
   onTurnstileToken,
 }: {
   formRef: RefObject<HTMLFormElement>;
+  panelRef: RefObject<HTMLDivElement>;
   layoutMode: ComposerLayoutMode;
   form: GenerateForm;
   config: AppConfig;
@@ -2217,6 +2518,9 @@ function ComposerPanel({
   referencePreparing: boolean;
   optimizing: boolean;
   providerConfigured: boolean;
+  modelProviders: ComposerModelProvider[];
+  selectedModelProviderId: string | null;
+  onModelProviderChange: (providerId: string) => void;
   showReferenceCarryoverHint: boolean;
   referenceImages: ReferenceImagePreview[];
   sourceImagePreview: SourceImagePreview | null;
@@ -2232,11 +2536,14 @@ function ComposerPanel({
   onRemoveReference: (index: number) => void;
   onOptimize: () => void;
   onUpdate: <K extends keyof GenerateForm>(key: K, value: GenerateForm[K]) => void;
+  onConfigureProvider: () => void;
   turnstileToken: string;
   onTurnstileToken: (token: string) => void;
 }) {
   const modelOptions = uniqueModelOptions(config.modelOptions ?? config.models, config.model);
-  const modelName = modelOptions.includes(form.model) ? form.model : modelOptions[0];
+  const activeProvider = modelProviders.find((provider) => provider.id === selectedModelProviderId) ?? modelProviders[0] ?? null;
+  const visibleModels = activeProvider ? activeProvider.models.map((model) => model.value) : modelOptions;
+  const modelName = visibleModels.includes(form.model) ? form.model : visibleModels[0] ?? form.model;
   const submitDisabled = !providerConfigured || !form.prompt.trim() || (config.turnstileRequired && config.turnstileSiteKey ? !turnstileToken : false);
   const referenceCount = referenceImages.length + (sourceImagePreview ? 1 : 0);
   const optimizeButton = (
@@ -2247,124 +2554,151 @@ function ComposerPanel({
   );
 
   return (
-    <form
-      ref={formRef}
-      data-composer-layout-mode={layoutMode}
+    <div
+      ref={panelRef}
       className={cn(
-        "ohm-smooth-panel ohm-composer-panel absolute left-1/2 flex min-h-[170px] -translate-x-1/2 flex-col items-start gap-4 overflow-visible border p-4",
+        "absolute left-1/2 flex -translate-x-1/2 flex-col gap-3",
         conversationPanelWidthClassName,
         layoutMode === "conversation" ? "bottom-6" : "",
+        layoutMode === "canvas-card" ? "top-0" : "",
       )}
       style={layoutMode === "empty-first-message" ? { top: `${emptyFirstComposerTopPercent}%` } : undefined}
-      onSubmit={onSubmit}
     >
-      {layoutMode === "empty-first-message" && (
-        <p
-          className="pointer-events-none absolute left-1/2 whitespace-nowrap text-center text-[28px] font-medium leading-none tracking-[-0.04em] text-white/90 -translate-x-1/2"
-          style={{ bottom: `calc(100% + ${emptyStateCopyToComposerGapPx}px)` }}
-        >
-          让我们一起创造点什么······
-        </p>
-      )}
-      <input ref={referenceInputRef} type="file" accept="image/png,image/jpeg,image/webp" multiple className="hidden" onChange={onReferenceInput} />
-      <div className="flex min-h-8 w-full flex-wrap items-center gap-x-2 gap-y-2">
-        {sourceImagePreview && (
-          <span className="ohm-smooth-control inline-flex h-8 min-w-0 max-w-full shrink items-center gap-2 overflow-hidden border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white">
-            <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[6px] border border-transparent bg-white/10">
-              <img src={localEditPreviewUrl ?? sourceImagePreview.url} alt={sourceImagePreview.name} loading="lazy" decoding="async" className="size-full object-cover" />
-            </span>
-            <span className="min-w-0 truncate whitespace-nowrap">{sourceImagePreview.name}</span>
-            <CossButton type="button" variant="ghost" size="icon-xs" aria-label={`移除${sourceImagePreview.name}`} className="grid size-4 shrink-0 place-items-center border-0 p-0 text-white/72 hover:bg-transparent hover:text-white" onClick={onRemoveSourceReference}>
-              <img aria-hidden="true" src={referenceDeleteIcon} alt="" className="size-4" draggable={false} />
-            </CossButton>
-          </span>
-        )}
-        {referenceImages.map((image, index) => (
-          <span key={image.url} className="ohm-smooth-control inline-flex h-8 min-w-0 max-w-full shrink items-center gap-2 overflow-hidden border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white">
-            <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[6px] border border-transparent bg-white/10">
-              <img src={image.url} alt={image.name} loading="lazy" decoding="async" className="size-full object-cover" />
-            </span>
-            <span className="min-w-0 truncate whitespace-nowrap">参考图 {index + 1}</span>
-            <CossButton type="button" variant="ghost" size="icon-xs" aria-label={`移除参考图 ${index + 1}`} className="grid size-4 shrink-0 place-items-center border-0 p-0 text-white/72 hover:bg-transparent hover:text-white" onClick={() => onRemoveReference(index)}>
-              <img aria-hidden="true" src={referenceDeleteIcon} alt="" className="size-4" draggable={false} />
-            </CossButton>
-          </span>
-        ))}
-        {referenceCount < maxReferenceImages && (
-          <CossButton
-            type="button"
-            variant="outline"
-            size="sm"
-            className={composerActionButtonClassName}
-            disabled={referencePreparing}
-            onClick={onPickReference}
+      <form
+        ref={formRef}
+        data-composer-layout-mode={layoutMode}
+        className="ohm-smooth-panel ohm-composer-panel relative flex min-h-[170px] w-full flex-col items-start gap-4 overflow-visible border p-4"
+        onSubmit={onSubmit}
+      >
+        {layoutMode === "empty-first-message" && (
+          <p
+            className="pointer-events-none absolute left-1/2 whitespace-nowrap text-center text-[28px] font-medium leading-none tracking-[-0.04em] text-white/90 -translate-x-1/2"
+            style={{ bottom: `calc(100% + ${emptyStateCopyToComposerGapPx}px)` }}
           >
-            <ComposerReferenceIcon className="size-4 shrink-0 text-white/90" />
-            参考图
-          </CossButton>
+            让我们一起创造点什么······
+          </p>
         )}
-        {referenceCount >= maxReferenceImages && (
-          <span className="text-xs leading-5 text-white/30">最多 {maxReferenceImages} 张</span>
-        )}
-      </div>
-      <div className="relative w-full">
-        <CossTextarea
-          ref={textareaRef}
-          aria-label="提示词"
-          value={form.prompt}
-          required
-          rows={composerTextareaMinRows}
-          placeholder={composerPromptPlaceholderText}
-          className={composerPromptTextareaClassName}
-          onChange={(event) => onUpdate("prompt", event.target.value)}
-          onPaste={onPromptPaste}
-        />
-      </div>
-      {showReferenceCarryoverHint && (
-        <p role="note" className="-mt-2 w-full text-xs leading-5 text-amber-100/72">
-          当前不会自动参考上一张图；如需继续修改，请先在图片菜单选择“基于这张图片继续创作”。
-        </p>
-      )}
-      <div className="flex w-full items-center justify-between gap-20">
-        <div className="flex min-w-0 items-center gap-2">
-          {shouldShowComposerOptimizeBeam(optimizing) ? (
-            <BorderBeam {...composerOptimizeBeamProps} className={composerOptimizeBeamClassName}>
-              {optimizeButton}
-            </BorderBeam>
-          ) : (
-            optimizeButton
+        <input ref={referenceInputRef} type="file" accept="image/png,image/jpeg,image/webp" multiple className="hidden" onChange={onReferenceInput} />
+        <div className="flex min-h-8 w-full flex-wrap items-center gap-x-2 gap-y-2">
+          {sourceImagePreview && (
+            <span className="ohm-smooth-control inline-flex h-8 min-w-0 max-w-full shrink items-center gap-2 overflow-hidden border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white">
+              <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[6px] border border-transparent bg-white/10">
+                <img src={localEditPreviewUrl ?? sourceImagePreview.url} alt={sourceImagePreview.name} loading="lazy" decoding="async" className="size-full object-cover" />
+              </span>
+              <span className="min-w-0 truncate whitespace-nowrap">{sourceImagePreview.name}</span>
+              <CossButton type="button" variant="ghost" size="icon-xs" aria-label={`移除${sourceImagePreview.name}`} className="grid size-4 shrink-0 place-items-center border-0 p-0 text-white/72 hover:bg-transparent hover:text-white" onClick={onRemoveSourceReference}>
+                <img aria-hidden="true" src={referenceDeleteIcon} alt="" className="size-4" draggable={false} />
+              </CossButton>
+            </span>
           )}
-          <ComposerChoiceMenu
-            label="模型"
-            value={modelName}
-            disabled={modelOptions.length <= 1}
-            icon={<ComposerModelIcon className="size-4 text-white/90" />}
-            options={modelOptions.map((model) => ({ value: model, label: imageModelLabel(model) }))}
-            onChange={(next) => onUpdate("model", next)}
+          {referenceImages.map((image, index) => (
+            <span key={image.url} className="ohm-smooth-control inline-flex h-8 min-w-0 max-w-full shrink items-center gap-2 overflow-hidden border border-transparent bg-white/10 px-1.5 py-1 text-sm font-normal leading-[22px] text-white">
+              <span className="grid size-5 shrink-0 place-items-center overflow-hidden rounded-[6px] border border-transparent bg-white/10">
+                <img src={image.url} alt={image.name} loading="lazy" decoding="async" className="size-full object-cover" />
+              </span>
+              <span className="min-w-0 truncate whitespace-nowrap">参考图 {index + 1}</span>
+              <CossButton type="button" variant="ghost" size="icon-xs" aria-label={`移除参考图 ${index + 1}`} className="grid size-4 shrink-0 place-items-center border-0 p-0 text-white/72 hover:bg-transparent hover:text-white" onClick={() => onRemoveReference(index)}>
+                <img aria-hidden="true" src={referenceDeleteIcon} alt="" className="size-4" draggable={false} />
+              </CossButton>
+            </span>
+          ))}
+          {referenceCount < maxReferenceImages && (
+            <CossButton
+              type="button"
+              variant="outline"
+              size="sm"
+              className={composerActionButtonClassName}
+              disabled={referencePreparing}
+              onClick={onPickReference}
+            >
+              <ComposerReferenceIcon className="size-4 shrink-0 text-white/90" />
+              参考图
+            </CossButton>
+          )}
+          {referenceCount >= maxReferenceImages && (
+            <span className="text-xs leading-5 text-white/30">最多 {maxReferenceImages} 张</span>
+          )}
+        </div>
+        <div className="relative w-full">
+          <CossTextarea
+            ref={textareaRef}
+            aria-label="提示词"
+            value={form.prompt}
+            required
+            rows={composerTextareaMinRows}
+            placeholder={composerPromptPlaceholderText}
+            className={composerPromptTextareaClassName}
+            onChange={(event) => onUpdate("prompt", event.target.value)}
+            onPaste={onPromptPaste}
           />
-          <ComposerGenerationSettingsMenu form={form} maxImagesPerRequest={config.maxImagesPerRequest} onUpdate={onUpdate} />
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {config.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={onTurnstileToken} />}
-          {config.turnstileRequired && !config.turnstileSiteKey && (
-            <span className="text-xs text-red-200/80">缺少验证配置</span>
-          )}
-          <CossButton
-            type="submit"
-            loading={loading}
-            disabled={submitDisabled}
-            className="h-8 min-w-16 rounded-[12px] border-transparent bg-white/90 text-black shadow-none hover:bg-white disabled:opacity-100 disabled:bg-white/20 disabled:text-white/40 disabled:hover:bg-white/20 disabled:shadow-none"
-          >
-            生图
-          </CossButton>
+        {showReferenceCarryoverHint && (
+          <p role="note" className="-mt-2 w-full text-xs leading-5 text-amber-100/72">
+            当前不会自动参考上一张图；如需继续修改，请先在图片菜单选择“基于这张图片继续创作”。
+          </p>
+        )}
+        <div className="flex w-full items-center justify-between gap-20">
+          <div className="flex min-w-0 items-center gap-2">
+            {shouldShowComposerOptimizeBeam(optimizing) ? (
+              <BorderBeam {...composerOptimizeBeamProps} className={composerOptimizeBeamClassName}>
+                {optimizeButton}
+              </BorderBeam>
+            ) : (
+              optimizeButton
+            )}
+            <ComposerModelMenu
+              providers={modelProviders}
+              selectedProviderId={selectedModelProviderId}
+              fallbackOptions={modelOptions.map((model) => ({ value: model, label: imageModelLabel(model) }))}
+              value={modelName}
+              onProviderChange={onModelProviderChange}
+              onChange={(next) => onUpdate("model", next)}
+            />
+            <ComposerGenerationSettingsMenu form={form} maxImagesPerRequest={config.maxImagesPerRequest} onUpdate={onUpdate} />
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            {config.turnstileSiteKey && <Turnstile siteKey={config.turnstileSiteKey} onToken={onTurnstileToken} />}
+            {config.turnstileRequired && !config.turnstileSiteKey && (
+              <span className="text-xs text-red-200/80">缺少验证配置</span>
+            )}
+            <CossButton
+              type="submit"
+              loading={loading}
+              disabled={submitDisabled}
+              className="h-8 min-w-16 rounded-[12px] border-transparent bg-white/90 text-black shadow-none hover:bg-white disabled:opacity-100 disabled:bg-white/20 disabled:text-white/40 disabled:hover:bg-white/20 disabled:shadow-none"
+            >
+              生图
+            </CossButton>
+          </div>
         </div>
-      </div>
-    </form>
+      </form>
+      {!providerConfigured && (
+        <button
+          type="button"
+          className="ohm-smooth-panel ohm-composer-panel group flex w-full items-center gap-3 border px-4 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20"
+          onClick={onConfigureProvider}
+        >
+          <span className="grid size-8 shrink-0 place-items-center rounded-[8px] bg-white/10 text-white/80">
+            <KeyRound aria-hidden="true" className="size-4" />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block text-sm font-medium leading-[22px] text-white/90">还没有配置生图 Provider</span>
+            <span className="block text-xs leading-5 text-white/45">填入 Base URL 和 API Key 后即可开始生成图片。</span>
+          </span>
+          <span className="flex shrink-0 items-center gap-1 text-sm leading-[22px] text-white/72 transition-colors group-hover:text-white">
+            去配置
+            <ChevronRight aria-hidden="true" className="size-4" />
+          </span>
+        </button>
+      )}
+    </div>
   );
 }
 
 function uniqueModelOptions(options: string[] | undefined, configuredModel: string) {
-  const candidates = [...(options ?? []), configuredModel, ...IMAGE_MODEL_OPTIONS].map((model) => model.trim()).filter(Boolean);
+  const candidates = (options && options.length > 0 ? options : [configuredModel, ...IMAGE_MODEL_OPTIONS])
+    .map((model) => model.trim())
+    .filter(Boolean);
   return Array.from(new Set(candidates));
 }
 
@@ -2401,7 +2735,7 @@ export function ImagePreview({ image, onClose }: { image: PreviewImage; onClose:
       try {
         // 使用原始 image.url（不带额外参数），让浏览器 HTTP 强缓存和 SW 缓存
         // 都能命中：画廊已加载过的图片，预览直接秒开；否则才走网络下载。
-        const response = await fetch(image.url, { signal: abortController.signal });
+        const response = await fetch(generatedImageRetryUrl(image.url, loadAttempt), { signal: abortController.signal, cache: "no-store" });
         if (!response.ok) throw new Error(`Image preview request failed with ${response.status}`);
         stalledSince = Date.now();
         const contentLength = Number(response.headers.get("Content-Length") ?? "");
@@ -2435,7 +2769,12 @@ export function ImagePreview({ image, onClose }: { image: PreviewImage; onClose:
         setLoadProgressPercent(100);
         setLoadState("loaded");
       } catch (error) {
-        if (!abortController.signal.aborted || Date.now() - stalledSince > IMAGE_PREVIEW_STALL_TIMEOUT_MS) {
+        const stalled = Date.now() - stalledSince > IMAGE_PREVIEW_STALL_TIMEOUT_MS;
+        if (shouldRetryImagePreviewRequest(error, loadAttempt, stalled)) {
+          setLoadAttempt((attempt) => attempt + 1);
+          return;
+        }
+        if (!abortController.signal.aborted || stalled) {
           console.error("image preview load failed", error);
           setLoadState("error");
         }
@@ -2532,7 +2871,7 @@ export function ImagePreview({ image, onClose }: { image: PreviewImage; onClose:
   );
 }
 
-function LocalEditDialog({
+export function LocalEditDialog({
   image,
   open,
   onOpenChange,
@@ -2728,10 +3067,17 @@ function LocalEditDialog({
 
 export function updateGenerateForm<K extends keyof GenerateForm>(current: GenerateForm, key: K, value: GenerateForm[K]): GenerateForm {
   const next = { ...current, [key]: value };
+  if (key === "model") {
+    next.quality = clampQualityForModel(value as string, current.quality);
+    next.resolution = clampResolutionForForm(current.aspectRatio, current.resolution);
+    if (!outputFormatsForModel(next.model).includes(next.outputFormat)) next.outputFormat = "png";
+  }
   if (key === "width" || key === "height") {
-    next[key] = normalizeCustomSize(value as number) as GenerateForm[K];
+    // Keep the typed number while editing; it is snapped to the 16px grid when committed or submitted.
+    next[key] = clampCustomSize(value as number) as GenerateForm[K];
   }
   if (key === "aspectRatio" || key === "resolution") {
+    next.resolution = clampResolutionForForm(next.aspectRatio, next.resolution);
     if (next.aspectRatio === "custom") return next;
     const [width, height] = sizeForRatioResolution(next.aspectRatio, next.resolution);
     next.width = width;
@@ -2740,16 +3086,12 @@ export function updateGenerateForm<K extends keyof GenerateForm>(current: Genera
   return next;
 }
 
-function normalizeCustomSize(value: number): number {
-  if (!Number.isFinite(value)) return 1024;
-  return Math.max(16, Math.round(value / 16) * 16);
-}
-
-function sizeForRatioResolution(ratio: string, resolution: string): [number, number] {
-  const [baseWidth, baseHeight] = ratioSizes[ratio] ?? ratioSizes["16:9"];
-  const longEdge = resolutionLongEdge[resolution] ?? resolutionLongEdge["1K"];
-  const scale = longEdge / Math.max(baseWidth, baseHeight);
-  return [Math.round((baseWidth * scale) / 16) * 16, Math.round((baseHeight * scale) / 16) * 16];
+/** Clamp model capabilities and snap custom dimensions right before the request is sent. */
+export function submittedGenerateForm(form: GenerateForm): GenerateForm {
+  const outputFormat = outputFormatsForModel(form.model).includes(form.outputFormat) ? form.outputFormat : "png";
+  const next = { ...form, outputFormat };
+  if (next.aspectRatio !== "custom") return next;
+  return { ...next, width: normalizeCustomSize(next.width), height: normalizeCustomSize(next.height) };
 }
 
 export function generationRequestBody(
@@ -2998,12 +3340,13 @@ function clampNumber(value: number, min: number, max: number): number {
 export function buildFlowChips(flow: ReturnType<typeof buildGenerationFlowItem>): string[] {
   const longEdge = Math.max(flow.job.width, flow.job.height);
   const resolution = longEdge >= 3840 ? "4K" : longEdge >= 2048 ? "2K" : "1K";
+  const outputFormat = flow.images[0]?.format || flow.job.output_format;
   const chips = [
-    "image-2",
+    imageModelLabel(flow.job.model || DEFAULT_IMAGE_MODEL),
     flow.job.aspect_ratio,
     qualityLabels[flow.job.quality] ?? flow.job.quality,
     resolution,
-    flow.job.output_format.toUpperCase(),
+    outputFormat.toUpperCase(),
   ];
   if (flow.status !== "pending" && typeof flow.elapsedSeconds === "number") {
     chips.push(`耗时：${flow.elapsedSeconds.toFixed(1)}s`);
@@ -3067,16 +3410,7 @@ function isTerminalJobStatus(status: GenerationJob["status"]): boolean {
 }
 
 async function loadInitialGenerationStatus(jobId: string): Promise<{ ok: true; job: GenerationJob; images: ImageItem[] }> {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), resolveInitialGenerationStatusTimeoutMs());
-  try {
-    return await api<{ ok: true; job: GenerationJob; images: ImageItem[] }>(
-      `/api/generations/${jobId}`,
-      { ...resolveGenerationPollRequestInit(), signal: controller.signal },
-    );
-  } finally {
-    window.clearTimeout(timeout);
-  }
+  return getGenerationStatus(jobId, resolveInitialGenerationStatusTimeoutMs());
 }
 
 function upsertRecord(

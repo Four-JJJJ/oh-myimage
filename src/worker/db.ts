@@ -104,27 +104,37 @@ export async function upsertCredential(
     promptModel: string;
     promptEncryptedApiKey?: string | null;
     promptApiKeyHint?: string | null;
+    /** 保存的是非启用配置时置 false，避免把编辑内容写进当前启用项的镜像字段。 */
+    syncImageFields?: boolean;
+    syncPromptFields?: boolean;
   },
 ): Promise<void> {
   const existing = await getCredential(db, spaceId);
   if (existing) {
+    const syncImage = input.syncImageFields ?? true;
+    const syncPrompt = input.syncPromptFields ?? true;
     await db
       .prepare(
         `UPDATE api_credentials
          SET base_url = ?, model = ?, encrypted_api_key = ?, api_key_hint = ?,
              prompt_base_url = ?, prompt_optimizer_model = ?, prompt_encrypted_api_key = ?, prompt_api_key_hint = ?,
-             last_test_ok = 0, last_tested_at = NULL, prompt_last_test_ok = 0, prompt_last_tested_at = NULL, updated_at = CURRENT_TIMESTAMP
+             last_test_ok = ?, last_tested_at = ?,
+             prompt_last_test_ok = ?, prompt_last_tested_at = ?, updated_at = CURRENT_TIMESTAMP
          WHERE space_id = ?`,
       )
       .bind(
-        input.imageBaseURL,
-        input.imageModel,
-        input.imageEncryptedApiKey,
-        input.imageApiKeyHint,
-        input.promptBaseURL,
-        input.promptModel,
-        input.promptEncryptedApiKey,
-        input.promptApiKeyHint,
+        syncImage ? input.imageBaseURL : existing.base_url,
+        syncImage ? input.imageModel : existing.model,
+        syncImage ? input.imageEncryptedApiKey : existing.encrypted_api_key,
+        syncImage ? input.imageApiKeyHint : existing.api_key_hint,
+        syncPrompt ? input.promptBaseURL : existing.prompt_base_url,
+        syncPrompt ? input.promptModel : existing.prompt_optimizer_model,
+        syncPrompt ? input.promptEncryptedApiKey : existing.prompt_encrypted_api_key,
+        syncPrompt ? input.promptApiKeyHint : existing.prompt_api_key_hint,
+        syncImage ? 0 : existing.last_test_ok,
+        syncImage ? null : existing.last_tested_at,
+        syncPrompt ? 0 : existing.prompt_last_test_ok,
+        syncPrompt ? null : existing.prompt_last_tested_at,
         spaceId,
       )
       .run();
@@ -183,8 +193,8 @@ export async function createImageProviderProfile(
   await db
     .prepare(
       `INSERT INTO image_provider_profiles (
-        id, space_id, name, base_url, model, encrypted_api_key, api_key_hint, last_test_ok, last_tested_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        id, space_id, name, base_url, model, encrypted_api_key, api_key_hint, last_test_ok, last_tested_at, discovered_models_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       input.id,
@@ -196,6 +206,7 @@ export async function createImageProviderProfile(
       input.api_key_hint,
       input.last_test_ok,
       input.last_tested_at,
+      input.discovered_models_json ?? null,
     )
     .run();
 }
@@ -229,7 +240,14 @@ export async function activateImageProviderProfile(db: AppDatabase, spaceId: str
        WHERE space_id = ?
          AND EXISTS (SELECT 1 FROM image_provider_profiles WHERE id = ? AND space_id = ?)`,
     )
-    .bind(profileId, spaceId, profileId, spaceId, profileId, spaceId, profileId, spaceId, profileId, spaceId)
+    .bind(
+      profileId, spaceId, // base_url
+      profileId, spaceId, // model
+      profileId, spaceId, // encrypted_api_key
+      profileId, spaceId, // api_key_hint
+      profileId, spaceId, // active_image_provider_id and target credential
+      profileId, spaceId, // profile existence within the same space
+    )
     .run();
 }
 
@@ -264,6 +282,23 @@ export async function markCredentialTested(db: AppDatabase, spaceId: string, kin
        WHERE space_id = ?`,
     )
     .bind(ok ? 1 : 0, spaceId)
+    .run();
+}
+
+export async function markImageProviderProfileDiscovered(
+  db: AppDatabase,
+  spaceId: string,
+  profileId: string,
+  ok: boolean,
+  discoveredModelsJson: string | null,
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE image_provider_profiles
+       SET last_test_ok = ?, last_tested_at = CURRENT_TIMESTAMP, discovered_models_json = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND space_id = ?`,
+    )
+    .bind(ok ? 1 : 0, discoveredModelsJson, profileId, spaceId)
     .run();
 }
 
@@ -302,7 +337,7 @@ export async function createGenerationJob(
       input.quantity,
       input.outputFormat,
       input.background,
-      input.outputFormat === "png" ? null : input.compression,
+      input.outputFormat === "jpeg" || input.outputFormat === "webp" ? input.compression : null,
       input.moderation,
       model,
       baseUrlHash,
@@ -530,6 +565,8 @@ export async function insertImageUsageEvent(db: AppDatabase, spaceId: string, im
     .run();
 }
 
+const progressWriteTimestamps = new Map<string, number>();
+
 export async function updateJobStatus(
   db: AppDatabase,
   jobId: string,
@@ -539,6 +576,19 @@ export async function updateJobStatus(
   update: JobStatusUpdate = {},
 ): Promise<void> {
   const completed = status === "succeeded" || status === "partial_succeeded" || status === "failed" || status === "cancelled";
+  const now = Date.now();
+  const lastProgressWrite = progressWriteTimestamps.get(jobId) ?? 0;
+  const shouldThrottleProgress =
+    status === "running" &&
+    update.progressCurrent !== undefined &&
+    errorCode === undefined &&
+    errorMessage === undefined &&
+    update.errorReason === undefined &&
+    !completed &&
+    now - lastProgressWrite < 750;
+  if (shouldThrottleProgress) return;
+  if (status === "running" && update.progressCurrent !== undefined) progressWriteTimestamps.set(jobId, now);
+  if (completed) progressWriteTimestamps.delete(jobId);
   const nextStage = update.stage ?? stageForStatus(status);
   await db
     .prepare(

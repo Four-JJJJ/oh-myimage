@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  activateImageProviderProfile,
   countDailyGeneratedImages,
   countDailyImageUsage,
   countPendingGenerationImages,
@@ -10,6 +11,7 @@ import {
   listGenerationJobs,
   listGenerationResultsForJob,
   upsertGenerationJobResult,
+  updateJobStatus,
 } from "./db";
 import type { AppDatabase, AppPreparedStatement } from "./types";
 
@@ -127,6 +129,31 @@ describe("daily image usage accounting", () => {
       values: ["evt_usage_img_abc", "space_1", IMAGE_GENERATED_EVENT],
     });
     expect(db.calls[0]?.query).toContain("ON CONFLICT (id) DO NOTHING");
+  });
+});
+
+describe("generation status persistence", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("does not throttle retryable provider errors behind a recent progress update", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-06T06:00:00.000Z"));
+    const db = new FakeDatabase();
+
+    await updateJobStatus(db, "job_retry_status", "running", undefined, undefined, {
+      stage: "waiting_provider",
+      progressCurrent: 0,
+      progressTotal: 1,
+    });
+    await updateJobStatus(db, "job_retry_status", "running", "provider_request_failed", "上游连接失败", {
+      stage: "waiting_provider",
+      progressCurrent: 0,
+      progressTotal: 1,
+    });
+
+    expect(db.calls).toHaveLength(2);
+    expect(db.calls[1]?.values).toContain("provider_request_failed");
+    expect(db.calls[1]?.values).toContain("上游连接失败");
   });
 });
 
@@ -261,5 +288,17 @@ describe("generation job result slots", () => {
     expect(db.calls[0]?.query).toContain("FROM generation_job_results");
     expect(db.calls[0]?.query).toContain("ORDER BY result_index ASC");
     expect(db.calls[0]?.values).toEqual(["space_1", "job_1"]);
+  });
+});
+
+describe("image provider activation", () => {
+  it("binds every profile and space predicate, including the existence guard", async () => {
+    const db = new FakeDatabase();
+    await activateImageProviderProfile(db, "space_owner", "profile_second");
+    const call = db.calls[0]!;
+    expect(call.method).toBe("run");
+    expect(call.query.match(/\?/g)).toHaveLength(12);
+    expect(call.values).toEqual(Array.from({ length: 6 }, () => ["profile_second", "space_owner"]).flat());
+    expect(call.values).toHaveLength(call.query.match(/\?/g)!.length);
   });
 });

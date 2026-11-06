@@ -1,4 +1,4 @@
-import type { GenerationJob, GenerationRecord } from "../../api";
+import { generatedImageDisplayUrl, type GenerationJob, type GenerationRecord } from "../../api";
 import { isTerminalGenerationJobStatus } from "../../generation-state";
 import { DEFAULT_IMAGE_MODEL } from "../../../image-models";
 
@@ -6,6 +6,7 @@ export interface ConversationListItem {
   id: string;
   title: string;
   previewImage: string | null;
+  previewImageFallback?: string | null;
   createdAt: string;
   groupLabel: string;
   latestRecordId?: string;
@@ -57,7 +58,8 @@ export function buildConversationList(records: GenerationRecord[], now = new Dat
   return records.map((record) => ({
     id: record.job.id,
     title: truncateConversationTitle(record.job.prompt),
-    previewImage: record.images[0]?.thumbnailUrl ?? record.images[0]?.url ?? null,
+    previewImage: record.images[0] ? generatedImageDisplayUrl(record.images[0]) : null,
+    previewImageFallback: record.images[0]?.url ?? null,
     createdAt: record.job.created_at,
     groupLabel: groupLabelForDate(record.job.created_at, now),
     latestRecordId: record.job.id,
@@ -104,6 +106,7 @@ export function buildSidebarConversations(
       ...anchorItem,
       id: conversationId,
       previewImage: item.previewImage,
+      previewImageFallback: item.previewImageFallback,
       latestRecordId: item.latestRecordId ?? item.id,
     });
   }

@@ -41,6 +41,25 @@ describe("generation validation", () => {
     expect(validateSize(512, 512)).toContain("总像素");
   });
 
+  it.each([
+    ["gif", "gpt-image-2.6"],
+    ["svg", "gpt-image-2.6"],
+    ["gif", "gpt-image-2.6-flare-lite"],
+    ["svg", "image-2.6-flare-lite"],
+  ])("accepts %s output for image-2.6 family model %s", (outputFormat, model) => {
+    const result = parseGenerationInput({ prompt: "animated icon", model, outputFormat });
+
+    expect(result.error).toBeUndefined();
+    expect(result.input?.outputFormat).toBe(outputFormat);
+  });
+
+  it.each(["gif", "svg"])("rejects %s output for models other than image-2.6", (outputFormat) => {
+    const result = parseGenerationInput({ prompt: "static image", model: "gpt-image-2.5-flare", outputFormat });
+
+    expect(result.input).toBeUndefined();
+    expect(result.error).toContain("仅支持 image-2.6");
+  });
+
   it("accepts transparent png backgrounds", () => {
     const result = parseGenerationInput({
       prompt: "transparent icon",
@@ -58,6 +77,25 @@ describe("generation validation", () => {
       background: "transparent",
     });
     expect(result.error).toContain("透明背景");
+  });
+
+  it("accepts xhigh and max quality for gpt-image-2.5 models", () => {
+    const xhigh = parseGenerationInput({ prompt: "poster", quality: "xhigh", model: "gpt-image-2.5-flare" });
+    const max = parseGenerationInput({ prompt: "poster", quality: "max", model: "gpt-image-2.5-sunburst" });
+    expect(xhigh.input?.quality).toBe("xhigh");
+    expect(max.input?.quality).toBe("max");
+  });
+
+  it("clamps xhigh and max quality to auto for gpt-image-2", () => {
+    const xhigh = parseGenerationInput({ prompt: "poster", quality: "xhigh", model: "gpt-image-2" });
+    const max = parseGenerationInput({ prompt: "poster", quality: "max", model: "gpt-image-2" });
+    expect(xhigh.input?.quality).toBe("auto");
+    expect(max.input?.quality).toBe("auto");
+  });
+
+  it("keeps xhigh and max quality when no model is specified", () => {
+    const xhigh = parseGenerationInput({ prompt: "poster", quality: "xhigh" });
+    expect(xhigh.input?.quality).toBe("xhigh");
   });
 });
 

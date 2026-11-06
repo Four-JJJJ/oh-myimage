@@ -14,7 +14,7 @@ export const collapsedPromptLineHeightPx = 21;
 export const emptyFirstComposerTopPercent = 34.7;
 export const emptyStateCopyToComposerGapPx = 40;
 
-export type ComposerLayoutMode = "empty-first-message" | "conversation";
+export type ComposerLayoutMode = "empty-first-message" | "conversation" | "canvas-card";
 
 export function resolveComposerLayoutMode(flowCount: number): ComposerLayoutMode {
   return flowCount > 0 ? "conversation" : "empty-first-message";

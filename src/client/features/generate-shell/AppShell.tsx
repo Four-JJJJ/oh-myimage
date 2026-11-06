@@ -1,4 +1,6 @@
 import type { ReactNode } from "react";
+import navCanvas from "../../assets/figma/nav-canvas.svg";
+import navCanvasActive from "../../assets/figma/nav-canvas-active.svg";
 import navGallery from "../../assets/figma/nav-gallery.svg";
 import navGalleryActive from "../../assets/figma/nav-gallery-active.svg";
 import navGenerate from "../../assets/figma/nav-generate.svg";
@@ -13,22 +15,25 @@ import ohmioWordmark from "../../assets/figma/ohmio-wordmark.svg";
 import { cn } from "../../lib/utils";
 import { CossButton } from "../shared/coss";
 
+export type WorkspaceView = "generate" | "gallery" | "settings" | "inspiration" | "canvas";
+
 interface AppShellProps {
   sidebar?: ReactNode;
   children: ReactNode;
-  activeView: "generate" | "gallery" | "settings" | "inspiration";
-  onNavigate: (view: "generate" | "gallery" | "settings" | "inspiration") => void;
+  activeView: WorkspaceView;
+  onNavigate: (view: WorkspaceView) => void;
   onLogout: () => void;
 }
 
 const navItems: Array<{
   value: string;
-  view?: "generate" | "gallery" | "settings" | "inspiration";
+  view?: WorkspaceView;
   label: string;
   icon: string;
   activeIcon: string;
 }> = [
   { value: "generate", view: "generate", label: "生成", icon: navGenerate, activeIcon: navGenerateActive },
+  { value: "canvas", view: "canvas", label: "画布", icon: navCanvas, activeIcon: navCanvasActive },
   { value: "gallery", view: "gallery", label: "作品", icon: navGallery, activeIcon: navGalleryActive },
   { value: "magic", view: "inspiration", label: "灵感", icon: navMagic, activeIcon: navMagicActive },
   { value: "settings", view: "settings", label: "设置", icon: navSettings, activeIcon: navSettingsActive },

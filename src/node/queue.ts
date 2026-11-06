@@ -32,7 +32,7 @@ export function createBullQueues(config: QueueConfig): BullQueues {
   return {
     generationQueue: new BullAppQueue(generation, "generation", {
       attempts: config.generationAttempts,
-      backoff: { type: "fixed", delay: config.generationBackoffMs },
+      backoff: { type: "exponential", delay: config.generationBackoffMs },
     }),
     inspirationQueue: new BullAppQueue(inspiration, "inspiration", {
       attempts: 1,
@@ -48,7 +48,7 @@ class BullAppQueue<T> implements AppQueue<T> {
   constructor(
     private readonly queue: Queue,
     private readonly name: string,
-    private readonly defaults: { attempts: number; backoff?: { type: "fixed"; delay: number } },
+    private readonly defaults: { attempts: number; backoff?: { type: "exponential" | "fixed"; delay: number } },
   ) {}
 
   async send(message: T): Promise<void> {

@@ -48,17 +48,21 @@ export function validateBaseURL(value: string): BaseUrlValidation {
     return { ok: false, error: "baseURL 不允许使用 IP 地址，请使用公开域名。" };
   }
 
-  const normalizedPath = url.pathname.replace(/\/+$/, "");
-  url.pathname = normalizedPath === "/" ? "" : normalizedPath;
+  url.pathname = providerBasePath(url);
   return { ok: true, normalized: url.toString().replace(/\/$/, "") };
 }
 
 export function buildProviderEndpoint(baseURL: string, endpoint: string): string {
   const base = new URL(baseURL);
-  base.pathname = `${base.pathname.replace(/\/+$/, "")}/${endpoint.replace(/^\/+/, "")}`;
+  base.pathname = `${providerBasePath(base)}/${endpoint.replace(/^\/+/, "")}`;
   base.search = "";
   base.hash = "";
   return base.toString();
+}
+
+function providerBasePath(url: URL): string {
+  // Apply the same default to new settings and legacy domain-only credentials.
+  return url.pathname.replace(/\/+$/, "") || "/v1";
 }
 
 export function isTokenFourjBaseURL(baseURL: string): boolean {

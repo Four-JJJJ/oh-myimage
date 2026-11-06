@@ -11,7 +11,8 @@ import {
   shouldShowWorkspaceSidebar,
   usesAppShellFrame,
 } from "./App";
-import type { GenerationRecord } from "./api";
+import { generatedImageDisplayUrl, supportsGeneratedImageEditing, type GenerationRecord } from "./api";
+import { GeneratedImage } from "./features/shared/GeneratedImage";
 import { entryStatusLoadingLines, entryStatusLoadingLoopLines, entryStatusSurfaceContract, entrySurfaceContract } from "./features/auth/EntryScreens";
 import { navGroupAnchorTop } from "./features/generate-shell/AppShell";
 import { buildGalleryGroups, galleryHasHiddenDefaultRangeItems } from "./gallery-utils";
@@ -40,8 +41,9 @@ describe("App safety helpers", () => {
     expect(currentSpaceName({ space: { id: "space_1", name: "   " }, providerConfigured: false })).toBeUndefined();
   });
 
-  it("keeps the generate, gallery, settings, and inspiration views inside the current app shell frame", () => {
+  it("keeps the generate, canvas, gallery, settings, and inspiration views inside the current app shell frame", () => {
     expect(usesAppShellFrame("generate")).toBe(true);
+    expect(usesAppShellFrame("canvas")).toBe(true);
     expect(usesAppShellFrame("gallery")).toBe(true);
     expect(usesAppShellFrame("settings")).toBe(true);
     expect(usesAppShellFrame("inspiration")).toBe(true);
@@ -49,12 +51,13 @@ describe("App safety helpers", () => {
 
   it("only keeps the secondary sidebar on the generate workspace", () => {
     expect(shouldShowWorkspaceSidebar("generate")).toBe(true);
+    expect(shouldShowWorkspaceSidebar("canvas")).toBe(false);
     expect(shouldShowWorkspaceSidebar("gallery")).toBe(false);
     expect(shouldShowWorkspaceSidebar("settings")).toBe(false);
     expect(shouldShowWorkspaceSidebar("inspiration")).toBe(false);
   });
 
-  it("pins the four primary nav entries as one group to a fixed sidebar height percentage", () => {
+  it("pins the primary nav entries as one group to a fixed sidebar height percentage", () => {
     expect(navGroupAnchorTop).toBe("37.56%");
   });
 
@@ -74,14 +77,38 @@ describe("App safety helpers", () => {
   it("uses generated thumbnails for compact generation record thumbnails when available", () => {
     const thumbnailSource = appSource.slice(appSource.indexOf("function GenerationThumbnail"), appSource.indexOf("type ImageSelectionMaskFactory"));
 
-    expect(thumbnailSource).toContain("image.thumbnailUrl ?? image.url");
+    expect(thumbnailSource).toContain("generatedImageDisplayUrl(image)");
+    expect(thumbnailSource).toContain("<GeneratedImage");
+    expect(thumbnailSource).toContain("fallbackSrc={image.url}");
   });
 
   it("uses generated thumbnails for gallery cards when available", () => {
     const galleryCardSource = appSource.slice(appSource.indexOf("function GalleryImageCard"), appSource.indexOf("function InspirationPlaceholderView"));
 
-    expect(galleryCardSource).toContain("item.image.thumbnailUrl ?? item.image.url");
+    expect(galleryCardSource).toContain("generatedImageDisplayUrl(item.image)");
+    expect(galleryCardSource).toContain("<GeneratedImage");
+    expect(galleryCardSource).toContain("fallbackSrc={item.image.url}");
     expect(galleryCardSource).not.toContain("src={item.image.url}");
+  });
+
+  it("retries image previews without cache and falls back to original image URLs", () => {
+    const previewSource = generateMenuSource.slice(generateMenuSource.indexOf("export function ImagePreview"), generateMenuSource.indexOf("function LocalEditDialog"));
+    expect(previewSource).toContain("shouldRetryImagePreviewRequest(error, loadAttempt, stalled)");
+    expect(previewSource).toContain("setLoadAttempt((attempt) => attempt + 1)");
+    expect(GeneratedImage).toBeTypeOf("function");
+  });
+
+  it("uses original GIF and SVG assets while retaining raster thumbnails", () => {
+    const image = { url: "/original", thumbnailUrl: "/thumbnail", format: "png" };
+
+    expect(generatedImageDisplayUrl(image)).toBe("/thumbnail");
+    expect(generatedImageDisplayUrl({ ...image, thumbnailUrl: null })).toBe("/original");
+    expect(generatedImageDisplayUrl({ ...image, format: "gif" })).toBe("/original");
+    expect(generatedImageDisplayUrl({ ...image, format: "svg" })).toBe("/original");
+    expect(supportsGeneratedImageEditing({ format: "png" })).toBe(true);
+    expect(supportsGeneratedImageEditing({ format: "webp" })).toBe(true);
+    expect(supportsGeneratedImageEditing({ format: "gif" })).toBe(false);
+    expect(supportsGeneratedImageEditing({ format: "svg" })).toBe(false);
   });
 
   it("mounts the shared image preview at the document body so it covers the whole app shell", () => {
