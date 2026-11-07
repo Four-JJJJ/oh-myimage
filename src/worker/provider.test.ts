@@ -307,6 +307,45 @@ describe("provider image size normalization", () => {
 });
 
 describe("provider save recovery", () => {
+  it.each(["base64", "url"])("rejects PNG returned for a GIF request via %s without retrying generation", async (transport) => {
+    const encryptionKey = "test-encryption-key-123";
+    const job = makeJob({ model: "gpt-image-2.6", output_format: "gif" });
+    const db = new GenerationFlowDatabase(job, await encryptSecret("test-key", encryptionKey));
+    const images = new WritableMemoryObjectStore();
+    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        const payload = JSON.parse(init.body as string);
+        expect(payload.output_format).toBe("gif");
+        expect(payload.prompt).toContain("animated GIF with multiple frames");
+        return Response.json({ data: [transport === "base64"
+          ? { b64_json: Buffer.from(PNG_SIGNATURE).toString("base64") }
+          : { url: "https://img.example.com/result.gif" }] });
+      }
+      return new Response(PNG_SIGNATURE, { headers: { "Content-Type": "image/gif" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await processGenerationMessage({ jobId: job.id, spaceId: job.space_id }, {
+      APP_ENCRYPTION_KEY: encryptionKey, DB: db, IMAGES: images, REQUEST_TIMEOUT_MS: "600000",
+    } as never, { retryProviderErrors: true, retryPostProcessingErrors: true });
+
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    expect(db.completedJob).toBeNull();
+    expect(db.jobStatusUpdates.at(-1)).toMatchObject({ status: "failed", errorCode: "provider_image_format_mismatch" });
+    expect(db.jobStatusUpdates.at(-1)?.errorMessage).toContain("实际返回了 PNG");
+    expect(db.imageAssets).toHaveLength(0);
+    expect([...images.objects.keys()].filter((key) => !key.endsWith(".json"))).toEqual([]);
+  });
+
+  it("does not recover a mismatched PNG as a successful GIF result", async () => {
+    const db = new RecordingDatabase();
+    const images = new MemoryObjectStore({ "space_1/job_1/img_job_1_0.png": PNG_SIGNATURE.buffer });
+
+    await expect(recoverStoredImageForResult(makeJob({ output_format: "gif" }), 0, { DB: db, IMAGES: images } as never))
+      .rejects.toMatchObject({ code: "provider_image_format_mismatch", retryable: false });
+    expect(db.queries.join("\n")).not.toContain("INSERT INTO image_assets");
+  });
+
   it("recovers an already stored image object without requesting the provider again", async () => {
     const db = new RecordingDatabase();
     const images = new MemoryObjectStore({

@@ -102,6 +102,27 @@ export function imageModelGroup(model: string): ImageModelGroup {
   return "其他";
 }
 
+function compareOpenAIImageModels(left: string, right: string): number {
+  const parse = (model: string) => {
+    const match = model.trim().toLowerCase().match(/^(?:gpt-)?image-(\d+(?:\.\d+)?)(?:-(sunburst|flare))?(?:-(pro|lite))?$/);
+    if (!match) return null;
+    return {
+      version: match[1].split(".").map(Number),
+      family: match[2] === "sunburst" ? 0 : match[2] === "flare" ? 1 : 2,
+      tier: match[3] === "pro" ? 0 : match[3] === "lite" ? 1 : 2,
+    };
+  };
+  const a = parse(left);
+  const b = parse(right);
+  if (!a || !b) return 0;
+  const versionLength = Math.max(a.version.length, b.version.length);
+  for (let index = 0; index < versionLength; index += 1) {
+    const difference = (b.version[index] ?? 0) - (a.version[index] ?? 0);
+    if (difference) return difference;
+  }
+  return a.family - b.family || a.tier - b.tier;
+}
+
 export interface GroupedImageModelOptions<T> {
   group: ImageModelGroup;
   models: T[];
@@ -117,7 +138,13 @@ export function groupImageModelOptions<T>(options: readonly T[], modelOf: (item:
   }
   return IMAGE_MODEL_GROUP_ORDER.flatMap((group) => {
     const models = buckets.get(group);
-    return models ? [{ group, models }] : [];
+    if (!models) return [];
+    if (group === "OpenAI") {
+      const originalOrder = new Map(models.map((item, index) => [item, index]));
+      models.sort((left, right) => compareOpenAIImageModels(modelOf(left), modelOf(right))
+        || (originalOrder.get(left) ?? 0) - (originalOrder.get(right) ?? 0));
+    }
+    return [{ group, models }];
   });
 }
 

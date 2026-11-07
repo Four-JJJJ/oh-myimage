@@ -27,6 +27,7 @@ import { claimGenerationSubmitLock, isTerminalGenerationJobStatus, mergePolledJo
 import { generationProgressSummary } from "../../generation-progress";
 import { clampQualityForModel, DEFAULT_IMAGE_MODEL, groupImageModelOptions, IMAGE_MODEL_OPTIONS, imageModelLabel, outputFormatsForModel, sizeForRatioResolution, type GroupedImageModelOptions } from "../../../image-models";
 import { composerModelProvidersFromProfiles, resolveComposerProviderSelection, type ComposerModelProvider } from "./model-providers";
+import { readGenerationPreferences, writeGenerationPreferences } from "./preferences";
 import {
   AlertDialog,
   AlertDialogClose,
@@ -103,6 +104,7 @@ const generationStageMaxWidthPx = conversationPanelMaxWidthPx;
 const generationStageMaxHeightPx = 360;
 
 interface GenerateMenuViewProps {
+  spaceId: string;
   config: AppConfig;
   providerConfigured: boolean;
   records: GenerationRecord[];
@@ -523,6 +525,7 @@ export function shouldRefreshActiveGenerationRecordsOnLifecycleEvent({
 }
 
 export function GenerateMenuView({
+  spaceId,
   config,
   providerConfigured,
   records,
@@ -537,7 +540,11 @@ export function GenerateMenuView({
   onLogout,
   onUsageChanged,
 }: GenerateMenuViewProps) {
-  const [form, setForm] = useState<GenerateForm>(defaultForm);
+  const [initialPreferences] = useState(() => {
+    try { return readGenerationPreferences(window.localStorage, spaceId, defaultForm); }
+    catch { return { form: { ...defaultForm }, providerId: null }; }
+  });
+  const [form, setForm] = useState<GenerateForm>(initialPreferences.form);
   const [referenceImages, setReferenceImages] = useState<ReferenceImagePreview[]>([]);
   const [sourceImagePreview, setSourceImagePreview] = useState<SourceImagePreview | null>(null);
   const [referenceMask, setReferenceMask] = useState<ImageSelectionMask | null>(null);
@@ -573,7 +580,12 @@ export function GenerateMenuView({
   const lastAutoScrolledFlowCountRef = useRef(0);
   const [composerHeight, setComposerHeight] = useState(170);
   const [modelProviders, setModelProviders] = useState<ComposerModelProvider[]>([]);
-  const [selectedModelProviderId, setSelectedModelProviderId] = useState<string | null>(null);
+  const [selectedModelProviderId, setSelectedModelProviderId] = useState<string | null>(initialPreferences.providerId);
+
+  useEffect(() => {
+    try { writeGenerationPreferences(window.localStorage, spaceId, form, selectedModelProviderId); }
+    catch { /* Browser storage access can be blocked. */ }
+  }, [spaceId, form, selectedModelProviderId]);
 
   const conversations = useMemo(
     () => buildSidebarConversations(records, draftConversation, conversationIdsByRecordId),
@@ -623,7 +635,7 @@ export function GenerateMenuView({
         if (cancelled) return;
         const providers = composerModelProvidersFromProfiles(result.imageProviders, []);
         setModelProviders(providers);
-        applyProviders(providers, result.activeImageProviderId ?? null);
+        applyProviders(providers, selectedModelProviderIdRef.current ?? result.activeImageProviderId ?? null);
         const missingModelIds = providers
           .filter((provider) => provider.models.length === 0 && !discoveredProviderIdsRef.current.has(provider.id))
           .map((provider) => provider.id);
@@ -1207,7 +1219,7 @@ export function GenerateMenuView({
         setActiveJob(null);
         setActiveImages([]);
         setSourceImageId(undefined);
-        setForm(defaultForm);
+        setForm((current) => ({ ...current, prompt: "" }));
         clearAllReferences();
         window.requestAnimationFrame(() => textareaRef.current?.focus());
       }}

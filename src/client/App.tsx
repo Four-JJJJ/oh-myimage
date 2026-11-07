@@ -386,6 +386,8 @@ export function App() {
   if (view === "generate") {
     return (
       <GenerateMenuView
+        key={me.space.id}
+        spaceId={me.space.id}
         config={effectiveConfig}
         providerConfigured={me.providerConfigured}
         records={generationRecords}

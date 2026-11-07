@@ -97,10 +97,10 @@ describe("image model groups", () => {
     expect(imageModelGroup("")).toBe("其他");
   });
 
-  it("orders groups OpenAI, Gemini, Grok and keeps in-group order stable", () => {
+  it("orders OpenAI models by version and family, then keeps other groups stable", () => {
     const groups = groupImageModelOptions(IMAGE_MODEL_OPTIONS, (model) => model);
     expect(groups.map((group) => group.group)).toEqual(["OpenAI", "Gemini", "Grok"]);
-    expect(groups[0].models).toEqual(["gpt-image-2", "gpt-image-2.6", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]);
+    expect(groups[0].models).toEqual(["gpt-image-2.6", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "gpt-image-2"]);
     expect(groups[1].models).toEqual([
       "gemini-2.5-flash-image",
       "gemini-3-pro-image",
@@ -110,6 +110,33 @@ describe("image model groups", () => {
       "gemini-nano-banana-2.1",
     ]);
     expect(groups[2].models).toEqual(["grok-imagine-image", "grok-imagine-image-2.0"]);
+  });
+
+  it("orders discovered OpenAI variants by version, family, and tier", () => {
+    const models = [
+      "gpt-image-2.5-flare-lite",
+      "gpt-image-2.6-sunburst-lite",
+      "gpt-image-2.5-sunburst-pro",
+      "gpt-image-2.5-sunburst-lite",
+      "gpt-image-2-lite",
+      "gpt-image-2-pro",
+      "gpt-image-2.6-flare-pro",
+      "gpt-image-2.5-flare-pro",
+      "gpt-image-2.6-flare-lite",
+      "gpt-image-2.6-sunburst-pro",
+    ];
+    expect(groupImageModelOptions(models, (model) => model)[0].models).toEqual([
+      "gpt-image-2.6-sunburst-pro",
+      "gpt-image-2.6-sunburst-lite",
+      "gpt-image-2.6-flare-pro",
+      "gpt-image-2.6-flare-lite",
+      "gpt-image-2.5-sunburst-pro",
+      "gpt-image-2.5-sunburst-lite",
+      "gpt-image-2.5-flare-pro",
+      "gpt-image-2.5-flare-lite",
+      "gpt-image-2-pro",
+      "gpt-image-2-lite",
+    ]);
   });
 
   it("appends unknown models as a trailing group", () => {

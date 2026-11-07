@@ -728,6 +728,7 @@ async function generateAndStoreOneImage(
     { providerBaseURL: credential.base_url, apiKey },
     env,
   );
+  validateRequestedImageFormat(job, binary);
   const id = imageIdForResult(job.id, resultIndex);
   const normalizedBinary = await normalizeProviderImageSize(job, binary);
   await persistGeneratedImage(job, env, id, resultIndex, normalizedBinary.bytes, normalizedBinary.mimeType, normalizedBinary.format, Date.now() + downloadTimeoutMs);
@@ -1065,10 +1066,9 @@ async function prepareProviderResultCheckpoint(
     return { image: checkpointImage(image), binary: null };
   }
 
-  const binary = await normalizeProviderImageSize(
-    job,
-    providerImageBinaryFromBytes(bytesFromBase64(image.b64_json), fallbackFormat),
-  );
+  const decoded = providerImageBinaryFromBytes(bytesFromBase64(image.b64_json), fallbackFormat);
+  validateRequestedImageFormat(job, decoded);
+  const binary = await normalizeProviderImageSize(job, decoded);
   const id = imageIdForResult(job.id, resultIndex);
   const storageKey = storageKeyForResult(job, id, binary.format);
   await storeGeneratedImageWithRecovery(
@@ -1247,6 +1247,7 @@ export async function recoverStoredImageForResult(job: GenerationJobRecord, resu
   try {
     const bytes = new Uint8Array(await object.arrayBuffer());
     const binary = providerImageBinaryFromBytes(bytes, stored.format);
+    validateRequestedImageFormat(job, binary);
     const pixelSize = await imagePixelSize(bytes);
     await insertImageAsset(env.DB, {
       id,
@@ -1597,7 +1598,12 @@ export function extractResponsesOutputText(response: ProviderTextResponse): stri
 export function buildImageGenerationPayload(job: GenerationJobRecord, count: number): ImageGenerationPayload {
   const payload: ImageGenerationPayload = {
     model: job.model,
-    prompt: buildProviderImagePrompt(job),
+    prompt: [
+      buildProviderImagePrompt(job),
+      job.output_format === "gif"
+        ? "Output an animated GIF with multiple frames and visible motion. Return the GIF file itself, not a static PNG, preview, or sprite sheet."
+        : "",
+    ].filter(Boolean).join("\n\n"),
     n: count,
     size: `${job.width}x${job.height}`,
     quality: job.quality,
@@ -1815,6 +1821,16 @@ async function loadSharp(): Promise<typeof import("sharp") | null> {
   } catch {
     return null;
   }
+}
+
+function validateRequestedImageFormat(job: Pick<GenerationJobRecord, "output_format">, binary: ProviderImageBinary): void {
+  if (job.output_format !== "gif" || binary.format === "gif") return;
+  throw new ProviderError(
+    "provider_image_format_mismatch",
+    `你选择了 GIF，但模型服务实际返回了 ${binary.format.toUpperCase()}，未返回 GIF 动图。请确认当前模型和服务支持 GIF 输出。系统不会自动重新生图，以免重复计费。`,
+    false,
+    "post_processing",
+  );
 }
 
 /**
