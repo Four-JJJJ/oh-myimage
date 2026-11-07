@@ -22,8 +22,10 @@ import {
   Dispatch,
   Fragment,
   FormEvent,
+  lazy,
   ReactNode,
   SetStateAction,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -43,14 +45,12 @@ import {
   AlertDialogTitle,
 } from "./components/ui/alert-dialog";
 import { Button } from "./components/ui/button";
-import { Calendar } from "./components/ui/calendar";
 import { Input, type InputProps } from "./components/ui/input";
 import { Popover, PopoverPopup, PopoverTrigger } from "./components/ui/popover";
 import { api, AppConfig, generatedImageDisplayUrl, GenerationJob, GenerationRecord, getGenerationStatus, ImageItem, ImageProviderProfile, ProviderSettings, SettingsProviders, supportsGeneratedImageEditing } from "./api";
 import { EntryField, EntryFormSection, EntryNoticeStack, EntryShell, EntryStatusScreen } from "./features/auth/EntryScreens";
 import { GenerateMenuView, HoverImageActionBar, ImagePreview, resolveGenerationPollIntervalMs, shouldPollGeneration, type HoverImageAction } from "./features/generate-menu/GenerateMenuView";
 import { AppShell, type WorkspaceView } from "./features/generate-shell/AppShell";
-import { InfiniteCanvasView } from "./features/infinite-canvas/InfiniteCanvasView";
 import { GenerationFormFooter, ParameterSection, PromptPlaceholderThumbnail, PromptSection } from "./features/shared/generation-form-sections";
 import { GeneratedImage } from "./features/shared/GeneratedImage";
 import { GenerationDotMatrixLoader, generationDotMatrixColumns, generationDotMatrixRows } from "./features/shared/generation-loading";
@@ -71,6 +71,23 @@ import generationRegenerateIcon from "./assets/figma/generation-regenerate.svg";
 import openaiIcon from "./assets/figma/openai.svg";
 import referenceDeleteIcon from "./assets/figma/reference-delete.svg";
 import { cn } from "./lib/utils";
+
+// Heavy, rarely-first-visited surfaces are split into their own chunks so the
+// initial bundle only carries the generate workspace.
+const loadInfiniteCanvasView = () => import("./features/infinite-canvas/InfiniteCanvasView");
+const InfiniteCanvasView = lazy(() => loadInfiniteCanvasView().then((module) => ({ default: module.InfiniteCanvasView })));
+const loadCalendar = () => import("./components/ui/calendar");
+const Calendar = lazy(() => loadCalendar().then((module) => ({ default: module.Calendar })));
+
+function scheduleIdlePrefetch(load: () => Promise<unknown>): () => void {
+  const run = () => void load().catch(() => undefined);
+  if (typeof window.requestIdleCallback === "function") {
+    const handle = window.requestIdleCallback(run, { timeout: 4000 });
+    return () => window.cancelIdleCallback(handle);
+  }
+  const handle = window.setTimeout(run, 1500);
+  return () => window.clearTimeout(handle);
+}
 
 type View = WorkspaceView;
 
@@ -359,6 +376,13 @@ export function App() {
     void loadGenerationRecords();
   }, [loadGenerationRecords, currentSpaceId(me)]);
 
+  const signedIn = Boolean(me && currentSpaceId(me));
+  useEffect(() => {
+    // Prefetch the canvas chunk in idle time after sign-in so switching views stays instant.
+    if (!signedIn) return;
+    return scheduleIdlePrefetch(loadInfiniteCanvasView);
+  }, [signedIn]);
+
   if (booting) {
     return <EntryStatusScreen label="正在打开创作台" detail="正在同步空间信息与创作台配置。" />;
   }
@@ -371,16 +395,18 @@ export function App() {
   }
   if (view === "canvas") {
     return (
-      <InfiniteCanvasView
-        config={effectiveConfig}
-        providerConfigured={me.providerConfigured}
-        onNavigate={setView}
-        onProviderNeeded={() => setView("settings")}
-        onLogout={async () => {
-          await api("/api/auth/logout", { method: "POST" });
-          setMe(null);
-        }}
-      />
+      <Suspense fallback={<EntryStatusScreen label="正在打开画布" detail="正在加载无限画布工作区。" />}>
+        <InfiniteCanvasView
+          config={effectiveConfig}
+          providerConfigured={me.providerConfigured}
+          onNavigate={setView}
+          onProviderNeeded={() => setView("settings")}
+          onLogout={async () => {
+            await api("/api/auth/logout", { method: "POST" });
+            setMe(null);
+          }}
+        />
+      </Suspense>
     );
   }
   if (view === "generate") {
@@ -1489,6 +1515,10 @@ function GalleryView({
   const [previewItem, setPreviewItem] = useState<{ image: ImageItem; job: GenerationJob } | null>(null);
   const [error, setError] = useState("");
   const [dateRange, setDateRange] = useState<DateRange | undefined>();
+  useEffect(() => {
+    // Warm the calendar chunk once the gallery is on screen so opening the date filter feels instant.
+    return scheduleIdlePrefetch(loadCalendar);
+  }, []);
   const [showOlderThanDefaultRange, setShowOlderThanDefaultRange] = useState(false);
 
   const availableRatios = useMemo(
@@ -1701,7 +1731,9 @@ function GalleryView({
                 <span className={cn("truncate", !normalizedDateFilter.active && "text-white/42")}>{dateRangeLabel}</span>
               </PopoverTrigger>
               <PopoverPopup className="w-auto p-3" sideOffset={10}>
-                <Calendar defaultMonth={dateRange?.from} mode="range" selected={dateRange} onSelect={setDateRange} />
+                <Suspense fallback={<div aria-hidden className="h-[296px] w-[252px]" />}>
+                  <Calendar defaultMonth={dateRange?.from} mode="range" selected={dateRange} onSelect={setDateRange} />
+                </Suspense>
               </PopoverPopup>
             </Popover>
             {normalizedDateFilter.active && (

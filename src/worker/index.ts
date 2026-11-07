@@ -590,8 +590,10 @@ app.use("/api/*", async (c, next) => {
 
 app.get("/api/me", async (c) => {
   const space = c.get("space");
-  const credential = await getCredential(c.env.DB, space.id);
-  const profiles = await listImageProviderProfiles(c.env.DB, space.id);
+  const [credential, profiles] = await Promise.all([
+    getCredential(c.env.DB, space.id),
+    listImageProviderProfiles(c.env.DB, space.id),
+  ]);
   const modelOptions = availableImageModels(profiles, credential?.model ?? c.env.DEFAULT_IMAGE_MODEL);
   return c.json({
     ok: true,
@@ -922,8 +924,10 @@ app.get("/api/generations", async (c) => {
   const jobs = await listGenerationJobs(c.env.DB, spaceId, c.req.query("cursor"));
   const visibleJobs = jobs.slice(0, GENERATION_JOB_PAGE_SIZE);
   const jobIds = visibleJobs.map((job) => job.id);
-  const images = await listImagesForJobs(c.env.DB, spaceId, jobIds);
-  const results = await listGenerationResultsForJobs(c.env.DB, spaceId, jobIds);
+  const [images, results] = await Promise.all([
+    listImagesForJobs(c.env.DB, spaceId, jobIds),
+    listGenerationResultsForJobs(c.env.DB, spaceId, jobIds),
+  ]);
   const imagesByJob = new Map<string, typeof images>();
   for (const image of images) {
     const group = imagesByJob.get(image.job_id) ?? [];
@@ -957,8 +961,10 @@ app.get("/api/generations", async (c) => {
 app.get("/api/generations/:jobId", async (c) => {
   const job = await getGenerationJob(c.env.DB, c.get("space").id, c.req.param("jobId"));
   if (!job) throw jsonError(404, "job_not_found", "任务不存在。");
-  const images = await listImagesForJob(c.env.DB, c.get("space").id, job.id);
-  const results = await listGenerationResultsForJob(c.env.DB, c.get("space").id, job.id);
+  const [images, results] = await Promise.all([
+    listImagesForJob(c.env.DB, c.get("space").id, job.id),
+    listGenerationResultsForJob(c.env.DB, c.get("space").id, job.id),
+  ]);
   c.header("Cache-Control", "private, no-store, no-cache, must-revalidate, max-age=0");
   c.header("Pragma", "no-cache");
   c.header("Expires", "0");
@@ -1014,9 +1020,7 @@ app.delete("/api/generations/:jobId", async (c) => {
     ...(job.mask_image_storage_key ? [job.mask_image_storage_key] : []),
     ...recoveryKeys,
   ]);
-  for (const storageKey of storageKeys) {
-    await c.env.IMAGES.delete(storageKey);
-  }
+  await deleteStorageKeys(c.env.IMAGES, storageKeys);
   await deleteGenerationJob(c.env.DB, spaceId, job.id);
   return c.json({ ok: true });
 });
@@ -1382,6 +1386,29 @@ function serializeImage(
         }
       : {}),
   };
+}
+
+const STORAGE_DELETE_CONCURRENCY = 8;
+
+/**
+ * Deletes object-store keys with bounded parallelism. A job can fan out to dozens of
+ * recovery keys (every format x quantity), and deleting them one by one costs a full
+ * object-store round trip each.
+ */
+export async function deleteStorageKeys(store: Pick<Env["IMAGES"], "delete">, keys: Iterable<string>, concurrency = STORAGE_DELETE_CONCURRENCY): Promise<void> {
+  const queue = Array.from(keys);
+  let firstError: unknown;
+  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+    for (let key = queue.shift(); key !== undefined; key = queue.shift()) {
+      try {
+        await store.delete(key);
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+  });
+  await Promise.all(workers);
+  if (firstError !== undefined) throw firstError;
 }
 
 function imageResponseHeaders(contentType: string, contentDisposition: string, etag: string, contentLength?: number | null): HeadersInit {

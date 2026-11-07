@@ -52,7 +52,21 @@ class PostgresPreparedStatement implements AppPreparedStatement {
   }
 }
 
-function translateSql(query: string): string {
+// SQL text comes from a small, fixed set of templates, so the translated form is
+// memoised instead of being re-scanned character by character on every query.
+const TRANSLATED_SQL_CACHE_LIMIT = 1_000;
+const translatedSqlCache = new Map<string, string>();
+
+export function translateSql(query: string): string {
+  const cached = translatedSqlCache.get(query);
+  if (cached !== undefined) return cached;
+  const translated = translateSqlUncached(query);
+  if (translatedSqlCache.size >= TRANSLATED_SQL_CACHE_LIMIT) translatedSqlCache.clear();
+  translatedSqlCache.set(query, translated);
+  return translated;
+}
+
+function translateSqlUncached(query: string): string {
   const normalized = query.replace(
     /\bCURRENT_TIMESTAMP\b/g,
     "to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')",

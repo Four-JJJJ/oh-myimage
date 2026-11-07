@@ -15,7 +15,9 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (!id.includes("node_modules")) return undefined;
-          if (id.includes("/react-day-picker/") || id.includes("/date-fns/")) return "calendar-vendor";
+          // Let Rollup place calendar deps next to the lazily loaded Calendar chunk
+          // (date-fns helpers used by the app shell are split out automatically).
+          if (id.includes("/react-day-picker/") || id.includes("/date-fns/") || id.includes("/@date-fns/")) return undefined;
           return "vendor";
         },
       },
