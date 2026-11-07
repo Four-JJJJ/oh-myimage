@@ -30,7 +30,7 @@
 @tailwind utilities;
 
 .canvas-node {
-  border-radius: 18px;
+  border-radius: 16px;
   box-shadow: none;
 }
 
@@ -53,7 +53,7 @@
 .canvas-select {
   height: 1.75rem;
   width: 7.5rem;
-  border-radius: 0.5rem;
+  border-radius: 8px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.06);
   padding: 0 0.5rem;

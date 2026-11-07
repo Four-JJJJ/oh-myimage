@@ -841,7 +841,7 @@ export function InfiniteCanvasView({
             return applyCanvasLocalEdit(localEditNodeId, image, strokes);
           }}
         />
-        {notice && <div className="absolute bottom-24 left-1/2 max-w-md -translate-x-1/2 rounded-xl bg-black/80 px-4 py-2 text-sm text-white shadow-lg">{notice}</div>}
+        {notice && <div className="absolute bottom-24 left-1/2 max-w-md -translate-x-1/2 rounded-[12px] bg-black/80 px-4 py-2 text-sm text-white shadow-lg">{notice}</div>}
         <input
           ref={fileInputRef}
           type="file"
@@ -1200,34 +1200,34 @@ function Port({ side, onPointerDown }: { side: "input" | "output"; onPointerDown
 function CanvasTopBar({ name, canvases, activeId, onOpen, onCreate, zoom, assistantOpen, onAssistant, onName }: { name: string; canvases: Array<{ id: string; name: string }>; activeId: string; onOpen: (id: string) => void; onCreate: () => void; zoom: number; assistantOpen: boolean; onAssistant: () => void; onName: (name: string) => void }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="absolute left-4 top-4 z-20 flex h-11 items-center gap-1 rounded-2xl border border-white/10 bg-[#1b1b1b]/92 px-1.5 shadow-lg backdrop-blur">
-      <button type="button" aria-label="画布列表" aria-expanded={open} className="flex h-8 max-w-52 items-center gap-1.5 rounded-lg px-2 text-sm text-white hover:bg-white/8" onClick={() => setOpen((current) => !current)}>
+    <div className="absolute left-4 top-4 z-20 flex h-11 items-center gap-1 rounded-[16px] border border-white/10 bg-[#1b1b1b]/92 px-1.5 shadow-lg backdrop-blur">
+      <button type="button" aria-label="画布列表" aria-expanded={open} className="flex h-8 max-w-52 items-center gap-1.5 rounded-[8px] px-2 text-sm text-white hover:bg-white/8" onClick={() => setOpen((current) => !current)}>
         <span className="truncate">{name || "未命名项目"}</span>
         <IconChevronDownSmall className="size-4 shrink-0 text-white/70" />
       </button>
-      <button type="button" aria-label="新建画布" className="flex h-8 items-center gap-1 rounded-lg border border-white/10 bg-white/[0.06] px-2.5 text-sm text-white hover:bg-white/12" onClick={onCreate}>
+      <button type="button" aria-label="新建画布" className="flex h-8 items-center gap-1 rounded-[8px] border border-white/10 bg-white/[0.06] px-2.5 text-sm text-white hover:bg-white/12" onClick={onCreate}>
         <IconPlusSmall className="size-4" />
         新建
       </button>
       {open && (
-        <div className="absolute left-0 top-12 w-64 rounded-xl border border-white/10 bg-[#202020] p-2 shadow-2xl">
+        <div className="absolute left-0 top-12 w-64 rounded-[12px] border border-white/10 bg-[#202020] p-2 shadow-2xl">
           <label className="mb-2 block px-1 text-xs text-white/45">
             重命名
-            <input aria-label="项目名称" value={name} className="mt-1 h-8 w-full rounded-lg border border-white/10 bg-white/[0.04] px-2 text-sm text-white outline-none" onChange={(event) => onName(event.target.value)} />
+            <input aria-label="项目名称" value={name} className="mt-1 h-8 w-full rounded-[8px] border border-white/10 bg-white/[0.04] px-2 text-sm text-white outline-none" onChange={(event) => onName(event.target.value)} />
           </label>
           <div className="max-h-56 space-y-0.5 overflow-y-auto">
             {canvases.map((item) => (
-              <button key={item.id} type="button" className={cn("block w-full truncate rounded-lg px-3 py-2 text-left text-sm", item.id === activeId ? "bg-white/10 text-white" : "text-white/72 hover:bg-white/8")} onClick={() => { onOpen(item.id); setOpen(false); }}>{item.name || "未命名项目"}</button>
+              <button key={item.id} type="button" className={cn("block w-full truncate rounded-[8px] px-3 py-2 text-left text-sm", item.id === activeId ? "bg-white/10 text-white" : "text-white/72 hover:bg-white/8")} onClick={() => { onOpen(item.id); setOpen(false); }}>{item.name || "未命名项目"}</button>
             ))}
           </div>
-          <button type="button" className="mt-1 flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-white hover:bg-white/10" onClick={() => { onCreate(); setOpen(false); }}>
+          <button type="button" className="mt-1 flex w-full items-center gap-2 rounded-[8px] px-3 py-2 text-left text-sm text-white hover:bg-white/10" onClick={() => { onCreate(); setOpen(false); }}>
             <IconPlusSmall className="size-4" />
             新建画布
           </button>
         </div>
       )}
       <span className="px-1.5 text-xs tabular-nums text-white/45">{Math.round(zoom * 100)}%</span>
-      <button type="button" aria-label="对话" aria-pressed={assistantOpen} className={cn("grid size-8 place-items-center rounded-lg text-white/62 hover:bg-white/10", assistantOpen && "bg-white/10 text-white")} onClick={onAssistant}>
+      <button type="button" aria-label="对话" aria-pressed={assistantOpen} className={cn("grid size-8 place-items-center rounded-[8px] text-white/62 hover:bg-white/10", assistantOpen && "bg-white/10 text-white")} onClick={onAssistant}>
         <IconBubble5 className="size-4" />
       </button>
     </div>
@@ -1254,7 +1254,7 @@ function CanvasToolbar({
   onRedo: () => void;
 }) {
   return (
-    <div className="absolute bottom-5 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1 rounded-2xl border border-white/10 bg-[#1b1b1b]/94 p-1.5 shadow-2xl backdrop-blur">
+    <div className="absolute bottom-5 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1 rounded-[16px] border border-white/10 bg-[#1b1b1b]/94 p-1.5 shadow-2xl backdrop-blur">
       <ToolButton label="选择" active={tool === "select"} onClick={() => onTool("select")}><IconCursor1 className="size-4" /></ToolButton>
       <ToolButton label="抓手" active={tool === "pan"} onClick={() => onTool("pan")}><IconPan className="size-4" /></ToolButton>
       <span className="mx-1 h-5 w-px bg-white/10" />
@@ -1270,7 +1270,7 @@ function CanvasToolbar({
 
 function ToolButton({ label, active, disabled, onClick, children }: { label: string; active?: boolean; disabled?: boolean; onClick: () => void; children: ReactNode }) {
   return (
-    <button type="button" aria-label={label} title={label} disabled={disabled} className={cn("flex h-9 items-center gap-1.5 rounded-xl px-2.5 text-xs text-white/72 hover:bg-white/10 disabled:opacity-35", active && "bg-white/12 text-white")} onClick={onClick}>
+    <button type="button" aria-label={label} title={label} disabled={disabled} className={cn("flex h-9 items-center gap-1.5 rounded-[12px] px-2.5 text-xs text-white/72 hover:bg-white/10 disabled:opacity-35", active && "bg-white/12 text-white")} onClick={onClick}>
       {children}
       <span className="hidden sm:inline">{label}</span>
     </button>
@@ -1279,7 +1279,7 @@ function ToolButton({ label, active, disabled, onClick, children }: { label: str
 
 function ZoomControl({ zoom, onZoomOut, onZoomIn, onFit }: { zoom: number; onZoomOut: () => void; onZoomIn: () => void; onFit: () => void }) {
   return (
-    <div className="absolute bottom-5 left-4 z-20 flex items-center gap-1 rounded-2xl border border-white/10 bg-[#1b1b1b]/94 p-1 shadow-lg">
+    <div className="absolute bottom-5 left-4 z-20 flex items-center gap-1 rounded-[16px] border border-white/10 bg-[#1b1b1b]/94 p-1 shadow-lg">
       <ToolButton label="缩小" onClick={onZoomOut}><IconFocusZoomOut className="size-4" /></ToolButton>
       <span className="w-12 text-center text-xs text-white/70">{Math.round(zoom * 100)}%</span>
       <ToolButton label="放大" onClick={onZoomIn}><IconFocusZoomIn className="size-4" /></ToolButton>
@@ -1304,12 +1304,12 @@ function Inspector({
   const ratios = canvasRatioOptions(config);
   const qualities = qualityTiersForModel(config.model || DEFAULT_IMAGE_MODEL);
   return (
-    <aside className="absolute right-4 top-4 z-20 w-64 rounded-2xl border border-white/10 bg-[#1b1b1b]/94 p-3 shadow-2xl backdrop-blur">
+    <aside className="absolute right-4 top-4 z-20 w-64 rounded-[16px] border border-white/10 bg-[#1b1b1b]/94 p-3 shadow-2xl backdrop-blur">
       <div className="mb-3 flex items-center justify-between">
         <p className="text-sm text-white/88">节点</p>
         <div className="flex gap-1">
-          <button type="button" aria-label="复制节点" className="rounded-lg px-2 py-1 text-xs text-white/60 hover:bg-white/10" onClick={onDuplicate}>复制</button>
-          <button type="button" aria-label="删除节点" className="rounded-lg p-1 text-white/60 hover:bg-white/10" onClick={onDelete}><IconTrashCan className="size-3.5" /></button>
+          <button type="button" aria-label="复制节点" className="rounded-[8px] px-2 py-1 text-xs text-white/60 hover:bg-white/10" onClick={onDuplicate}>复制</button>
+          <button type="button" aria-label="删除节点" className="rounded-[8px] p-1 text-white/60 hover:bg-white/10" onClick={onDelete}><IconTrashCan className="size-3.5" /></button>
         </div>
       </div>
       {node.kind !== "upload" && (
@@ -1363,7 +1363,7 @@ function CanvasMenu({
   onClose: () => void;
 }) {
   return (
-    <div className="fixed z-30 min-w-40 rounded-xl border border-white/10 bg-[#202020] p-1 shadow-2xl" style={{ left: menu.x, top: menu.y }}>
+    <div className="fixed z-30 min-w-40 rounded-[12px] border border-white/10 bg-[#202020] p-1 shadow-2xl" style={{ left: menu.x, top: menu.y }}>
       <MenuItem label={canChain ? "连接到文字" : "文字节点"} onClick={() => onAdd("text", menu.canvas)} />
       <MenuItem label={canChain ? "连接到图片" : "图片节点"} onClick={() => onAdd("image", menu.canvas)} />
       {!canChain && <MenuItem label="上传图片" onClick={onUpload} />}
@@ -1373,7 +1373,7 @@ function CanvasMenu({
 }
 
 function MenuItem({ label, onClick }: { label: string; onClick: () => void }) {
-  return <button type="button" className="block w-full rounded-lg px-3 py-2 text-left text-sm text-white/82 hover:bg-white/10" onClick={onClick}>{label}</button>;
+  return <button type="button" className="block w-full rounded-[8px] px-3 py-2 text-left text-sm text-white/82 hover:bg-white/10" onClick={onClick}>{label}</button>;
 }
 
 function readCanvasLibrary(): CanvasLibrary {

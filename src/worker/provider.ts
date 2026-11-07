@@ -1814,7 +1814,7 @@ function storageKeyForResult(job: Pick<GenerationJobRecord, "space_id" | "id">, 
   return `${job.space_id}/${job.id}/${imageId}.${format}`;
 }
 
-async function loadSharp(): Promise<typeof import("sharp") | null> {
+async function loadSharp(): Promise<typeof import("sharp").default | null> {
   try {
     const sharpModule = await import("sharp");
     return sharpModule.default ?? sharpModule;

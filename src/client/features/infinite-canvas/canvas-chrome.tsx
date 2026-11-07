@@ -28,8 +28,8 @@ export function AssetRail({
         <div className="min-h-0 flex-1 space-y-1 overflow-y-auto px-2 pb-3">
           {assets.length === 0 && <p className="px-2 py-3 text-xs leading-5 text-white/38">生成或上传后，图片会出现在这里。</p>}
           {assets.map((node) => (
-            <button key={node.id} type="button" className={cn("flex w-full items-center gap-2 rounded-xl px-2 py-2 text-left hover:bg-white/8", selectedIds.includes(node.id) && "bg-white/10")} onClick={() => onFocus(node.id)}>
-              {node.imageUrl ? <img src={node.imageUrl} alt="" className="size-10 rounded-lg object-cover" /> : <span className="grid size-10 place-items-center rounded-lg bg-white/8 text-xs text-white/55">文</span>}
+            <button key={node.id} type="button" className={cn("flex w-full items-center gap-2 rounded-[12px] px-2 py-2 text-left hover:bg-white/8", selectedIds.includes(node.id) && "bg-white/10")} onClick={() => onFocus(node.id)}>
+              {node.imageUrl ? <img src={node.imageUrl} alt="" className="size-10 rounded-[8px] object-cover" /> : <span className="grid size-10 place-items-center rounded-[8px] bg-white/8 text-xs text-white/55">文</span>}
               <span className="min-w-0">
                 <span className="block truncate text-xs text-white/82">{node.text.trim() || nodeLabel(node.kind)}</span>
                 <span className="block text-[11px] text-white/38">{nodeLabel(node.kind)}</span>
@@ -66,8 +66,8 @@ export function AssistantRail({
         <p className="text-sm leading-6 text-white/48">写一段想法，确认后会变成画布上的文字节点。</p>
       </div>
       <form className="border-t border-white/10 p-3" onSubmit={(event) => { event.preventDefault(); onPlace(); }}>
-        <textarea aria-label="对话内容" value={draft} placeholder="描述想放上画布的内容" className="h-24 w-full resize-none rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm leading-6 text-white outline-none placeholder:text-white/28" onChange={(event) => onDraft(event.target.value)} />
-        <button type="submit" className="mt-2 h-9 w-full rounded-xl bg-white text-sm font-medium text-black disabled:opacity-40" disabled={!draft.trim()}>添加文字节点</button>
+        <textarea aria-label="对话内容" value={draft} placeholder="描述想放上画布的内容" className="h-24 w-full resize-none rounded-[12px] border border-white/10 bg-white/[0.04] px-3 py-2 text-sm leading-6 text-white outline-none placeholder:text-white/28" onChange={(event) => onDraft(event.target.value)} />
+        <button type="submit" className="mt-2 h-9 w-full rounded-[12px] bg-white text-sm font-medium text-black disabled:opacity-40" disabled={!draft.trim()}>添加文字节点</button>
       </form>
     </aside>
   );
@@ -83,9 +83,9 @@ export function MiniMap({ nodes, viewport, onFocus }: { nodes: CanvasNode[]; vie
   }), { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity });
   const scale = Math.min(132 / Math.max(1, bounds.right - bounds.left), 78 / Math.max(1, bounds.bottom - bounds.top));
   return (
-    <button type="button" aria-label="小地图" className="absolute bottom-5 right-4 z-20 h-24 w-40 overflow-hidden rounded-2xl border border-white/10 bg-[#1b1b1b]/90" onClick={onFocus}>
+    <button type="button" aria-label="小地图" className="absolute bottom-5 right-4 z-20 h-24 w-40 overflow-hidden rounded-[16px] border border-white/10 bg-[#1b1b1b]/90" onClick={onFocus}>
       {nodes.map((node) => (
-        <span key={node.id} className="absolute rounded-sm bg-white/60" style={{ left: 8 + (node.x - bounds.left) * scale, top: 8 + (node.y - bounds.top) * scale, width: Math.max(4, node.width * scale), height: Math.max(3, node.height * scale) }} />
+        <span key={node.id} className="absolute rounded-[6px] bg-white/60" style={{ left: 8 + (node.x - bounds.left) * scale, top: 8 + (node.y - bounds.top) * scale, width: Math.max(4, node.width * scale), height: Math.max(3, node.height * scale) }} />
       ))}
       <span className="sr-only">{Math.round(viewport.zoom * 100)}%</span>
     </button>
