@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { createPostgresDatabase, PostgresD1Database } from "./postgres-d1";
 import { createBullQueues, BullQueues } from "./queue";
+import { resolveSmallObjectCacheOptions, withSmallObjectCache } from "./object-cache";
 import { createR2Store } from "./r2-store";
 import { DEFAULT_IMAGE_MODEL } from "../image-models";
 import { envNumber } from "../worker/http";
@@ -25,13 +26,7 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions = {}): NodeR
 
   const env: Env = {
     DB: db,
-    IMAGES: createR2Store({
-      accountId: process.env.R2_ACCOUNT_ID,
-      endpoint: process.env.R2_ENDPOINT,
-      accessKeyId: requiredEnv("R2_ACCESS_KEY_ID"),
-      secretAccessKey: requiredEnv("R2_SECRET_ACCESS_KEY"),
-      bucket: requiredEnv("R2_BUCKET"),
-    }),
+    IMAGES: createObjectStore(),
     GENERATION_QUEUE: queues?.generationQueue ?? disabledQueue("generation"),
     INSPIRATION_QUEUE: queues?.inspirationQueue ?? disabledQueue("inspiration"),
     APP_ENCRYPTION_KEY: requiredEnv("APP_ENCRYPTION_KEY"),
@@ -56,6 +51,7 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions = {}): NodeR
     INSPIRATION_MAX_ITEMS_PER_RUN: process.env.INSPIRATION_MAX_ITEMS_PER_RUN ?? "12",
     INSPIRATION_THUMBNAIL_MAX_BYTES: process.env.INSPIRATION_THUMBNAIL_MAX_BYTES ?? "1048576",
     INSPIRATION_AUTO_PUBLISH_SOURCES: process.env.INSPIRATION_AUTO_PUBLISH_SOURCES ?? "civitai",
+    STATUS_LONG_POLL_MAX_SECONDS: process.env.STATUS_LONG_POLL_MAX_SECONDS ?? "20",
   };
 
   return {
@@ -64,6 +60,18 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions = {}): NodeR
       await Promise.all([closeDatabase(db), closeQueues(queues)]);
     },
   };
+}
+
+function createObjectStore() {
+  const store = createR2Store({
+    accountId: process.env.R2_ACCOUNT_ID,
+    endpoint: process.env.R2_ENDPOINT,
+    accessKeyId: requiredEnv("R2_ACCESS_KEY_ID"),
+    secretAccessKey: requiredEnv("R2_SECRET_ACCESS_KEY"),
+    bucket: requiredEnv("R2_BUCKET"),
+  });
+  const cacheOptions = resolveSmallObjectCacheOptions();
+  return cacheOptions ? withSmallObjectCache(store, cacheOptions) : store;
 }
 
 function requiredEnv(name: string): string {

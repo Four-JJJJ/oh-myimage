@@ -20,10 +20,41 @@ self.addEventListener("fetch", (event) => {
 
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
-  if (!isCacheableImageRequest(url, request)) return;
+  if (!isCacheableImageRequest(url, request)) {
+    // "Download" of an original the user already previewed: serve it from the
+    // cached inline copy instead of pulling the whole file over the network again.
+    const originalUrl = cachedOriginalUrlForDownload(url);
+    if (originalUrl) event.respondWith(downloadFromCache(request, originalUrl));
+    return;
+  }
 
   event.respondWith(cacheFirst(request, event));
 });
+
+function cachedOriginalUrlForDownload(url) {
+  if (url.searchParams.get("sw") === "0") return null;
+  if (!/^\/api\/images\/[^/]+\/download$/.test(url.pathname)) return null;
+  if (url.searchParams.get("raw") !== "1" || url.searchParams.get("download") !== "1") return null;
+  const original = new URL(url.toString());
+  original.searchParams.delete("download");
+  return original.toString();
+}
+
+async function downloadFromCache(request, originalUrl) {
+  try {
+    const cache = await caches.open(IMAGE_CACHE_NAME);
+    const cached = await cache.match(originalUrl);
+    if (cached && isImageResponse(cached)) {
+      const headers = new Headers(cached.headers);
+      const disposition = headers.get("Content-Disposition");
+      headers.set("Content-Disposition", disposition ? disposition.replace(/^\s*inline/i, "attachment") : "attachment");
+      return new Response(cached.body, { status: 200, statusText: "OK", headers });
+    }
+  } catch {
+    // Fall through to the network on any cache problem.
+  }
+  return fetch(request);
+}
 
 function isCacheableImageRequest(url, request) {
   if (url.searchParams.get("sw") === "0") return false;
@@ -64,5 +95,7 @@ self.__OH_MYIMAGE_IMAGE_CACHE_TEST__ = {
   IMAGE_CACHE_NAME,
   IMAGE_CACHE_MAX_ENTRIES,
   isCacheableImageRequest,
+  cachedOriginalUrlForDownload,
+  downloadFromCache,
   trimImageCache,
 };

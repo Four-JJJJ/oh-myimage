@@ -160,22 +160,33 @@ export function InfiniteCanvasView({
       return { nodeId: item.slice(0, separator), jobId: item.slice(separator + 1) };
     });
     let cancelled = false;
+    let inFlight = false;
+    const abortController = new AbortController();
     const poll = () => {
+      // Skip while hidden or while the previous round is still running, so slow
+      // networks never stack overlapping status requests.
+      if (inFlight || document.visibilityState === "hidden") return;
+      inFlight = true;
       void Promise.all(active.map(async (node) => {
-        const result = await getGenerationStatus(node.jobId);
+        const result = await getGenerationStatus(node.jobId, undefined, { signal: abortController.signal });
         return { nodeId: node.nodeId, job: result.job, images: result.images };
       })).then((results) => {
         if (cancelled) return;
         setDocumentState((current) => applyGenerationResults(current, results));
       }).catch((error: unknown) => {
         if (!cancelled) setNotice(error instanceof Error ? error.message : "画布生成状态刷新失败。");
+      }).finally(() => {
+        inFlight = false;
       });
     };
     poll();
     const timer = window.setInterval(poll, 2000);
+    document.addEventListener("visibilitychange", poll);
     return () => {
       cancelled = true;
+      abortController.abort();
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", poll);
     };
   }, [activeGenerationKey]);
 

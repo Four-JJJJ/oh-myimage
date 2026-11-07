@@ -77,6 +77,8 @@ export interface Env {
   INSPIRATION_MAX_ITEMS_PER_RUN?: string;
   INSPIRATION_THUMBNAIL_MAX_BYTES?: string;
   INSPIRATION_AUTO_PUBLISH_SOURCES?: string;
+  /** Max seconds GET /api/generations/:jobId may hold a request waiting for changes (0/unset disables long polling). */
+  STATUS_LONG_POLL_MAX_SECONDS?: string;
 }
 
 export interface GenerationMessage {

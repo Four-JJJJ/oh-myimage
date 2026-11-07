@@ -6,6 +6,7 @@ import {
   resolvePostProcessingRetryDelaySeconds,
   resolveProviderRetryAttempts,
   normalizeGenerationResults,
+  resolveStatusLongPollSeconds,
 } from "./index";
 import type { AppDatabase, AppObject, AppObjectStore, AppObjectStorePutOptions, AppPreparedStatement, CredentialRecord, Env, GenerationJobRecord, ImageAssetRecord, ImageProviderProfileRecord, SpaceRecord } from "./types";
 import { OFFICIAL_IMAGE_MODEL_PRESETS } from "../image-models";
@@ -2018,3 +2019,68 @@ class FailingQueue {
     throw new Error("queue unavailable");
   }
 }
+
+describe("generation status long polling", () => {
+  type StatusJson = { version: string; longPollSeconds: number; job: { progress_current: number; status: string } };
+
+  function runningJobDb() {
+    const db = new FakeRouteDatabase();
+    db.jobRecords.set("job_1", makeJobRecord({ status: "running", stage: "waiting_provider", progress_current: 0, completed_at: null }));
+    return db;
+  }
+
+  function requestStatus(db: FakeRouteDatabase, query = "", longPoll?: string) {
+    return app.request(
+      `http://local.test/api/generations/job_1${query}`,
+      { headers: { Cookie: "image2_session=test-token" } },
+      { ...testEnv({ db, images: new FakeObjectStore() }), STATUS_LONG_POLL_MAX_SECONDS: longPoll },
+    );
+  }
+
+  it("bounds the configured wait", () => {
+    expect(resolveStatusLongPollSeconds(undefined)).toBe(0);
+    expect(resolveStatusLongPollSeconds("0")).toBe(0);
+    expect(resolveStatusLongPollSeconds("abc")).toBe(0);
+    expect(resolveStatusLongPollSeconds("20")).toBe(20);
+    expect(resolveStatusLongPollSeconds("999")).toBe(25);
+  });
+
+  it("returns a stable version and answers immediately when long polling is disabled", async () => {
+    const db = runningJobDb();
+    const first = (await (await requestStatus(db)).json()) as StatusJson;
+    expect(first.version).toMatch(/^[0-9a-f]{16}$/);
+    expect(first.longPollSeconds).toBe(0);
+
+    const startedAt = Date.now();
+    const second = (await (await requestStatus(db, `?since=${first.version}&wait=20`)).json()) as StatusJson;
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(second.version).toBe(first.version);
+  });
+
+  it("holds a since request until the job changes", async () => {
+    const db = runningJobDb();
+    const first = (await (await requestStatus(db, "", "5")).json()) as StatusJson;
+    expect(first.longPollSeconds).toBe(5);
+
+    setTimeout(() => {
+      db.jobRecords.set("job_1", makeJobRecord({ status: "running", stage: "saving", progress_current: 1, completed_at: null }));
+    }, 300);
+    const startedAt = Date.now();
+    const changed = (await (await requestStatus(db, `?since=${first.version}&wait=5`, "5")).json()) as StatusJson;
+    const elapsed = Date.now() - startedAt;
+
+    expect(changed.version).not.toBe(first.version);
+    expect(changed.job.progress_current).toBe(1);
+    expect(elapsed).toBeGreaterThanOrEqual(300);
+    expect(elapsed).toBeLessThan(3_000);
+  });
+
+  it("gives up waiting once the wait budget is spent", async () => {
+    const db = runningJobDb();
+    const first = (await (await requestStatus(db, "", "5")).json()) as StatusJson;
+    const startedAt = Date.now();
+    const same = (await (await requestStatus(db, `?since=${first.version}&wait=2`, "5")).json()) as StatusJson;
+    expect(same.version).toBe(first.version);
+    expect(Date.now() - startedAt).toBeLessThan(2_500);
+  });
+});

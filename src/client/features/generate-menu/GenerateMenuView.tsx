@@ -13,7 +13,7 @@ import {
   Redo2,
   Undo2,
 } from "lucide-react";
-import { api, AppConfig, generatedImageDisplayUrl, generatedImageRetryUrl, GenerationJob, GenerationRecord, getGenerationStatus, ImageItem, SettingsProviders, supportsGeneratedImageEditing } from "../../api";
+import { api, AppConfig, generatedImageDisplayUrl, generatedImageRetryUrl, GenerationJob, GenerationRecord, getGenerationStatus, ImageItem, SettingsProviders, supportsGeneratedImageEditing, type GenerationStatusResponse } from "../../api";
 import generationContinueIcon from "../../assets/figma/generation-continue.svg";
 import generationCopyIcon from "../../assets/figma/generation-copy.svg";
 import generationDeleteIcon from "../../assets/figma/generation-delete.svg";
@@ -369,6 +369,11 @@ export function resolveImagePreviewChromeState({
   };
 }
 
+export function resolveImagePreviewRequest(url: string, attempt: number): { url: string; init: RequestInit } {
+  if (attempt <= 0) return { url, init: {} };
+  return { url: generatedImageRetryUrl(url, attempt), init: { cache: "no-store" } };
+}
+
 export function resolveImagePreviewProgressPercent(loaded: number, total: number): number | null {
   if (!Number.isFinite(loaded) || !Number.isFinite(total) || total <= 0) return null;
   return Math.min(100, Math.max(0, Math.round((loaded / total) * 100)));
@@ -470,6 +475,31 @@ export function resolveGenerationPollIntervalMs(createdAt: string, now = Date.no
   if (elapsedMs >= slowPollAfterMs) return slowPollIntervalMs;
   if (elapsedMs >= standardPollAfterMs) return standardPollIntervalMs;
   return fastPollIntervalMs;
+}
+
+const longPollRepollMinSpacingMs = 1_000;
+const longPollRepollDelayMs = 150;
+
+/**
+ * Delay before the next status request. When the server supports long polling it
+ * already waited for a change, so re-arm almost immediately (but never start more
+ * than one request per second); otherwise fall back to timed polling.
+ */
+export function resolveNextGenerationPollDelayMs(
+  result: Pick<GenerationStatusResponse, "version" | "longPollSeconds"> | null,
+  createdAt: string,
+  requestStartedAt: number,
+  now = Date.now(),
+): number {
+  if (result?.version && (result.longPollSeconds ?? 0) > 0) {
+    return Math.max(longPollRepollDelayMs, longPollRepollMinSpacingMs - (now - requestStartedAt));
+  }
+  return resolveGenerationPollIntervalMs(createdAt, now);
+}
+
+/** True when the response is identical to what the poller already applied. */
+export function isUnchangedGenerationStatus(previousVersion: string | null, result: Pick<GenerationStatusResponse, "version">): boolean {
+  return Boolean(previousVersion && result.version && previousVersion === result.version);
 }
 
 export function shouldPollGeneration(visibilityState: Document["visibilityState"] | undefined): boolean {
@@ -784,6 +814,10 @@ export function GenerateMenuView({
     if (!activeJob || isTerminalJobStatus(activeJob.status)) return;
     let cancelled = false;
     let timer: number | undefined;
+    let statusVersion: string | null = null;
+    let lastResult: GenerationStatusResponse | null = null;
+    let requestStartedAt = 0;
+    const abortController = new AbortController();
 
     const clearPollTimer = () => {
       if (timer === undefined) return;
@@ -796,7 +830,7 @@ export function GenerateMenuView({
       const currentJob = activeJobRef.current;
       if (!currentJob || isTerminalJobStatus(currentJob.status)) return;
       clearPollTimer();
-      timer = window.setTimeout(pollJob, resolveGenerationPollIntervalMs(currentJob.created_at));
+      timer = window.setTimeout(pollJob, resolveNextGenerationPollDelayMs(lastResult, currentJob.created_at, requestStartedAt));
     };
 
     const pollJob = async () => {
@@ -813,9 +847,14 @@ export function GenerateMenuView({
         return;
       }
       pollInFlightRef.current = true;
+      requestStartedAt = Date.now();
       try {
-        const result = await getGenerationStatus(currentJob.id);
+        const result = await getGenerationStatus(currentJob.id, undefined, { since: statusVersion, signal: abortController.signal });
+        if (cancelled) return;
+        lastResult = result;
         setPollError("");
+        if (isUnchangedGenerationStatus(statusVersion, result)) return;
+        statusVersion = result.version ?? null;
         const fallbackReferenceImages = submittedReferenceImagesByJobId[currentJob.id] ?? currentJob.referenceImages;
         const mergedReferenceJob = mergeJobReferenceImages(result.job, fallbackReferenceImages ? { ...result.job, referenceImages: fallbackReferenceImages } : currentJob);
         const nextJob = mergePolledJobState(activeJobRef.current, mergedReferenceJob);
@@ -829,10 +868,14 @@ export function GenerateMenuView({
           void loadRecords(undefined, { background: true });
         }
       } catch (err) {
+        if (cancelled) return;
+        lastResult = null;
         setPollError(err instanceof Error ? err.message : "刷新任务状态失败，系统会自动重试。");
       } finally {
-        pollInFlightRef.current = false;
-        schedulePoll();
+        if (!cancelled) {
+          pollInFlightRef.current = false;
+          schedulePoll();
+        }
       }
     };
 
@@ -851,6 +894,7 @@ export function GenerateMenuView({
     void pollJob();
     return () => {
       cancelled = true;
+      abortController.abort();
       pollInFlightRef.current = false;
       clearPollTimer();
       document.removeEventListener("visibilitychange", handleVisibilityChange);
@@ -2743,11 +2787,29 @@ export function ImagePreview({ image, onClose }: { image: PreviewImage; onClose:
       }
     }, 1000);
 
+    // Large originals arrive in hundreds of chunks; coalesce progress updates to one render per frame.
+    let progressFrame: number | null = null;
+    let pendingProgress: number | null = null;
+    const scheduleProgressUpdate = (percent: number | null) => {
+      pendingProgress = percent;
+      if (progressFrame !== null) return;
+      progressFrame = window.requestAnimationFrame(() => {
+        progressFrame = null;
+        setLoadProgressPercent(pendingProgress);
+      });
+    };
+    const cancelProgressUpdate = () => {
+      if (progressFrame === null) return;
+      window.cancelAnimationFrame(progressFrame);
+      progressFrame = null;
+    };
+
     async function loadFullSizeImage() {
       try {
-        // 使用原始 image.url（不带额外参数），让浏览器 HTTP 强缓存和 SW 缓存
-        // 都能命中：画廊已加载过的图片，预览直接秒开；否则才走网络下载。
-        const response = await fetch(generatedImageRetryUrl(image.url, loadAttempt), { signal: abortController.signal, cache: "no-store" });
+        // 首次加载使用原始 image.url，让浏览器 HTTP 强缓存和 SW 缓存都能命中：
+        // 看过的原图再次预览直接秒开。只有失败重试时才绕过缓存走网络。
+        const request = resolveImagePreviewRequest(image.url, loadAttempt);
+        const response = await fetch(request.url, { ...request.init, signal: abortController.signal });
         if (!response.ok) throw new Error(`Image preview request failed with ${response.status}`);
         stalledSince = Date.now();
         const contentLength = Number(response.headers.get("Content-Length") ?? "");
@@ -2761,17 +2823,18 @@ export function ImagePreview({ image, onClose }: { image: PreviewImage; onClose:
           return;
         }
 
-        const chunks: ArrayBuffer[] = [];
+        const chunks: BlobPart[] = [];
         let loaded = 0;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           stalledSince = Date.now();
-          // Copy into an ArrayBuffer so Blob accepts chunks from every supported stream implementation.
-          chunks.push(new Uint8Array(value).buffer);
+          // Stream chunks are owned by us once read, so they can go into the Blob without an extra copy.
+          chunks.push(value as Uint8Array<ArrayBuffer>);
           loaded += value.byteLength;
-          setLoadProgressPercent(resolveImagePreviewProgressPercent(loaded, contentLength));
+          scheduleProgressUpdate(resolveImagePreviewProgressPercent(loaded, contentLength));
         }
+        cancelProgressUpdate();
 
         const blob = new Blob(chunks, {
           type: response.headers.get("Content-Type") ?? "image/png",
@@ -2797,6 +2860,7 @@ export function ImagePreview({ image, onClose }: { image: PreviewImage; onClose:
 
     return () => {
       window.clearInterval(stallTimer);
+      cancelProgressUpdate();
       abortController.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };

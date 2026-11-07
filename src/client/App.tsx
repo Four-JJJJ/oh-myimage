@@ -47,9 +47,9 @@ import {
 import { Button } from "./components/ui/button";
 import { Input, type InputProps } from "./components/ui/input";
 import { Popover, PopoverPopup, PopoverTrigger } from "./components/ui/popover";
-import { api, AppConfig, generatedImageDisplayUrl, GenerationJob, GenerationRecord, getGenerationStatus, ImageItem, ImageProviderProfile, ProviderSettings, SettingsProviders, supportsGeneratedImageEditing } from "./api";
+import { api, AppConfig, generatedImageDisplayUrl, GenerationJob, GenerationRecord, getGenerationStatus, type GenerationStatusResponse, ImageItem, ImageProviderProfile, ProviderSettings, SettingsProviders, supportsGeneratedImageEditing } from "./api";
 import { EntryField, EntryFormSection, EntryNoticeStack, EntryShell, EntryStatusScreen } from "./features/auth/EntryScreens";
-import { GenerateMenuView, HoverImageActionBar, ImagePreview, resolveGenerationPollIntervalMs, shouldPollGeneration, type HoverImageAction } from "./features/generate-menu/GenerateMenuView";
+import { GenerateMenuView, HoverImageActionBar, ImagePreview, isUnchangedGenerationStatus, resolveNextGenerationPollDelayMs, shouldPollGeneration, type HoverImageAction } from "./features/generate-menu/GenerateMenuView";
 import { AppShell, type WorkspaceView } from "./features/generate-shell/AppShell";
 import { GenerationFormFooter, ParameterSection, PromptPlaceholderThumbnail, PromptSection } from "./features/shared/generation-form-sections";
 import { GeneratedImage } from "./features/shared/GeneratedImage";
@@ -773,6 +773,10 @@ function GenerateView({
     let cancelled = false;
     let timer: number | undefined;
     let inFlight = false;
+    let statusVersion: string | null = null;
+    let lastResult: GenerationStatusResponse | null = null;
+    let requestStartedAt = 0;
+    const abortController = new AbortController();
     const clearTimer = () => { if (timer !== undefined) window.clearTimeout(timer); timer = undefined; };
     const poll = async () => {
       if (cancelled) return;
@@ -780,19 +784,23 @@ function GenerateView({
       if (!shouldPollGeneration(document.visibilityState)) { timer = window.setTimeout(poll, 5000); return; }
       if (inFlight) return;
       inFlight = true;
+      requestStartedAt = Date.now();
       try {
-        const result = await getGenerationStatus(job.id);
+        const result = await getGenerationStatus(job.id, undefined, { since: statusVersion, signal: abortController.signal });
         if (cancelled) return;
+        lastResult = result;
+        if (isUnchangedGenerationStatus(statusVersion, result)) return;
+        statusVersion = result.version ?? null;
         const nextJob = mergePolledJobState(job, result.job);
         setJob(nextJob); setImages(result.images); upsertRecord(nextJob, result.images);
         if (isTerminalJobStatus(nextJob.status)) { refreshUsage(); void loadRecords(undefined, { background: true }); return; }
-      } catch (err) { if (!cancelled) setError(err instanceof Error ? err.message : "刷新任务状态失败。"); }
-      finally { inFlight = false; if (!cancelled) timer = window.setTimeout(poll, resolveGenerationPollIntervalMs(job.created_at)); }
+      } catch (err) { if (!cancelled) { lastResult = null; setError(err instanceof Error ? err.message : "刷新任务状态失败。"); } }
+      finally { inFlight = false; if (!cancelled) timer = window.setTimeout(poll, resolveNextGenerationPollDelayMs(lastResult, job.created_at, requestStartedAt)); }
     };
     const refresh = () => { if (shouldPollGeneration(document.visibilityState)) void poll(); };
     document.addEventListener("visibilitychange", refresh); window.addEventListener("focus", refresh); window.addEventListener("online", refresh);
     void poll();
-    return () => { cancelled = true; clearTimer(); document.removeEventListener("visibilitychange", refresh); window.removeEventListener("focus", refresh); window.removeEventListener("online", refresh); };
+    return () => { cancelled = true; abortController.abort(); clearTimer(); document.removeEventListener("visibilitychange", refresh); window.removeEventListener("focus", refresh); window.removeEventListener("online", refresh); };
   }, [job?.id, job?.status, job?.created_at, loadRecords, refreshUsage, upsertRecord]);
 
   useEffect(() => {
@@ -1576,6 +1584,10 @@ function GalleryView({
     let cancelled = false;
     let timer: number | undefined;
     let inFlight = false;
+    let statusVersion: string | null = null;
+    let lastResult: GenerationStatusResponse | null = null;
+    let requestStartedAt = 0;
+    const abortController = new AbortController();
     const clearTimer = () => { if (timer !== undefined) window.clearTimeout(timer); timer = undefined; };
     const poll = async () => {
       if (cancelled) return;
@@ -1583,19 +1595,23 @@ function GalleryView({
       if (!shouldPollGeneration(document.visibilityState)) { timer = window.setTimeout(poll, 5000); return; }
       if (inFlight) return;
       inFlight = true;
+      requestStartedAt = Date.now();
       try {
-        const result = await getGenerationStatus(activeJob.id);
+        const result = await getGenerationStatus(activeJob.id, undefined, { since: statusVersion, signal: abortController.signal });
         if (cancelled) return;
+        lastResult = result;
+        if (isUnchangedGenerationStatus(statusVersion, result)) return;
+        statusVersion = result.version ?? null;
         const nextJob = mergePolledJobState(activeJob, result.job);
         setActiveJob(nextJob); setActiveImages(result.images); upsertRecord(nextJob, result.images);
         if (isTerminalJobStatus(nextJob.status)) { refreshUsage(); void loadRecords(undefined, { background: true }); return; }
-      } catch (err) { if (!cancelled) setError(err instanceof Error ? err.message : "刷新任务状态失败。"); }
-      finally { inFlight = false; if (!cancelled) timer = window.setTimeout(poll, resolveGenerationPollIntervalMs(activeJob.created_at)); }
+      } catch (err) { if (!cancelled) { lastResult = null; setError(err instanceof Error ? err.message : "刷新任务状态失败。"); } }
+      finally { inFlight = false; if (!cancelled) timer = window.setTimeout(poll, resolveNextGenerationPollDelayMs(lastResult, activeJob.created_at, requestStartedAt)); }
     };
     const refresh = () => { if (shouldPollGeneration(document.visibilityState)) void poll(); };
     document.addEventListener("visibilitychange", refresh); window.addEventListener("focus", refresh); window.addEventListener("online", refresh);
     void poll();
-    return () => { cancelled = true; clearTimer(); document.removeEventListener("visibilitychange", refresh); window.removeEventListener("focus", refresh); window.removeEventListener("online", refresh); };
+    return () => { cancelled = true; abortController.abort(); clearTimer(); document.removeEventListener("visibilitychange", refresh); window.removeEventListener("focus", refresh); window.removeEventListener("online", refresh); };
   }, [activeJob?.id, activeJob?.status, activeJob?.created_at, loadRecords, refreshUsage, upsertRecord]);
 
   useEffect(() => {

@@ -959,21 +959,71 @@ app.get("/api/generations", async (c) => {
 });
 
 app.get("/api/generations/:jobId", async (c) => {
-  const job = await getGenerationJob(c.env.DB, c.get("space").id, c.req.param("jobId"));
-  if (!job) throw jsonError(404, "job_not_found", "任务不存在。");
-  const [images, results] = await Promise.all([
-    listImagesForJob(c.env.DB, c.get("space").id, job.id),
-    listGenerationResultsForJob(c.env.DB, c.get("space").id, job.id),
-  ]);
+  const spaceId = c.get("space").id;
+  const jobId = c.req.param("jobId");
+  const longPollSeconds = resolveStatusLongPollSeconds(c.env.STATUS_LONG_POLL_MAX_SECONDS);
+  const since = c.req.query("since");
+  const waitSeconds = Math.min(longPollSeconds, Math.max(0, Number(c.req.query("wait") ?? 0) || 0));
+  const deadline = Date.now() + waitSeconds * 1000;
+  const signal = c.req.raw.signal;
+
+  let snapshot = await loadGenerationStatusSnapshot(c.env.DB, spaceId, jobId);
+  // Long poll: hold the request until the job visibly changes (or the wait budget runs out),
+  // so the client sees progress immediately instead of on its next timer tick.
+  while (
+    since &&
+    snapshot.version === since &&
+    !isTerminalJobStatus(snapshot.payload.job.status) &&
+    Date.now() + STATUS_LONG_POLL_INTERVAL_MS < deadline &&
+    !signal?.aborted
+  ) {
+    await sleep(STATUS_LONG_POLL_INTERVAL_MS);
+    if (signal?.aborted) break;
+    snapshot = await loadGenerationStatusSnapshot(c.env.DB, spaceId, jobId);
+  }
+
   c.header("Cache-Control", "private, no-store, no-cache, must-revalidate, max-age=0");
   c.header("Pragma", "no-cache");
   c.header("Expires", "0");
   return c.json({
     ok: true,
-    job: serializeGenerationJob(job, results),
-    images: images.map((image) => serializeImage(image)),
+    ...snapshot.payload,
+    version: snapshot.version,
+    longPollSeconds,
   });
 });
+
+const STATUS_LONG_POLL_INTERVAL_MS = 1_000;
+const STATUS_LONG_POLL_MAX_SECONDS = 25;
+
+export function resolveStatusLongPollSeconds(value: string | undefined): number {
+  const seconds = Math.trunc(Number(value ?? 0));
+  if (!Number.isFinite(seconds) || seconds <= 0) return 0;
+  return Math.min(seconds, STATUS_LONG_POLL_MAX_SECONDS);
+}
+
+function isTerminalJobStatus(status: string): boolean {
+  return status === "succeeded" || status === "partial_succeeded" || status === "failed" || status === "cancelled";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function loadGenerationStatusSnapshot(db: Env["DB"], spaceId: string, jobId: string) {
+  const job = await getGenerationJob(db, spaceId, jobId);
+  if (!job) throw jsonError(404, "job_not_found", "任务不存在。");
+  const [images, results] = await Promise.all([
+    listImagesForJob(db, spaceId, job.id),
+    listGenerationResultsForJob(db, spaceId, job.id),
+  ]);
+  const payload = {
+    job: serializeGenerationJob(job, results),
+    images: images.map((image) => serializeImage(image)),
+  };
+  const version = (await sha256Hex(JSON.stringify(payload))).slice(0, 16);
+  return { payload, version };
+}
 
 app.get("/api/generations/:jobId/references/:index", async (c) => {
   const spaceId = c.get("space").id;

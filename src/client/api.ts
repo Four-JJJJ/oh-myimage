@@ -135,6 +135,24 @@ export interface GenerationStatusResponse {
   ok: true;
   job: GenerationJob;
   images: ImageItem[];
+  /** Opaque fingerprint of this status payload; send it back as `since` to long-poll for the next change. */
+  version?: string;
+  /** Seconds the server is willing to hold a `since` request open; 0/absent means plain polling only. */
+  longPollSeconds?: number;
+}
+
+export interface GenerationStatusRequestOptions {
+  /** Version from the previous response; when set the server waits until the status changes. */
+  since?: string | null;
+  signal?: AbortSignal;
+}
+
+export const GENERATION_STATUS_WAIT_SECONDS = 20;
+
+export function generationStatusUrl(jobId: string, since?: string | null): string {
+  const path = `/api/generations/${encodeURIComponent(jobId)}`;
+  if (!since) return path;
+  return `${path}?since=${encodeURIComponent(since)}&wait=${GENERATION_STATUS_WAIT_SECONDS}`;
 }
 
 interface ApiResponse<T> {
@@ -167,16 +185,30 @@ export async function api<T>(path: string, options?: RequestInit): Promise<T> {
 /**
  * Read fresh generation state with a deadline. A stalled fetch must not hold a
  * polling loop's in-flight lock forever and prevent later status updates.
+ *
+ * With `since`, the first attempt is a long poll that the server holds open until
+ * the job changes; if it stalls, the retry falls back to an immediate read.
  */
-export async function getGenerationStatus(jobId: string, timeoutMs = 12_000): Promise<GenerationStatusResponse> {
+export async function getGenerationStatus(
+  jobId: string,
+  timeoutMs = 12_000,
+  options: GenerationStatusRequestOptions = {},
+): Promise<GenerationStatusResponse> {
   let lastError: unknown;
+  const longPoll = Boolean(options.since);
   const deadline = Date.now() + Math.max(2, timeoutMs);
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (options.signal?.aborted) throw abortError();
     const controller = new AbortController();
+    const abortFromCaller = () => controller.abort();
+    options.signal?.addEventListener("abort", abortFromCaller, { once: true });
     let timedOut = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    const waiting = longPoll && attempt === 0;
     const remainingMs = Math.max(1, deadline - Date.now());
-    const attemptTimeoutMs = attempt === 0 ? Math.max(1, Math.floor(remainingMs / 2)) : remainingMs;
+    const attemptTimeoutMs = waiting
+      ? GENERATION_STATUS_WAIT_SECONDS * 1000 + Math.max(1, Math.floor(timeoutMs / 2))
+      : attempt === 0 ? Math.max(1, Math.floor(remainingMs / 2)) : longPoll ? Math.max(1, timeoutMs) : remainingMs;
     const timeoutPromise = new Promise<never>((_resolve, reject) => {
       timeout = setTimeout(() => {
         timedOut = true;
@@ -186,7 +218,7 @@ export async function getGenerationStatus(jobId: string, timeoutMs = 12_000): Pr
     });
     try {
       return await Promise.race([
-        api<GenerationStatusResponse>(`/api/generations/${encodeURIComponent(jobId)}`, {
+        api<GenerationStatusResponse>(generationStatusUrl(jobId, waiting ? options.since : null), {
           cache: "no-store",
           headers: { "Cache-Control": "no-cache" },
           signal: controller.signal,
@@ -194,13 +226,21 @@ export async function getGenerationStatus(jobId: string, timeoutMs = 12_000): Pr
         timeoutPromise,
       ]);
     } catch (error) {
+      if (options.signal?.aborted) throw abortError();
       lastError = timedOut ? new Error("获取生成状态超时，系统会自动重试。") : error;
       if (!timedOut || attempt === 1) throw lastError;
     } finally {
       if (timeout !== undefined) clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", abortFromCaller);
     }
   }
   throw lastError;
+}
+
+function abortError(): Error {
+  const error = new Error("Generation status request aborted.");
+  error.name = "AbortError";
+  return error;
 }
 
 export function generatedImageRetryUrl(rawUrl: string, retryKey: string | number): string {

@@ -10,6 +10,9 @@ import {
   remainingReferenceSlots,
   resolveImagePreviewChromeState,
   resolveImagePreviewProgressPercent,
+  resolveImagePreviewRequest,
+  resolveNextGenerationPollDelayMs,
+  isUnchangedGenerationStatus,
   shouldRetryImagePreviewRequest,
   generationRequestBody,
   generationFailureMessageForDisplay,
@@ -177,6 +180,32 @@ describe("generate menu form helpers", () => {
     expect(composerOptimizeBeamClassName).toContain("inline-flex");
   });
 
+  it("re-arms long polls quickly but never faster than one request per second", () => {
+    const createdAt = "2026-11-07T00:00:00.000Z";
+    const now = Date.parse(createdAt) + 5_000;
+    expect(resolveNextGenerationPollDelayMs({ version: "v1", longPollSeconds: 20 }, createdAt, now - 15_000, now)).toBe(150);
+    expect(resolveNextGenerationPollDelayMs({ version: "v1", longPollSeconds: 20 }, createdAt, now - 200, now)).toBe(800);
+    expect(resolveNextGenerationPollDelayMs({ version: "v1", longPollSeconds: 0 }, createdAt, now, now)).toBe(2000);
+    expect(resolveNextGenerationPollDelayMs(null, createdAt, now, now)).toBe(2000);
+  });
+
+  it("skips re-applying an unchanged status payload", () => {
+    expect(isUnchangedGenerationStatus(null, { version: "v1" })).toBe(false);
+    expect(isUnchangedGenerationStatus("v1", { version: "v1" })).toBe(true);
+    expect(isUnchangedGenerationStatus("v1", { version: "v2" })).toBe(false);
+    expect(isUnchangedGenerationStatus("v1", {})).toBe(false);
+  });
+
+  it("lets the first preview request hit browser/SW caches and bypasses them only on retry", () => {
+    expect(resolveImagePreviewRequest("/api/images/img_1/download?raw=1", 0)).toEqual({
+      url: "/api/images/img_1/download?raw=1",
+      init: {},
+    });
+    const retry = resolveImagePreviewRequest("/api/images/img_1/download?raw=1", 1);
+    expect(retry.url).toBe("/api/images/img_1/download?raw=1&sw=0&retry=1");
+    expect(retry.init).toEqual({ cache: "no-store" });
+  });
+
   it("keeps a bounded percent for full-size image preview loading progress", () => {
     expect(resolveImagePreviewProgressPercent(0, 1000)).toBe(0);
     expect(resolveImagePreviewProgressPercent(420, 1000)).toBe(42);
@@ -188,9 +217,10 @@ describe("generate menu form helpers", () => {
   it("streams the full-size preview image through fetch so loading progress can update", () => {
     const previewSource = source.slice(source.indexOf("export function ImagePreview"), source.indexOf("function LocalEditDialog"));
 
-    expect(previewSource).toContain("fetch(generatedImageRetryUrl(image.url, loadAttempt)");
-    expect(previewSource).toContain('cache: "no-store"');
+    expect(previewSource).toContain("resolveImagePreviewRequest(image.url, loadAttempt)");
+    expect(previewSource).toContain("fetch(request.url");
     expect(previewSource).toContain("getReader()");
+    expect(previewSource).toContain("requestAnimationFrame");
     expect(previewSource).toContain("URL.createObjectURL");
     expect(previewSource).not.toContain("new XMLHttpRequest");
   });
